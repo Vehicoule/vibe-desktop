@@ -1393,6 +1393,7 @@ impl SessionView {
         if let Some((path, _owner, diff)) = &self.review_diff {
             let keep_path = path.clone();
             let revert_path = path.clone();
+            let busy = self.review_busy(path);
             let mut lines = div().flex().flex_col();
             for change in
                 similar::TextDiff::from_lines(&diff.baseline, &diff.current).iter_all_changes()
@@ -1402,11 +1403,10 @@ impl SessionView {
                     similar::ChangeTag::Insert => ("+", theme::GREEN),
                     similar::ChangeTag::Equal => (" ", theme::INK_FAINT),
                 };
-                lines = lines.child(text(
-                    format!("{mark}{}", change.value().trim_end()),
-                    10.5,
-                    c(color),
-                ));
+                // Strip only the line terminator — trailing whitespace
+                // inside the line is itself diff content.
+                let line = change.value().trim_end_matches(['\n', '\r']);
+                lines = lines.child(text(format!("{mark}{line}"), 10.5, c(color)));
             }
             return Some(
                 sheet
@@ -1421,18 +1421,28 @@ impl SessionView {
                                 c(theme::INK_SOFT),
                             ))
                             .child(div().flex_1())
-                            .child(
-                                ghost_button("review-keep", "keep")
-                                    .on_click(cx.listener(move |v, _e, _w, cx| {
-                                        v.review_apply_file(keep_path.clone(), true, cx)
-                                    })),
-                            )
-                            .child(
-                                ghost_button("review-revert", "revert")
-                                    .on_click(cx.listener(move |v, _e, _w, cx| {
-                                        v.review_apply_file(revert_path.clone(), false, cx)
-                                    })),
-                            )
+                            // One decision per file at a time — keep and
+                            // revert both collapse into an inflight label
+                            // so opposing decisions can't race.
+                            .when(busy, |el| {
+                                el.child(text("applying…", 11.0, c(theme::INK_FAINT)))
+                            })
+                            .when(!busy, |el| {
+                                el.child(
+                                    ghost_button("review-keep", "keep").on_click(cx.listener(
+                                        move |v, _e, _w, cx| {
+                                            v.review_apply_file(keep_path.clone(), true, cx)
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    ghost_button("review-revert", "revert").on_click(
+                                        cx.listener(move |v, _e, _w, cx| {
+                                            v.review_apply_file(revert_path.clone(), false, cx)
+                                        }),
+                                    ),
+                                )
+                            })
                             .child(
                                 ghost_button("review-diff-back", "back")
                                     .on_click(cx.listener(|v, _e, _w, cx| {
@@ -1470,12 +1480,15 @@ impl SessionView {
                     _ => theme::AMBER,
                 };
                 let path = f.path.clone();
+                // The row's own scope owner — two scopes touching one
+                // file each get their own diff.
+                let owner = scope.owner.clone();
                 rows = rows.child(
                     div()
                         .id(SharedString::from(format!("review-file-{}", f.path)))
                         .cursor_pointer()
                         .on_click(cx.listener(move |v, _e, _w, cx| {
-                            v.open_review_diff(path.clone(), cx)
+                            v.open_review_diff(path.clone(), Some(owner.clone()), cx)
                         }))
                         .child(text(
                             format!("{}  {} ({} region{})", f.path, f.status, f.region_count,
@@ -1503,20 +1516,23 @@ impl SessionView {
                     _ => theme::AMBER,
                 };
                 let path = f.path.clone();
-                rows = rows.child(
-                    div()
-                        .id(SharedString::from(format!("review-file-{}", f.path)))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |v, _e, _w, cx| {
-                            v.open_review_diff(path.clone(), cx)
-                        }))
-                        .child(text(
-                            format!("{}  {} ({} region{})", f.path, f.status, f.regions.len(),
-                                if f.regions.len() == 1 { "" } else { "s" }),
-                            11.5,
-                            c(color),
-                        )),
-                );
+                // Files with no resolvable owner render inert — better a
+                // label than a click that does nothing.
+                let openable = self.review_file_openable(&f.path);
+                let mut row = div()
+                    .id(SharedString::from(format!("review-file-{}", f.path)))
+                    .child(text(
+                        format!("{}  {} ({} region{})", f.path, f.status, f.regions.len(),
+                            if f.regions.len() == 1 { "" } else { "s" }),
+                        11.5,
+                        c(if openable { color } else { theme::INK_FAINT }),
+                    ));
+                if openable {
+                    row = row.cursor_pointer().on_click(cx.listener(
+                        move |v, _e, _w, cx| v.open_review_diff(path.clone(), None, cx),
+                    ));
+                }
+                rows = rows.child(row);
             }
             sheet = sheet.child(rows);
         }

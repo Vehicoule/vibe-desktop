@@ -1865,20 +1865,41 @@ async fn main() {
                 .await;
             }
             "review/state" => {
+                // Decisions persist to review_decisions.json — an
+                // approve/revert on a file target resolves it off the
+                // pending list (all regions decided ⇒ nothing left to
+                // review), so the round-trip is observable.
+                let decisions: serde_json::Map<String, Value> = std::fs::read_to_string(
+                    store.join("review_decisions.json"),
+                )
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+                let pending = |path: &str| !decisions.contains_key(path);
+                let files: Vec<Value> = [
+                    (json!({"path": "src/main.rs", "status": "modified", "regions": [
+                        {"kind": "text", "versionIndex": 0, "ordinal": 0, "owner": {"kind": "agent", "turnId": 1}, "baselineStart": 1, "baselineLineCount": 2, "currentStart": 1, "currentLineCount": 3, "decision": "pending", "dependsOn": []}
+                    ]}), "src/main.rs"),
+                    (json!({"path": "src/lib.rs", "status": "created", "regions": [
+                        {"kind": "text", "versionIndex": 0, "ordinal": 1, "owner": {"kind": "agent", "turnId": 1}, "baselineStart": 0, "baselineLineCount": 0, "currentStart": 0, "currentLineCount": 2, "decision": "pending", "dependsOn": []}
+                    ]}), "src/lib.rs"),
+                ]
+                .into_iter()
+                .filter(|(_, p)| pending(p))
+                .map(|(f, _)| f)
+                .collect();
+                let scope_files: Vec<Value> = [
+                    json!({"path": "src/main.rs", "status": "modified", "regionCount": 1}),
+                    json!({"path": "src/lib.rs", "status": "created", "regionCount": 1}),
+                ]
+                .into_iter()
+                .filter(|f| pending(f["path"].as_str().unwrap_or_default()))
+                .collect();
                 respond(json!({
-                    "files": [
-                        {"path": "src/main.rs", "status": "modified", "regions": [
-                            {"kind": "text", "versionIndex": 0, "ordinal": 0, "owner": {"kind": "agent", "turnId": 1}, "baselineStart": 1, "baselineLineCount": 2, "currentStart": 1, "currentLineCount": 3, "decision": "pending", "dependsOn": []}
-                        ]},
-                        {"path": "src/lib.rs", "status": "created", "regions": [
-                            {"kind": "text", "versionIndex": 0, "ordinal": 1, "owner": {"kind": "agent", "turnId": 1}, "baselineStart": 0, "baselineLineCount": 0, "currentStart": 0, "currentLineCount": 2, "decision": "pending", "dependsOn": []}
-                        ]}
-                    ],
+                    "files": files,
                     "scopes": [
-                        {"owner": {"kind": "agent", "turnId": 1}, "files": [
-                            {"path": "src/main.rs", "status": "modified", "regionCount": 1},
-                            {"path": "src/lib.rs", "status": "created", "regionCount": 1}
-                        ]}
+                        {"owner": {"kind": "agent", "turnId": 1}, "files": scope_files}
                     ]
                 }))
                 .await;
@@ -1892,7 +1913,43 @@ async fn main() {
                 .await;
             }
             "review/approve" | "review/revert" => {
-                respond(json!({})).await;
+                let decision = if method == "review/approve" { "keep" } else { "revert" };
+                let mut decisions: serde_json::Map<String, Value> = std::fs::read_to_string(
+                    store.join("review_decisions.json"),
+                )
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+                // Resolve the target's paths — file/scopeFile name one,
+                // all covers the whole pending list; other kinds accept
+                // but decide nothing (unmodeled granularity).
+                let target = &params["target"];
+                let paths: Vec<String> = match target["kind"].as_str() {
+                    Some("file") | Some("scopeFile") => {
+                        target["path"].as_str().map(|p| vec![p.to_string()]).unwrap_or_default()
+                    }
+                    Some("all") => vec!["src/main.rs".to_string(), "src/lib.rs".to_string()]
+                        .into_iter()
+                        .filter(|p| !decisions.contains_key(p))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for p in paths {
+                    decisions.insert(p, Value::String(decision.to_string()));
+                }
+                let tmp = store.join("review_decisions.json.tmp");
+                let persisted = tokio::fs::write(&tmp, serde_json::to_string(&decisions).unwrap_or_default())
+                    .await
+                    .is_ok()
+                    && tokio::fs::rename(&tmp, store.join("review_decisions.json"))
+                        .await
+                        .is_ok();
+                if persisted {
+                    respond(json!({})).await;
+                } else {
+                    respond_err("internal_error", "fixture: review persist failed").await;
+                }
             }
             "runtime/read" => {
                 respond(json!({

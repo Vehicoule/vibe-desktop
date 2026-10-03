@@ -85,6 +85,13 @@ pub struct SessionView {
     /// Open per-file diff — (path, owner, response). `None` until
     /// `review/turnDiff` lands.
     pub review_diff: Option<(String, ReviewOwner, ReviewTurnDiffResponse)>,
+    /// Generation counter — a stale `review/state` or `review/turnDiff`
+    /// response must not overwrite a newer read or selection.
+    review_gen: u64,
+    /// Files with an in-flight approve/revert — both controls stay
+    /// disabled until the mutation settles so opposing decisions
+    /// can't race on one file.
+    review_inflight: HashSet<String>,
     /// Dictation run in flight while the mic toggle is down.
     pub dictation: Option<DictationRun>,
     dictation_pump: Option<Task<()>>,
@@ -159,6 +166,8 @@ impl SessionView {
             review: None,
             review_open: false,
             review_diff: None,
+            review_gen: 0,
+            review_inflight: HashSet::new(),
             dictation: None,
             dictation_pump: None,
             dictation_meter: None,
@@ -228,14 +237,18 @@ impl SessionView {
         cx.notify();
     }
 
-    /// Fetch `review/state` for the review sheet.
+    /// Fetch `review/state` for the review sheet. Refreshes every call —
+    /// the state changes as turns complete, so a cached snapshot goes
+    /// stale; `review_gen` drops a response that loses the race.
     fn load_review(&mut self, cx: &mut Context<Self>) {
+        self.review_gen += 1;
+        let gen = self.review_gen;
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let state = conn.review_state(&sid).await;
             let _ = this.update(cx, |view, cx| {
-                if view.session_id() != sid {
+                if view.session_id() != sid || view.review_gen != gen {
                     return;
                 }
                 match state {
@@ -248,38 +261,61 @@ impl SessionView {
         .detach();
     }
 
-    /// Review sheet toggle — loads the state lazily the first time.
+    /// Review sheet toggle — refreshes the state on every open.
     pub fn toggle_review(&mut self, cx: &mut Context<Self>) {
         self.review_open = !self.review_open;
-        if self.review_open && self.review.is_none() {
+        if self.review_open {
             self.load_review(cx);
+        } else {
+            // Pending reads must not land after the sheet closed.
+            self.review_gen += 1;
         }
         cx.notify();
     }
 
-    /// Owner a file belongs to — the scope listing it, else the first
-    /// scope's owner (turnDiff needs an owner even for a plain file view).
+    /// Owner a file belongs to — the scope listing it, else the file's
+    /// own region owner, else the first scope (`turnDiff` needs an owner
+    /// even for a plain file view; `None` when the state offers none).
     fn review_owner_for(&self, path: &str) -> Option<ReviewOwner> {
         let state = self.review.as_ref()?;
-        state
+        if let Some(scope) = state
             .scopes
             .iter()
             .find(|s| s.files.iter().any(|f| f.path == path))
-            .or_else(|| state.scopes.first())
-            .map(|s| s.owner.clone())
+        {
+            return Some(scope.owner.clone());
+        }
+        if let Some(owner) = state
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .and_then(|f| f.regions.iter().find_map(|r| r.owner()))
+        {
+            return Some(owner);
+        }
+        state.scopes.first().map(|s| s.owner.clone())
     }
 
     /// `review/turnDiff` — open the baseline→current diff for a file.
-    pub fn open_review_diff(&mut self, path: String, cx: &mut Context<Self>) {
-        let Some(owner) = self.review_owner_for(&path) else {
+    /// Scoped rows pass their scope's owner explicitly so two owners on
+    /// one file show their own diffs; unscoped rows derive one.
+    pub fn open_review_diff(
+        &mut self,
+        path: String,
+        owner: Option<ReviewOwner>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = owner.or_else(|| self.review_owner_for(&path)) else {
             return;
         };
+        self.review_gen += 1;
+        let gen = self.review_gen;
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
             let resp = conn.review_turn_diff(&sid, &path, &owner).await;
             let _ = this.update(cx, |view, cx| {
-                if view.session_id() != sid {
+                if view.session_id() != sid || view.review_gen != gen {
                     return;
                 }
                 match resp {
@@ -292,14 +328,25 @@ impl SessionView {
         .detach();
     }
 
+    /// True when `path` has a resolvable owner — rows without one render
+    /// non-clickable instead of silently doing nothing.
+    pub fn review_file_openable(&self, path: &str) -> bool {
+        self.review_owner_for(path).is_some()
+    }
+
     pub fn close_review_diff(&mut self, cx: &mut Context<Self>) {
         self.review_diff = None;
+        self.review_gen += 1;
         cx.notify();
     }
 
     /// `review/approve` (`keep`) or `review/revert` for a whole file, then
-    /// refresh the state and close the diff.
+    /// refresh the state and close the diff. One decision per file at a
+    /// time — a second click while the first is in flight is ignored.
     pub fn review_apply_file(&mut self, path: String, keep: bool, cx: &mut Context<Self>) {
+        if !self.review_inflight.insert(path.clone()) {
+            return;
+        }
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
@@ -313,9 +360,11 @@ impl SessionView {
                 if view.session_id() != sid {
                     return;
                 }
+                view.review_inflight.remove(&path);
                 match result {
                     Ok(()) => {
                         view.review_diff = None;
+                        view.review_gen += 1;
                         view.load_review(cx);
                     }
                     Err(e) => view.error = Some(format!("review write failed: {e}")),
@@ -324,6 +373,12 @@ impl SessionView {
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    /// `path` currently has an approve/revert in flight.
+    pub fn review_busy(&self, path: &str) -> bool {
+        self.review_inflight.contains(path)
     }
 
     /// `config/model/write` — pin a model (and keep its thinking effort).
@@ -591,6 +646,12 @@ impl SessionView {
                 if session_updated && self.pending_agent.is_some() {
                     self.refresh_agents(cx);
                 }
+                // New turn output / config changes re-shape the review —
+                // re-read while the sheet is open instead of serving a
+                // stale snapshot.
+                if (session_updated || narrate_turn.is_some()) && self.review_open {
+                    self.load_review(cx);
+                }
                 if narrate_turn.is_some() && self.narrator_on {
                     self.narrate_turn(narrate_turn, cx);
                 }
@@ -622,6 +683,8 @@ impl SessionView {
             self.cfg_inflight.clear();
             self.review = None;
             self.review_diff = None;
+            self.review_gen += 1;
+            self.review_inflight.clear();
             if self.settings_open {
                 self.load_settings(cx);
             }

@@ -624,11 +624,21 @@ async fn review_state_diff_and_mutation() {
     })
     .await
     .unwrap();
+    // A decided file resolves off the pending list — the mutation is
+    // observable on the next read.
+    let after_keep = conn.review_state(&sid).await.unwrap();
+    assert_eq!(after_keep.files.len(), 1);
+    assert_eq!(after_keep.files[0].path, "src/lib.rs");
+    assert_eq!(after_keep.scopes[0].files.len(), 1);
+
     conn.review_revert(&sid, &vibe_protocol::models::ReviewTarget::File {
         path: "src/lib.rs".into(),
     })
     .await
     .unwrap();
+    let after_all = conn.review_state(&sid).await.unwrap();
+    assert!(after_all.files.is_empty());
+    assert!(after_all.scopes[0].files.is_empty());
 
     cleanup(conn, &dir).await;
 }

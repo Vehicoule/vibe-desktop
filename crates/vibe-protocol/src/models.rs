@@ -1759,6 +1759,46 @@ pub enum ReviewRegion {
     },
 }
 
+impl ReviewRegion {
+    /// Who authored the region — both variants carry one.
+    pub fn owner(&self) -> Option<ReviewOwner> {
+        match self {
+            ReviewRegion::Text { owner, .. } | ReviewRegion::Opaque { owner, .. } => {
+                Some(owner.clone())
+            }
+        }
+    }
+
+    /// Region ref for depends_on/mutation targeting.
+    pub fn region_ref(&self) -> ReviewRegionRef {
+        let (version_index, ordinal) = match self {
+            ReviewRegion::Text {
+                version_index,
+                ordinal,
+                ..
+            }
+            | ReviewRegion::Opaque {
+                version_index,
+                ordinal,
+                ..
+            } => (*version_index, *ordinal),
+        };
+        ReviewRegionRef {
+            version_index,
+            ordinal,
+        }
+    }
+
+    /// `pending` | `keep` | `revert`
+    pub fn decision(&self) -> &str {
+        match self {
+            ReviewRegion::Text { decision, .. } | ReviewRegion::Opaque { decision, .. } => {
+                decision
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewFile {
