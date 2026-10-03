@@ -79,7 +79,7 @@ async fn wait_for(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scripted_turn_with_approval() {
-    let (_dir, envs) = store();
+    let (dir, envs) = store();
     let mut conn = spawn_fixture(&envs).await;
     let init = conn.initialize(info(), caps()).await.expect("initialize");
     assert!(init.server_info.name.contains("vibe"));
@@ -173,11 +173,12 @@ async fn scripted_turn_with_approval() {
     // A state re-read is consistent (fixture serves the initial state).
     let state = conn.session_read(&session_id).await.expect("session/read");
     assert_eq!(state.session.id, session_id);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupt_returns_accepted() {
-    let (_dir, envs) = store();
+    let (dir, envs) = store();
     let conn = spawn_fixture(&envs).await;
     conn.initialize(info(), caps()).await.unwrap();
     let state = conn
@@ -194,6 +195,7 @@ async fn interrupt_returns_accepted() {
     // interrupt is fire-and-forget correct: fixture accepts it.
     conn.turn_interrupt(&sid, "turn-1").await.unwrap();
     conn.session_stop(&sid).await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A fork made on one fixture process must be resumable from a different
@@ -201,7 +203,7 @@ async fn interrupt_returns_accepted() {
 /// mirrors that with a shared file store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_resumes_across_processes() {
-    let (_dir, envs) = store();
+    let (dir, envs) = store();
     let conn_a = spawn_fixture(&envs).await;
     conn_a.initialize(info(), caps()).await.unwrap();
     let state = conn_a
@@ -248,4 +250,5 @@ async fn fork_resumes_across_processes() {
         .await
         .expect("session/list");
     assert!(list.items.iter().any(|s| s.id == forked.session.id));
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -39,6 +39,16 @@ fn store_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/vibe-fixture-store"))
 }
 
+/// Session ids are caller-supplied and become filenames — only ids made of
+/// filename-safe characters may touch the store (no `../` escapes).
+fn store_safe_id(sid: &str) -> bool {
+    !sid.is_empty()
+        && !sid.contains("..")
+        && sid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 impl SessionData {
     fn new(session: Value, store: std::path::PathBuf) -> Self {
         Self {
@@ -55,6 +65,9 @@ impl SessionData {
     /// Rebuild a session from the shared store (a different fixture
     /// process may have created or forked it).
     async fn load(store: &std::path::Path, sid: &str) -> Option<Arc<SessionData>> {
+        if !store_safe_id(sid) {
+            return None;
+        }
         let path = store.join(format!("{sid}.json"));
         let raw = tokio::fs::read_to_string(path).await.ok()?;
         let v: Value = serde_json::from_str(&raw).ok()?;
@@ -78,6 +91,9 @@ impl SessionData {
             "turn_seq": self.turn_seq.load(Ordering::SeqCst),
         });
         let id = self.session["id"].as_str().unwrap_or("x");
+        if !store_safe_id(id) {
+            return;
+        }
         let path = self.store.join(format!("{id}.json"));
         let tmp = self.store.join(format!("{id}.json.tmp"));
         if tokio::fs::write(&tmp, body.to_string()).await.is_ok() {
@@ -449,6 +465,10 @@ async fn main() {
             }
             "session/fork" => {
                 let src = params["sourceSessionId"].as_str().unwrap_or("");
+                if !store_safe_id(src) {
+                    respond(Value::Null).await;
+                    continue;
+                }
                 let data = sessions.lock().await.get(src).cloned();
                 let data = match data {
                     Some(d) => Some(d),
@@ -800,6 +820,21 @@ async fn main() {
                     }).to_string()).await;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::store_safe_id;
+
+    #[test]
+    fn store_safe_id_rejects_traversal() {
+        for bad in ["../etc/passwd", "a/b", "..", "", "x\\y", "a:b"] {
+            assert!(!store_safe_id(bad), "{bad} must be rejected");
+        }
+        for good in ["fx-02fd7bbf", "fx-x-fork", "saved-aaaa1111", "s_1.2"] {
+            assert!(store_safe_id(good), "{good} must be accepted");
         }
     }
 }
