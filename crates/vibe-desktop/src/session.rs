@@ -191,6 +191,11 @@ impl SessionView {
             let agents = conn.agents_list(&sid).await;
             let fields = conn.config_fields_read(&sid).await;
             let _ = this.update(cx, |view, cx| {
+                // A handoff may have swapped the session while this was
+                // in flight — the response belongs to the old session.
+                if view.session_id() != sid {
+                    return;
+                }
                 if let Ok(list) = agents {
                     view.active_agent = list.active.name.clone();
                     view.agents = list.agents;
@@ -220,6 +225,9 @@ impl SessionView {
         cx.spawn(async move |this, cx| {
             let resp = conn.config_model_write(&sid, &alias, None).await;
             let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
                 match resp {
                     Ok(r) if !r.rejected => {
                         if let Some(cfg) = &mut view.config {
@@ -254,6 +262,9 @@ impl SessionView {
         cx.spawn(async move |this, cx| {
             let resp = conn.session_agent_update(&sid, &name).await;
             let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
                 match resp {
                     Ok(r) if r.rejected => {
                         view.error = Some(format!(
@@ -262,7 +273,12 @@ impl SessionView {
                         ));
                     }
                     Ok(r) if r.status.as_deref() == Some("pending") => {
+                        // The switch may already have applied (its
+                        // session/updated raced ahead of this reply) —
+                        // reconcile immediately instead of waiting for
+                        // a notification that may never come.
                         view.pending_agent = Some(name.clone());
+                        view.refresh_agents(cx);
                     }
                     Ok(r) => {
                         let applied = r
@@ -287,20 +303,28 @@ impl SessionView {
         .detach();
     }
 
-    /// Re-fetch `agents/list` to learn the authoritative active agent
-    /// after a pending switch applies.
+    /// Re-fetch `agents/list` to learn the authoritative active agent.
+    /// A pending switch only clears once the list actually reports it
+    /// active — an unrelated `session/updated` answering with the old
+    /// agent must not drop the pending marker.
     fn refresh_agents(&mut self, cx: &mut Context<Self>) {
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
             let agents = conn.agents_list(&sid).await;
             let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
                 if let Ok(list) = agents {
-                    view.active_agent = list.active.name.clone();
+                    let active = list.active.name.clone();
                     view.agents = list.agents;
-                    view.pending_agent = None;
+                    view.active_agent = active.clone();
+                    if view.pending_agent.as_deref() == Some(active.as_str()) {
+                        view.pending_agent = None;
+                    }
                     if let Some(cfg) = &mut view.config {
-                        cfg.default_agent = list.active.name.clone();
+                        cfg.default_agent = view.active_agent.clone();
                     }
                 }
                 cx.notify();
@@ -352,6 +376,12 @@ impl SessionView {
                 )
                 .await;
             let _ = this.update(cx, |view, cx| {
+                // Skip entirely if a handoff swapped the session: the
+                // response is for the old session and the new one may
+                // have re-marked this path in flight.
+                if view.session_id() != sid {
+                    return;
+                }
                 view.cfg_inflight.remove(&field.path);
                 match resp {
                     Ok(r) if !r.rejected => {

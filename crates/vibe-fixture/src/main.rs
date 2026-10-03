@@ -1830,13 +1830,17 @@ async fn main() {
                     }
                 }
                 let tmp = store.join("config_values.json.tmp");
-                if tokio::fs::write(&tmp, serde_json::to_string(&overlays).unwrap_or_default())
+                let persisted = tokio::fs::write(&tmp, serde_json::to_string(&overlays).unwrap_or_default())
                     .await
                     .is_ok()
-                {
-                    let _ = tokio::fs::rename(&tmp, store.join("config_values.json")).await;
+                    && tokio::fs::rename(&tmp, store.join("config_values.json"))
+                        .await
+                        .is_ok();
+                if persisted {
+                    respond(json!({"rejected": false, "failures": [], "status": "applied"})).await;
+                } else {
+                    respond(json!({"rejected": true, "failures": ["fixture: config persist failed"], "status": null})).await;
                 }
-                respond(json!({"rejected": false, "failures": [], "status": "applied"})).await;
             }
             "config/model/write" => {
                 respond(json!({"status": "applied"})).await;
