@@ -354,7 +354,11 @@ pub struct AgentSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum PublicSessionStatus {
     Idle,
     Running {
@@ -1462,4 +1466,94 @@ pub struct WorkspaceUntrustedConfigResponse {
     pub dirs: Vec<String>,
     #[serde(default)]
     pub settings_path: String,
+}
+
+// --- M2b: voice --------------------------------------------------------------
+
+/// `config/read` audio provider view (`AudioProviderView` upstream).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioProviderView {
+    pub api_base: String,
+    #[serde(default)]
+    pub api_key_env_var: String,
+    #[serde(default)]
+    pub client: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeModelConfigView {
+    pub name: String,
+    #[serde(default)]
+    pub sample_rate: u32,
+    #[serde(default)]
+    pub encoding: String,
+    #[serde(default)]
+    pub language: String,
+    #[serde(default)]
+    pub target_streaming_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionConfigView {
+    pub model: TranscribeModelConfigView,
+    pub provider: AudioProviderView,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TtsModelConfigView {
+    pub name: String,
+    #[serde(default)]
+    pub voice: String,
+    #[serde(default)]
+    pub response_format: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechConfigView {
+    pub model: TtsModelConfigView,
+    pub provider: AudioProviderView,
+}
+
+/// The voice-bearing subset of `ConfigView` — tolerant to upstream growth
+/// (ADR-0014 version-skew rule: deserialize only what the client uses).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceConfigView {
+    #[serde(default)]
+    pub voice_mode_enabled: bool,
+    #[serde(default)]
+    pub narrator_enabled: bool,
+    pub speech: SpeechConfigView,
+    pub transcription: TranscriptionConfigView,
+}
+
+/// `config/read` response — the client reads `config` as `VoiceConfigView`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigReadResponse {
+    pub config: VoiceConfigView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NarrationSummarizeParams {
+    pub session_id: String,
+    pub user_message: String,
+    pub assistant_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NarrationSummarizeResponse {
+    #[serde(default)]
+    pub summary: Option<String>,
 }

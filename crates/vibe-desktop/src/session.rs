@@ -2,6 +2,7 @@
 //! composer state, and callback handling.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -11,6 +12,7 @@ use vibe_protocol::models::*;
 use vibe_protocol::projection::{Projection, Reduce};
 
 use crate::app::VibeApp;
+use crate::voice::{self, DictationEvent, NarrationEvent};
 
 /// User action destined for a callback.
 pub enum CallbackAnswer {
@@ -58,7 +60,42 @@ pub struct SessionView {
     pub trust_dismissed: bool,
     /// A `session/history/list` backward page is in flight.
     pub loading_earlier: bool,
+    /// `config/read` voice subset — `None` until the read lands (or fails:
+    /// voice UI stays hidden then).
+    pub voice: Option<VoiceConfigView>,
+    /// Dictation run in flight while the mic toggle is down.
+    pub dictation: Option<DictationRun>,
+    dictation_pump: Option<Task<()>>,
+    /// Periodic-redraw task so the mic level tracks speech between deltas.
+    dictation_meter: Option<Task<()>>,
+    /// Narration phase — `Idle` shows nothing.
+    pub narrating: Narration,
+    /// Stop flag shared with the in-flight narration task.
+    narration_stop: Arc<AtomicBool>,
+    /// Generation bumped on every narrate/cancel — stale pumps' events
+    /// for superseded runs are ignored.
+    narration_gen: u64,
+    /// Per-view narrator switch, initialized from `narrator_enabled`.
+    pub narrator_on: bool,
+    narration_pump: Option<Task<()>>,
     events_task: Option<Task<()>>,
+}
+
+/// A live dictation run: stop flag for the capture thread, peak meter for
+/// the mic badge. `stopping` = capture told to end but final transcript
+/// deltas may still arrive — the run stays until its `Done` event.
+pub struct DictationRun {
+    pub stop: Arc<AtomicBool>,
+    pub peak: Arc<AtomicU32>,
+    pub stopping: bool,
+}
+
+/// Narration lifecycle — mirrors upstream `NarratorState`. The stop flag
+/// lives on `narration_stop` (shared with the host-runtime playback task).
+pub enum Narration {
+    Idle,
+    Preparing,
+    Speaking,
 }
 
 impl SessionView {
@@ -90,12 +127,39 @@ impl SessionView {
             trust: None,
             trust_dismissed: false,
             loading_earlier: false,
+            voice: None,
+            dictation: None,
+            dictation_pump: None,
+            dictation_meter: None,
+            narrating: Narration::Idle,
+            narration_stop: Arc::new(AtomicBool::new(false)),
+            narration_gen: 0,
+            narrator_on: false,
+            narration_pump: None,
             events_task: None,
         };
         if let Some(rx) = events {
             view.events_task = Some(Self::pump(rx, cx));
         }
+        view.load_voice_config(cx);
         view
+    }
+
+    /// Pull `config/read` once — voice UI only appears when the server
+    /// reports `voice_mode_enabled`.
+    fn load_voice_config(&mut self, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let cfg = conn.config_read_voice().await;
+            let _ = this.update(cx, |view, cx| {
+                if let Ok(cfg) = cfg {
+                    view.narrator_on = cfg.narrator_enabled && cfg.voice_mode_enabled;
+                    view.voice = Some(cfg);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Called once right after attach: an untrusted workspace surfaces the
@@ -159,12 +223,24 @@ impl SessionView {
     fn on_server_message(&mut self, msg: &ServerMessage, cx: &mut Context<Self>) -> bool {
         match msg {
             ServerMessage::Notification { method, params } => {
+                let narrate_turn = (method == "turn/completed")
+                    .then(|| {
+                        params
+                            .get("turn")
+                            .and_then(|t| t.get("id"))
+                            .and_then(|i| i.as_str())
+                            .map(str::to_string)
+                    })
+                    .flatten();
                 let resync = matches!(
                     self.projection.on_notification(method, params),
                     Reduce::Resync { .. }
                 );
                 if resync {
                     self.resync(cx);
+                }
+                if narrate_turn.is_some() && self.narrator_on {
+                    self.narrate_turn(narrate_turn, cx);
                 }
             }
             ServerMessage::Request { id, method, params } => {
@@ -738,6 +814,236 @@ impl SessionView {
         })
     }
 
+    // ── Voice ─────────────────────────────────────────────────────────
+
+    /// Mic toggle: start dictation, or mark the run in flight as stopping.
+    /// A stopping run keeps its pump until `Done` so the final transcript
+    /// still lands in the composer — the mic can't restart until then.
+    pub fn toggle_dictation(&mut self, cx: &mut Context<Self>) {
+        if let Some(run) = self.dictation.as_mut() {
+            if !run.stopping {
+                run.stopping = true;
+                run.stop.store(true, Ordering::Relaxed);
+            }
+            cx.notify();
+            return;
+        }
+        let Some(cfg) = &self.voice else { return };
+        if !cfg.voice_mode_enabled {
+            return;
+        }
+        let tcfg = voice::TranscriptionConfig {
+            api_base: cfg.transcription.provider.api_base.clone(),
+            api_key_env_var: cfg.transcription.provider.api_key_env_var.clone(),
+            model_name: cfg.transcription.model.name.clone(),
+            encoding: cfg.transcription.model.encoding.clone(),
+            target_streaming_delay_ms: cfg.transcription.model.target_streaming_delay_ms,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU32::new(0));
+        let (chunks, rate) = match voice::start_recording(stop.clone(), peak.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                self.error = Some(e);
+                cx.notify();
+                return;
+            }
+        };
+        let (tx, rx) = futures::channel::mpsc::unbounded::<DictationEvent>();
+        // The task must always end with `Done` — an early `transcribe`
+        // failure (missing key, handshake) would otherwise leak the
+        // recorder and leave the run marked active forever.
+        crate::host::runtime().spawn(async move {
+            if let Err(e) = voice::transcribe(tcfg, rate, chunks, tx.clone()).await {
+                let _ = tx.unbounded_send(DictationEvent::Error(e));
+            }
+            let _ = tx.unbounded_send(DictationEvent::Done);
+        });
+        self.dictation_pump = Some(cx.spawn(async move |this, cx| {
+            let mut rx = rx;
+            while let Some(ev) = rx.next().await {
+                let keep = this.update(cx, |view, cx| view.on_dictation_event(ev, cx));
+                match keep {
+                    Ok(true) | Err(_) => {}
+                    Ok(false) => break,
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+            }
+        }));
+        self.dictation = Some(DictationRun {
+            stop,
+            peak,
+            stopping: false,
+        });
+        // The peak atom changes in the audio callback without notifying
+        // gpui — tick redraws so the level meter tracks speech between
+        // transcript deltas. Exits once the run drops.
+        self.dictation_meter = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(120))
+                .await;
+            match this.update(cx, |view, cx| {
+                if view.dictation.is_some() {
+                    cx.notify();
+                    true
+                } else {
+                    false
+                }
+            }) {
+                Ok(true) => {}
+                _ => break,
+            }
+        }));
+        cx.notify();
+    }
+
+    fn on_dictation_event(&mut self, ev: DictationEvent, cx: &mut Context<Self>) -> bool {
+        match ev {
+            DictationEvent::TextDelta(t) => {
+                self.composer.push_str(&t);
+            }
+            DictationEvent::Notice(n) | DictationEvent::Error(n) => {
+                self.error = Some(n);
+            }
+            DictationEvent::Done => {
+                if let Some(run) = self.dictation.take() {
+                    run.stop.store(true, Ordering::Relaxed);
+                }
+                self.dictation_pump = None;
+                self.dictation_meter = None;
+                cx.notify();
+                return false;
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// Narrator switch — also cancels anything playing.
+    pub fn toggle_narrator(&mut self, cx: &mut Context<Self>) {
+        self.narrator_on = !self.narrator_on;
+        if !self.narrator_on {
+            self.cancel_narration(cx);
+        }
+        cx.notify();
+    }
+
+    /// Stop a preparing/speaking narration run — the shared flag also
+    /// short-circuits `play` if the run reaches it after cancel. Bumping
+    /// the generation makes the old pump's late events inert.
+    pub fn cancel_narration(&mut self, cx: &mut Context<Self>) {
+        self.narration_stop.store(true, Ordering::Relaxed);
+        self.narrating = Narration::Idle;
+        self.narration_gen = self.narration_gen.wrapping_add(1);
+        cx.notify();
+    }
+
+    /// `turn/completed` while the narrator is on: summarize → TTS → play,
+    /// all on the host runtime; phases arrive back over the channel.
+    fn narrate_turn(&mut self, turn_id: Option<String>, cx: &mut Context<Self>) {
+        let Some(cfg) = &self.voice else { return };
+        if !cfg.voice_mode_enabled {
+            return;
+        }
+        let Some(turn_id) = turn_id else { return };
+        let history = self.projection.state.history.as_deref().unwrap_or(&[]);
+        let Some((user, asst)) = voice::turn_text(history, &turn_id) else {
+            return;
+        };
+        let scfg = voice::SpeechConfig {
+            api_base: cfg.speech.provider.api_base.clone(),
+            api_key_env_var: cfg.speech.provider.api_key_env_var.clone(),
+            model_name: cfg.speech.model.name.clone(),
+            voice: cfg.speech.model.voice.clone(),
+            response_format: cfg.speech.model.response_format.clone(),
+        };
+        self.cancel_narration(cx);
+        self.narrating = Narration::Preparing;
+        self.narration_gen = self.narration_gen.wrapping_add(1);
+        let gen = self.narration_gen;
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        self.narration_stop = stop.clone();
+        let (tx, rx) = futures::channel::mpsc::unbounded::<NarrationEvent>();
+        crate::host::runtime().spawn(async move {
+            // Cancel between async steps: a cancelled run must not emit
+            // Speaking or surface its error after the fact.
+            let run = async {
+                let summary = conn
+                    .narration_summarize(&sid, &user, &asst)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| "no summary".to_string())?;
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                let bytes = voice::speak(&scfg, &summary).await?;
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                let _ = tx.unbounded_send(NarrationEvent::Speaking);
+                voice::play(bytes, stop)
+                    .await
+                    .map(|_| Some(NarrationEvent::Done))
+            };
+            let ev = match run.await {
+                Ok(ev) => ev,
+                Err(e) => Some(NarrationEvent::Error(e)),
+            };
+            if let Some(ev) = ev {
+                let _ = tx.unbounded_send(ev);
+            }
+        });
+        self.narration_pump = Some(cx.spawn(async move |this, cx| {
+            let mut rx = rx;
+            while let Some(ev) = rx.next().await {
+                let keep = this.update(cx, |view, cx| view.on_narration_event(ev, gen, cx));
+                match keep {
+                    Ok(true) | Err(_) => {}
+                    Ok(false) => break,
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Events from a superseded/cancelled run (stale generation) drain
+    /// silently so they can't restore a killed Speaking badge or error.
+    fn on_narration_event(&mut self, ev: NarrationEvent, gen: u64, cx: &mut Context<Self>) -> bool {
+        if gen != self.narration_gen {
+            return true;
+        }
+        match ev {
+            NarrationEvent::Speaking => {
+                self.narrating = Narration::Speaking;
+            }
+            NarrationEvent::Done => {
+                self.narrating = Narration::Idle;
+                self.narration_pump = None;
+                cx.notify();
+                return false;
+            }
+            NarrationEvent::Error(e) => {
+                self.narrating = Narration::Idle;
+                self.narration_pump = None;
+                if e != "no summary" {
+                    self.error = Some(format!("narration: {e}"));
+                }
+                cx.notify();
+                return false;
+            }
+        }
+        cx.notify();
+        true
+    }
+
     /// Submit the accumulated answers for a `user_input` callback.
     pub fn submit_question(
         &mut self,
@@ -792,5 +1098,16 @@ impl SessionView {
             }),
             cx,
         );
+    }
+}
+
+/// A dropped view must not leak the capture thread or a speaking sink —
+/// both honor their shared stop flags within tens of ms.
+impl Drop for SessionView {
+    fn drop(&mut self) {
+        if let Some(run) = self.dictation.take() {
+            run.stop.store(true, Ordering::Relaxed);
+        }
+        self.narration_stop.store(true, Ordering::Relaxed);
     }
 }

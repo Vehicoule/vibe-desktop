@@ -743,6 +743,34 @@ impl Connection {
         )
         .await
     }
+
+    /// `config/read` → the voice-bearing subset of `ConfigView`.
+    pub async fn config_read_voice(&self) -> ClientResult<VoiceConfigView> {
+        let resp: ConfigReadResponse = self.request_typed("config/read", json!({})).await?;
+        Ok(resp.config)
+    }
+
+    /// `narration/summarize` → summary text (None when the provider can't).
+    pub async fn narration_summarize(
+        &self,
+        session_id: &str,
+        user_message: &str,
+        assistant_text: &str,
+    ) -> ClientResult<Option<String>> {
+        let resp: NarrationSummarizeResponse = self
+            .request_typed(
+                "narration/summarize",
+                NarrationSummarizeParams {
+                    session_id: session_id.to_string(),
+                    user_message: user_message.to_string(),
+                    assistant_text: assistant_text.to_string(),
+                    error: None,
+                    message_id: None,
+                },
+            )
+            .await?;
+        Ok(resp.summary)
+    }
 }
 
 impl Drop for Connection {
