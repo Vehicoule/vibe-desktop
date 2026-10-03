@@ -400,6 +400,34 @@ impl Render for SessionView {
             entries = entries.child(self.render_entry(entry, cx));
         }
 
+        // Pre-create other-input focus handles for open user-input
+        // callbacks so the &self card renderer can track them.
+        let other_keys: Vec<(String, usize)> = self
+            .projection
+            .state
+            .active_callbacks
+            .iter()
+            .filter_map(|e| match e {
+                PublicHistoryEntry::Callback {
+                    callback_id,
+                    detail: CallbackDetail::UserInput(input),
+                    ..
+                } => input.request.as_ref().map(|req| {
+                    req.questions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, q)| !q.hide_other)
+                        .map(|(qi, _)| (callback_id.clone(), qi))
+                        .collect::<Vec<_>>()
+                }),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for (cb, qi) in other_keys {
+            self.other_focus_handle(&cb, qi, cx);
+        }
+
         let open_callbacks = self.open_callbacks();
         let callback_area = if open_callbacks.is_empty() {
             None
@@ -722,6 +750,59 @@ impl SessionView {
                                         .child(opt.label.clone())
                                 }),
                             ));
+                        // Free-text "other" answer unless the request hides it.
+                        if !q.hide_other {
+                            let key = format!("{cb_id}:{qi}");
+                            let focus = self.other_focus.get(&key).cloned();
+                            let current = self.other_text(&cb_id, qi).to_string();
+                            if let Some(focus) = focus {
+                                let cb3 = cb_id.clone();
+                                let req2 = req.clone();
+                                let shown = if current.is_empty() {
+                                    text("other…", 11.5, c(theme::INK_FAINT))
+                                } else {
+                                    text(format!("{current}▏"), 11.5, c(theme::INK))
+                                };
+                                let input = div()
+                                    .track_focus(&focus)
+                                    .size_full()
+                                    .on_key_down(cx.listener(
+                                        move |v, e: &gpui::KeyDownEvent, _w, cx| {
+                                            match e.keystroke.key.as_str() {
+                                                "backspace" => {
+                                                    v.edit_other(&cb3, qi, None, cx);
+                                                }
+                                                "enter" => {
+                                                    if v.question_complete(&cb3, &req2) {
+                                                        v.submit_question(&cb3, &req2, cx);
+                                                    }
+                                                }
+                                                _ => {
+                                                    if let Some(ch) = &e.keystroke.key_char {
+                                                        v.edit_other(&cb3, qi, Some(ch), cx);
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    ))
+                                    .child(shown);
+                                col = col.child(
+                                    div()
+                                        .id(gpui::ElementId::Name(format!("other-{key}").into()))
+                                        .cursor_text()
+                                        .px_3()
+                                        .py_1p5()
+                                        .rounded_sm()
+                                        .bg(c(theme::IVORY))
+                                        .border_1()
+                                        .border_color(c(theme::EDGE))
+                                        .on_click(cx.listener(move |v, _e, window, _cx| {
+                                            window.focus(&v.other_focus[&key]);
+                                        }))
+                                        .child(input),
+                                );
+                            }
+                        }
                     }
                     let req2 = req.clone();
                     let cb3 = cb_id.clone();

@@ -15,51 +15,76 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use vibe_protocol::json_patch::apply_patch;
 use vibe_protocol::models::JsonPatchOperation;
 
-/// Live session contents — history entries accumulate as the scripted turn
-/// emits them, so `session/read` answers with the real current snapshot.
+/// Live session contents. History and its watermark live behind ONE lock so
+/// `session/read` always returns a consistent (history, eventId) pair — a
+/// snapshot never pairs a patched entry with the previous event id.
 struct SessionData {
     session: Value,
-    history: tokio::sync::Mutex<Vec<Value>>,
-    event_id: AtomicU64,
+    inner: tokio::sync::Mutex<SessionInner>,
     turn_seq: AtomicU64,
+}
+
+struct SessionInner {
+    history: Vec<Value>,
+    event_id: u64,
 }
 
 impl SessionData {
     fn new(session: Value) -> Self {
         Self {
             session,
-            history: tokio::sync::Mutex::new(Vec::new()),
-            event_id: AtomicU64::new(0),
+            inner: tokio::sync::Mutex::new(SessionInner {
+                history: Vec::new(),
+                event_id: 0,
+            }),
             turn_seq: AtomicU64::new(0),
         }
     }
 
-    async fn add_entry(&self, entry: Value) {
-        self.history.lock().await.push(entry);
+    /// Next event id — for notifications that don't mutate history.
+    async fn bump(&self) -> u64 {
+        let mut inner = self.inner.lock().await;
+        inner.event_id += 1;
+        inner.event_id
     }
 
-    async fn patch_entry(&self, entry_id: &str, patch: &Value) {
-        let mut history = self.history.lock().await;
-        let Some(entry) = history
+    /// Append a history entry and claim its event id atomically.
+    async fn add_entry(&self, entry: Value) -> u64 {
+        let mut inner = self.inner.lock().await;
+        inner.event_id += 1;
+        inner.history.push(entry);
+        inner.event_id
+    }
+
+    /// Apply a patch to a stored entry and claim its event id atomically.
+    async fn patch_entry(&self, entry_id: &str, patch: &Value) -> u64 {
+        let mut inner = self.inner.lock().await;
+        inner.event_id += 1;
+        if let Some(entry) = inner
+            .history
             .iter_mut()
             .find(|e| e["id"].as_str() == Some(entry_id))
-        else {
-            return;
-        };
-        if let Ok(ops) = serde_json::from_value::<Vec<JsonPatchOperation>>(patch.clone()) {
-            if let Ok(next) = apply_patch(entry, &ops) {
-                *entry = next;
+        {
+            if let Ok(ops) = serde_json::from_value::<Vec<JsonPatchOperation>>(patch.clone()) {
+                if let Ok(next) = apply_patch(entry, &ops) {
+                    *entry = next;
+                }
             }
         }
+        inner.event_id
     }
 
     async fn state(&self) -> Value {
-        let history = self.history.lock().await.clone();
+        let inner = self.inner.lock().await;
         state_value(
             self.session.clone(),
-            self.event_id.load(Ordering::SeqCst),
-            json!(history),
+            inner.event_id,
+            json!(inner.history.clone()),
         )
+    }
+
+    async fn clone_history(&self) -> Vec<Value> {
+        self.inner.lock().await.history.clone()
     }
 }
 
@@ -347,10 +372,13 @@ async fn main() {
                         let fork_id = format!("{src}-fork");
                         let mut session = d.session.clone();
                         session["id"] = json!(fork_id);
+                        session["parentSessionId"] = json!(src);
                         let fork = Arc::new(SessionData::new(session));
-                        *fork.history.lock().await = d.history.lock().await.clone();
+                        fork.inner.lock().await.history = d.clone_history().await;
+                        // Return the CHILD's state — the caller opens it.
+                        let state = fork.state().await;
                         sessions.lock().await.insert(fork_id, fork);
-                        d.state().await
+                        state
                     }
                     None => Value::Null,
                 };
@@ -383,7 +411,6 @@ async fn main() {
                 let tx2 = tx.clone();
                 let pending = pending_callbacks.clone();
                 tokio::spawn(async move {
-                    let seq = || data.event_id.fetch_add(1, Ordering::SeqCst) + 1;
                     let evt = |method: &str, eid: u64, extra: Value| {
                         let mut p = extra;
                         p["eventId"] = json!(eid);
@@ -403,16 +430,16 @@ async fn main() {
                     };
                     tokio::time::sleep(Duration::from_millis(60)).await;
                     let user_entry = message_entry(&e_user, &sid, &turn_id, "user", &text);
-                    data.add_entry(user_entry.clone()).await;
+                    let eid = data.add_entry(user_entry.clone()).await;
                     let (m, p) = evt(
                         "history/entryAdded",
-                        seq(),
+                        eid,
                         json!({"turnId": turn_id, "entry": user_entry}),
                     );
                     send(m, p).await;
                     let (m, p) = evt(
                         "turn/started",
-                        seq(),
+                        data.bump().await,
                         json!({"turn": turn(&turn_id, &sid, "in_progress")}),
                     );
                     send(m, p).await;
@@ -423,10 +450,10 @@ async fn main() {
                         "relatedEntryId": null,
                         "text": "", "summary": []
                     });
-                    data.add_entry(think_entry.clone()).await;
+                    let eid = data.add_entry(think_entry.clone()).await;
                     let (m, p) = evt(
                         "history/entryAdded",
-                        seq(),
+                        eid,
                         json!({"turnId": turn_id, "entry": think_entry}),
                     );
                     send(m, p).await;
@@ -434,18 +461,18 @@ async fn main() {
                     let patch = json!([
                         {"op": "append", "path": "/text", "value": "Thinking about the request… "}
                     ]);
-                    data.patch_entry(&e_think, &patch).await;
+                    let eid = data.patch_entry(&e_think, &patch).await;
                     let (m, p) = evt(
                         "history/entryUpdated",
-                        seq(),
+                        eid,
                         json!({"turnId": turn_id, "entryId": e_think, "patch": patch}),
                     );
                     send(m, p).await;
                     let asst_entry = message_entry(&e_asst, &sid, &turn_id, "assistant", "");
-                    data.add_entry(asst_entry.clone()).await;
+                    let eid = data.add_entry(asst_entry.clone()).await;
                     let (m, p) = evt(
                         "history/entryAdded",
-                        seq(),
+                        eid,
                         json!({"turnId": turn_id, "entry": asst_entry}),
                     );
                     send(m, p).await;
@@ -458,10 +485,10 @@ async fn main() {
                         let patch = json!([
                             {"op": "append", "path": "/content/0/text", "value": chunk}
                         ]);
-                        data.patch_entry(&e_asst, &patch).await;
+                        let eid = data.patch_entry(&e_asst, &patch).await;
                         let (m, p) = evt(
                             "history/entryUpdated",
-                            seq(),
+                            eid,
                             json!({"turnId": turn_id, "entryId": e_asst, "patch": patch}),
                         );
                         send(m, p).await;
@@ -469,10 +496,10 @@ async fn main() {
                     // Shell effect: pending → running → blocked on approval.
                     let shell_entry =
                         shell_effect(&e_shell, &sid, &turn_id, json!({"status": "pending"}));
-                    data.add_entry(shell_entry.clone()).await;
+                    let eid = data.add_entry(shell_entry.clone()).await;
                     let (m, p) = evt(
                         "history/entryAdded",
-                        seq(),
+                        eid,
                         json!({"turnId": turn_id, "entry": shell_entry}),
                     );
                     send(m, p).await;
@@ -480,30 +507,30 @@ async fn main() {
                     let patch = json!([
                         {"op": "replace", "path": "/state", "value": {"status": "running", "outputText": ""}}
                     ]);
-                    data.patch_entry(&e_shell, &patch).await;
+                    let eid = data.patch_entry(&e_shell, &patch).await;
                     let (m, p) = evt(
                         "history/entryUpdated",
-                        seq(),
+                        eid,
                         json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
                     );
                     send(m, p).await;
                     tokio::time::sleep(Duration::from_millis(80)).await;
                     let callback_id = format!("cb-{turn_id}");
                     let cb_entry = approval_callback(&e_cb, &sid, &turn_id, &callback_id, &e_shell);
-                    data.add_entry(cb_entry.clone()).await;
+                    let eid = data.add_entry(cb_entry.clone()).await;
                     let (m, p) = evt(
                         "history/entryAdded",
-                        seq(),
+                        eid,
                         json!({"turnId": turn_id, "entry": cb_entry}),
                     );
                     send(m, p).await;
                     let patch = json!([
                         {"op": "replace", "path": "/state", "value": {"status": "blocked", "callbackId": callback_id, "outputText": ""}}
                     ]);
-                    data.patch_entry(&e_shell, &patch).await;
+                    let eid = data.patch_entry(&e_shell, &patch).await;
                     let (m, p) = evt(
                         "history/entryUpdated",
-                        seq(),
+                        eid,
                         json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
                     );
                     send(m, p).await;
@@ -527,7 +554,6 @@ async fn main() {
                 if let Some((data, n)) = pending_callbacks.lock().await.remove(&cb_id) {
                     let tx2 = tx.clone();
                     tokio::spawn(async move {
-                        let seq = || data.event_id.fetch_add(1, Ordering::SeqCst) + 1;
                         let send = |m: &str, p: Value| {
                             let tx = tx2.clone();
                             let m = m.to_string();
@@ -558,11 +584,11 @@ async fn main() {
                         let patch = json!([
                             {"op": "replace", "path": "/state", "value": {"status": "answered", "output": params["output"]}}
                         ]);
-                        data.patch_entry(&e_cb, &patch).await;
+                        let eid = data.patch_entry(&e_cb, &patch).await;
                         send(
                             "history/entryUpdated",
                             evt(
-                                seq(),
+                                eid,
                                 json!({"turnId": turn_id, "entryId": e_cb, "patch": patch}),
                             ),
                         )
@@ -575,11 +601,11 @@ async fn main() {
                                 "display": {"success": true, "verb": "Ran", "message": "fixture-output", "warnings": [], "suffix": ""}
                             }}
                         ]);
-                        data.patch_entry(&e_shell, &patch).await;
+                        let eid = data.patch_entry(&e_shell, &patch).await;
                         send(
                             "history/entryUpdated",
                             evt(
-                                seq(),
+                                eid,
                                 json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
                             ),
                         )
@@ -588,11 +614,11 @@ async fn main() {
                         let patch = json!([
                             {"op": "append", "path": "/content/0/text", "value": " Done — effect approved and completed."}
                         ]);
-                        data.patch_entry(&e_asst, &patch).await;
+                        let eid = data.patch_entry(&e_asst, &patch).await;
                         send(
                             "history/entryUpdated",
                             evt(
-                                seq(),
+                                eid,
                                 json!({"turnId": turn_id, "entryId": e_asst, "patch": patch}),
                             ),
                         )
@@ -600,16 +626,16 @@ async fn main() {
                         let patch = json!([
                             {"op": "replace", "path": "/generationStatus", "value": "completed"}
                         ]);
-                        data.patch_entry(&e_think, &patch).await;
+                        let eid = data.patch_entry(&e_think, &patch).await;
                         send(
                             "history/entryUpdated",
                             evt(
-                                seq(),
+                                eid,
                                 json!({"turnId": turn_id, "entryId": e_think, "patch": patch}),
                             ),
                         )
                         .await;
-                        send("turn/completed", evt(seq(), json!({"turn": {"id": turn_id, "sessionId": sid, "status": "completed", "startedAt": 1, "completedAt": 2, "error": null, "stopReason": null, "queueItemId": null}}))).await;
+                        send("turn/completed", evt(data.bump().await, json!({"turn": {"id": turn_id, "sessionId": sid, "status": "completed", "startedAt": 1, "completedAt": 2, "error": null, "stopReason": null, "queueItemId": null}}))).await;
                     });
                 }
             }

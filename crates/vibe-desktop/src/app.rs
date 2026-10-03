@@ -94,10 +94,13 @@ impl VibeApp {
                     let conn = host::spawn_connection(&program, None).await?;
                     conn.initialize(Self::client_info(), Self::capabilities())
                         .await?;
-                    // Follow the cursor — sessions past page 1 exist too.
+                    // Follow the cursor to the end — session catalogs are
+                    // unbounded. The seen-set guards a server that repeats a
+                    // cursor (which would otherwise loop forever).
                     let mut items = Vec::new();
-                    let mut cursor = None;
-                    for _ in 0..32 {
+                    let mut cursor: Option<String> = None;
+                    let mut seen = std::collections::HashSet::new();
+                    loop {
                         let page = conn
                             .session_list(SessionListParams {
                                 cursor: cursor.take(),
@@ -107,8 +110,8 @@ impl VibeApp {
                             .await?;
                         items.extend(page.items);
                         match page.next_cursor {
-                            Some(c) => cursor = Some(c),
-                            None => break,
+                            Some(c) if seen.insert(c.clone()) => cursor = Some(c),
+                            _ => break,
                         }
                     }
                     Ok(items)

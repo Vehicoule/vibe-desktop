@@ -31,6 +31,10 @@ pub struct SessionView {
     /// `user_input` callback selections, per callback id → per question.
     /// Accumulated until the user submits the whole request.
     pub question_selections: HashMap<String, Vec<Vec<String>>>,
+    /// Free-text "other" answers, keyed by (callback id, question index).
+    pub question_other: HashMap<(String, usize), String>,
+    /// Focus handle per other-input, keyed "{callback id}:{question index}".
+    pub other_focus: HashMap<String, FocusHandle>,
     events_task: Option<Task<()>>,
 }
 
@@ -55,6 +59,8 @@ impl SessionView {
             autofocused: false,
             app: None,
             question_selections: HashMap::new(),
+            question_other: HashMap::new(),
+            other_focus: HashMap::new(),
             events_task: None,
         };
         if let Some(rx) = events {
@@ -165,22 +171,33 @@ impl SessionView {
         }
     }
 
-    /// Re-read the full state after a watermark gap.
+    /// Re-read the full state after a watermark gap. The read can itself
+    /// race behind the live stream — either rejected by `adopt`, or adopted
+    /// while buffered events still detect a gap — so keep reading until the
+    /// projection converges (bounded; a persistent failure surfaces in the
+    /// status line).
     fn resync(&mut self, cx: &mut Context<Self>) {
         let conn = self.conn.clone();
         let session_id = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
-            if let Ok(state) = conn.session_read(&session_id).await {
-                let _ = this.update(cx, |view, cx| {
-                    if view.projection.adopt(state) {
-                        cx.notify();
-                    } else {
-                        // The read raced behind the live stream — its
-                        // snapshot is already stale; read again.
-                        view.resync(cx);
-                    }
-                });
+            for _ in 0..8 {
+                let Ok(state) = conn.session_read(&session_id).await else {
+                    return;
+                };
+                let done = this
+                    .update(cx, |view, _cx| {
+                        view.projection.adopt(state) && !view.projection.needs_resync()
+                    })
+                    .unwrap_or(true);
+                if done {
+                    let _ = this.update(cx, |_view, cx| cx.notify());
+                    return;
+                }
             }
+            let _ = this.update(cx, |view, cx| {
+                view.error = Some("session could not catch up with the stream".into());
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -402,6 +419,63 @@ impl SessionView {
             .unwrap_or_default()
     }
 
+    /// Free-text input for a question's "other" answer.
+    pub fn other_text(&self, callback_id: &str, question_index: usize) -> &str {
+        self.question_other
+            .get(&(callback_id.to_string(), question_index))
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// Focus handle for a question's other-input (created lazily).
+    pub fn other_focus_handle(
+        &mut self,
+        callback_id: &str,
+        question_index: usize,
+        cx: &mut Context<Self>,
+    ) -> FocusHandle {
+        self.other_focus
+            .entry(format!("{callback_id}:{question_index}"))
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// Edit the other-answer text: `None` deletes the last char.
+    pub fn edit_other(
+        &mut self,
+        callback_id: &str,
+        question_index: usize,
+        input: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self
+            .question_other
+            .entry((callback_id.to_string(), question_index))
+            .or_default();
+        match input {
+            Some(s) => text.push_str(s),
+            None => {
+                text.pop();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Every question has at least one selected option or a free-text answer
+    /// (when the request permits "other"). A question offering no way to
+    /// answer — no options and `hideOther` — is treated as satisfied.
+    pub fn question_complete(&self, callback_id: &str, request: &UserQuestionRequest) -> bool {
+        request.questions.iter().enumerate().all(|(i, q)| {
+            let chosen = self
+                .question_selections
+                .get(callback_id)
+                .and_then(|s| s.get(i))
+                .is_some_and(|c| !c.is_empty());
+            let other = !q.hide_other && !self.other_text(callback_id, i).trim().is_empty();
+            chosen || other || (q.options.is_empty() && q.hide_other)
+        })
+    }
+
     /// Submit the accumulated answers for a `user_input` callback.
     pub fn submit_question(
         &mut self,
@@ -418,7 +492,7 @@ impl SessionView {
             .iter()
             .enumerate()
             .flat_map(|(i, q)| {
-                selections
+                let mut out: Vec<UserAnswer> = selections
                     .get(i)
                     .cloned()
                     .unwrap_or_default()
@@ -428,7 +502,19 @@ impl SessionView {
                         answer,
                         is_other: false,
                     })
-                    .collect::<Vec<_>>()
+                    .collect();
+                let other = self
+                    .question_other
+                    .remove(&(callback_id.to_string(), i))
+                    .unwrap_or_default();
+                if !q.hide_other && !other.trim().is_empty() {
+                    out.push(UserAnswer {
+                        question: q.question.clone(),
+                        answer: other.trim().to_string(),
+                        is_other: true,
+                    });
+                }
+                out
             })
             .collect();
         self.answer_callback(
@@ -439,15 +525,5 @@ impl SessionView {
             }),
             cx,
         );
-    }
-
-    /// Every question has at least one selected option.
-    pub fn question_complete(&self, callback_id: &str, request: &UserQuestionRequest) -> bool {
-        request.questions.iter().enumerate().all(|(i, _)| {
-            self.question_selections
-                .get(callback_id)
-                .and_then(|s| s.get(i))
-                .is_some_and(|c| !c.is_empty())
-        })
     }
 }
