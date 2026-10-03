@@ -8,6 +8,7 @@ mod host;
 mod session;
 mod theme;
 mod views;
+mod voice;
 
 use app::{Backend, VibeApp};
 use gpui::{px, size, AppContext as _, Application, Bounds, WindowBounds, WindowOptions};

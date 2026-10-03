@@ -494,3 +494,44 @@ async fn history_paging() {
     cleanup(conn, &dir).await;
     cleanup(conn2, &dir).await;
 }
+
+// ── M2b: voice config + narration summarize ─────────────────────────────────
+
+#[tokio::test]
+async fn config_read_returns_voice_views() {
+    let (dir, envs) = store();
+    let conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+
+    let voice = conn.config_read_voice().await.unwrap();
+    assert!(voice.voice_mode_enabled);
+    assert!(voice.narrator_enabled);
+    assert_eq!(voice.speech.model.name, "voxtral-mini-tts-latest");
+    assert_eq!(
+        voice.speech.provider.api_base,
+        "https://tts.fixture.invalid"
+    );
+    assert_eq!(
+        voice.transcription.model.encoding, "pcm_s16le",
+        "transcription model should mirror upstream realtime encoding"
+    );
+    assert_eq!(voice.transcription.model.target_streaming_delay_ms, 240);
+
+    cleanup(conn, &dir).await;
+}
+
+#[tokio::test]
+async fn narration_summarize_returns_summary() {
+    let (dir, envs) = store();
+    let mut conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    let (sid, _rx) = session_with_completed_turn(&mut conn).await;
+
+    let summary = conn
+        .narration_summarize(&sid, "fix the bug", "fixed it")
+        .await
+        .unwrap();
+    assert_eq!(summary.as_deref(), Some("Fixture narration: fix the bug"));
+
+    cleanup(conn, &dir).await;
+}

@@ -8,7 +8,7 @@ use gpui::{
 use vibe_protocol::models::*;
 
 use crate::app::{RailOp, VibeApp};
-use crate::session::{CallbackAnswer, SessionView};
+use crate::session::{CallbackAnswer, Narration, SessionView};
 use crate::theme::{self, c};
 
 fn text(s: impl Into<String>, size: f32, color: gpui::Hsla) -> gpui::Div {
@@ -340,9 +340,7 @@ impl VibeApp {
             .child(
                 // Servers disagree on which marker they fill: some stamp
                 // `archivedAt`, others only flip `status` to "archived".
-                if s.archived_at.is_some()
-                    || matches!(s.status, PublicSessionStatus::Archived)
-                {
+                if s.archived_at.is_some() || matches!(s.status, PublicSessionStatus::Archived) {
                     row("unarchive", RailOp::Archive(false))
                 } else {
                     row("archive", RailOp::Archive(true))
@@ -1222,6 +1220,44 @@ impl SessionView {
         } else {
             text(format!("{}▏", self.composer), 13.0, c(theme::INK))
         };
+        let mic = self.voice.as_ref().is_some_and(|v| v.voice_mode_enabled);
+        let recording = self.dictation.is_some();
+        let rec_level = self
+            .dictation
+            .as_ref()
+            .map(|d| f32::from_bits(d.peak.load(std::sync::atomic::Ordering::Relaxed)))
+            .unwrap_or(0.0);
+        let input = div()
+            .track_focus(&self.composer_focus)
+            .flex_1()
+            .px_4()
+            .py_2p5()
+            .rounded_lg()
+            .bg(c(theme::IVORY))
+            .border_1()
+            .border_color(c(theme::EDGE))
+            .on_key_down(cx.listener(|v, e: &gpui::KeyDownEvent, _w, cx| {
+                match e.keystroke.key.as_str() {
+                    "backspace" => {
+                        v.composer.pop();
+                    }
+                    "enter" => {
+                        if e.keystroke.modifiers.shift {
+                            v.enqueue(cx);
+                        } else {
+                            v.send_message(cx);
+                        }
+                    }
+                    "escape" => v.interrupt(cx),
+                    _ => {
+                        if let Some(ch) = &e.keystroke.key_char {
+                            v.composer.push_str(ch);
+                        }
+                    }
+                }
+                cx.notify();
+            }))
+            .child(content);
         div()
             .id("composer-wrap")
             .px_4()
@@ -1234,39 +1270,58 @@ impl SessionView {
             }))
             .child(
                 div()
-                    .track_focus(&self.composer_focus)
-                    .px_4()
-                    .py_2p5()
-                    .rounded_lg()
-                    .bg(c(theme::IVORY))
-                    .border_1()
-                    .border_color(c(theme::EDGE))
-                    .on_key_down(cx.listener(|v, e: &gpui::KeyDownEvent, _w, cx| {
-                        match e.keystroke.key.as_str() {
-                            "backspace" => {
-                                v.composer.pop();
-                            }
-                            "enter" => {
-                                if e.keystroke.modifiers.shift {
-                                    v.enqueue(cx);
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(input)
+                    .when(mic, |d| {
+                        d.child(
+                            div()
+                                .id("mic-toggle")
+                                .px_3()
+                                .py_2p5()
+                                .rounded_lg()
+                                .cursor_pointer()
+                                .bg(if recording {
+                                    c(theme::RED)
                                 } else {
-                                    v.send_message(cx);
-                                }
-                            }
-                            "escape" => v.interrupt(cx),
-                            _ => {
-                                if let Some(ch) = &e.keystroke.key_char {
-                                    v.composer.push_str(ch);
-                                }
-                            }
-                        }
-                        cx.notify();
-                    }))
-                    .child(content),
+                                    c(theme::IVORY)
+                                })
+                                .border_1()
+                                .border_color(c(theme::EDGE))
+                                .on_click(cx.listener(|v, _e, _w, cx| {
+                                    v.toggle_dictation(cx);
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(text(
+                                            if recording { "■ stop" } else { "● mic" },
+                                            11.0,
+                                            if recording {
+                                                c(theme::PAPER)
+                                            } else {
+                                                c(theme::INK)
+                                            },
+                                        ))
+                                        .when(recording, |d| {
+                                            d.child(
+                                                div()
+                                                    .h(px(8.0))
+                                                    .w(px(3.0 + 24.0 * rec_level))
+                                                    .rounded_sm()
+                                                    .bg(c(theme::PAPER)),
+                                            )
+                                        }),
+                                ),
+                        )
+                    }),
             )
     }
 
-    fn render_status_bar(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = &self.projection.state;
         let queue = state.turn_queue.items.len();
         let mut bar = div()
@@ -1302,6 +1357,42 @@ impl SessionView {
         }
         if let Some(err) = &self.error {
             bar = bar.child(text(format!("error: {err}"), 10.5, c(theme::RED)));
+        }
+        if self.voice.as_ref().is_some_and(|v| v.voice_mode_enabled) {
+            bar = bar.child(
+                div()
+                    .id("narrator-toggle")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _e, _w, cx| v.toggle_narrator(cx)))
+                    .child(text(
+                        if self.narrator_on {
+                            "narrator on"
+                        } else {
+                            "narrator off"
+                        },
+                        10.5,
+                        c(if self.narrator_on {
+                            theme::AMBER
+                        } else {
+                            theme::INK_FAINT
+                        }),
+                    )),
+            );
+            match &self.narrating {
+                Narration::Preparing => {
+                    bar = bar.child(text("preparing narration…", 10.5, c(theme::AMBER)));
+                }
+                Narration::Speaking => {
+                    bar = bar.child(
+                        div()
+                            .id("narration-stop")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|v, _e, _w, cx| v.cancel_narration(cx)))
+                            .child(text("speaking — stop", 10.5, c(theme::AMBER))),
+                    );
+                }
+                Narration::Idle => {}
+            }
         }
         bar.child(div().flex_1()).child(text(
             format!(

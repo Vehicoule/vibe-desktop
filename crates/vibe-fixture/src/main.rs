@@ -1015,9 +1015,7 @@ async fn main() {
                 ] {
                     // An archived row carries `archivedAt` — the rail reads
                     // the timestamp to decide archive vs unarchive.
-                    if demo["status"]["type"] == json!("archived")
-                        && demo["archivedAt"].is_null()
-                    {
+                    if demo["status"]["type"] == json!("archived") && demo["archivedAt"].is_null() {
                         demo["archivedAt"] = json!(1_700_000_000);
                     }
                     let archived = !demo["archivedAt"].is_null()
@@ -1382,13 +1380,17 @@ async fn main() {
                 // consistent) — without this an unarchived stored row would
                 // still report status "archived". A live turn keeps its
                 // running/blocked/failed status; only idle↔archived move.
-                let mut patch_ops =
-                    vec![json!({"op": "replace", "path": format!("/session/{field}"), "value": value})];
+                let mut patch_ops = vec![
+                    json!({"op": "replace", "path": format!("/session/{field}"), "value": value}),
+                ];
                 if field == "archivedAt" {
                     let archived = params["archived"].as_bool().unwrap_or(false);
                     let cur = {
                         let inner = data.inner.lock().await;
-                        inner.session["status"]["type"].as_str().unwrap_or("").to_string()
+                        inner.session["status"]["type"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string()
                     };
                     let status = match (cur.as_str(), archived) {
                         ("idle", true) => Some(json!({"type": "archived"})),
@@ -1748,6 +1750,31 @@ async fn main() {
                         .to_string(),
                     )
                     .await;
+            }
+            "config/read" => {
+                // Voice-bearing ConfigView subset; endpoints point at
+                // unreachable fixture hosts — tests never dial them, they
+                // only verify the client parses the views.
+                respond(json!({
+                    "config": {
+                        "voiceModeEnabled": true,
+                        "narratorEnabled": true,
+                        "speech": {
+                            "model": {"name": "voxtral-mini-tts-latest", "voice": "fixture", "responseFormat": "wav"},
+                            "provider": {"apiBase": "https://tts.fixture.invalid", "apiKeyEnvVar": "VIBE_FIXTURE_TTS_KEY", "client": "mistral"},
+                        },
+                        "transcription": {
+                            "model": {"name": "voxtral-mini-transcribe-realtime-2602", "sampleRate": 16000, "encoding": "pcm_s16le", "language": "en", "targetStreamingDelayMs": 240},
+                            "provider": {"apiBase": "https://transcribe.fixture.invalid", "apiKeyEnvVar": "VIBE_FIXTURE_TRANSCRIBE_KEY", "client": "mistral"},
+                        },
+                    }
+                }))
+                .await;
+            }
+            "narration/summarize" => {
+                respond(json!({"summary": format!("Fixture narration: {}",
+                    params["userMessage"].as_str().unwrap_or(""))}))
+                .await;
             }
             "runtime/read" => {
                 respond(json!({
