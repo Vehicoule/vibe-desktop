@@ -593,3 +593,42 @@ async fn settings_roundtrip_reads_and_writes() {
 
     cleanup(conn, &dir).await;
 }
+
+/// review/state + turnDiff + approve/revert round-trip.
+#[tokio::test]
+async fn review_state_diff_and_mutation() {
+    let (dir, envs) = store();
+    let mut conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    let (sid, _rx) = session_with_completed_turn(&mut conn).await;
+
+    let state = conn.review_state(&sid).await.unwrap();
+    assert_eq!(state.files.len(), 2);
+    assert_eq!(state.scopes.len(), 1);
+    let owner = state.scopes[0].owner.clone();
+    assert!(matches!(
+        owner,
+        vibe_protocol::models::ReviewOwner::Agent { turn_id: 1 }
+    ));
+
+    let diff = conn
+        .review_turn_diff(&sid, "src/main.rs", &owner)
+        .await
+        .unwrap();
+    assert_eq!(diff.status, "modified");
+    assert!(diff.baseline.contains("old_call"));
+    assert!(diff.current.contains("new_call"));
+
+    conn.review_approve(&sid, &vibe_protocol::models::ReviewTarget::File {
+        path: "src/main.rs".into(),
+    })
+    .await
+    .unwrap();
+    conn.review_revert(&sid, &vibe_protocol::models::ReviewTarget::File {
+        path: "src/lib.rs".into(),
+    })
+    .await
+    .unwrap();
+
+    cleanup(conn, &dir).await;
+}

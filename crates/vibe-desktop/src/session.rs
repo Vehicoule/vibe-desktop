@@ -78,6 +78,13 @@ pub struct SessionView {
     /// Config paths with an in-flight `config/write` — repeat clicks
     /// during the write would send the same value again.
     cfg_inflight: HashSet<String>,
+    /// `review/state` snapshot for the review sheet.
+    pub review: Option<ReviewStateResponse>,
+    /// Review sheet open/closed.
+    pub review_open: bool,
+    /// Open per-file diff — (path, owner, response). `None` until
+    /// `review/turnDiff` lands.
+    pub review_diff: Option<(String, ReviewOwner, ReviewTurnDiffResponse)>,
     /// Dictation run in flight while the mic toggle is down.
     pub dictation: Option<DictationRun>,
     dictation_pump: Option<Task<()>>,
@@ -149,6 +156,9 @@ impl SessionView {
             settings_open: false,
             pending_agent: None,
             cfg_inflight: HashSet::new(),
+            review: None,
+            review_open: false,
+            review_diff: None,
             dictation: None,
             dictation_pump: None,
             dictation_meter: None,
@@ -216,6 +226,95 @@ impl SessionView {
             self.load_settings(cx);
         }
         cx.notify();
+    }
+
+    /// Fetch `review/state` for the review sheet.
+    fn load_review(&mut self, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let state = conn.review_state(&sid).await;
+            let _ = this.update(cx, |view, cx| {
+                match state {
+                    Ok(s) => view.review = Some(s),
+                    Err(e) => view.error = Some(format!("review read failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Review sheet toggle — loads the state lazily the first time.
+    pub fn toggle_review(&mut self, cx: &mut Context<Self>) {
+        self.review_open = !self.review_open;
+        if self.review_open && self.review.is_none() {
+            self.load_review(cx);
+        }
+        cx.notify();
+    }
+
+    /// Owner a file belongs to — the scope listing it, else the first
+    /// scope's owner (turnDiff needs an owner even for a plain file view).
+    fn review_owner_for(&self, path: &str) -> Option<ReviewOwner> {
+        let state = self.review.as_ref()?;
+        state
+            .scopes
+            .iter()
+            .find(|s| s.files.iter().any(|f| f.path == path))
+            .or_else(|| state.scopes.first())
+            .map(|s| s.owner.clone())
+    }
+
+    /// `review/turnDiff` — open the baseline→current diff for a file.
+    pub fn open_review_diff(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(owner) = self.review_owner_for(&path) else {
+            return;
+        };
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn.review_turn_diff(&sid, &path, &owner).await;
+            let _ = this.update(cx, |view, cx| {
+                match resp {
+                    Ok(d) => view.review_diff = Some((path.clone(), owner, d)),
+                    Err(e) => view.error = Some(format!("diff read failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn close_review_diff(&mut self, cx: &mut Context<Self>) {
+        self.review_diff = None;
+        cx.notify();
+    }
+
+    /// `review/approve` (`keep`) or `review/revert` for a whole file, then
+    /// refresh the state and close the diff.
+    pub fn review_apply_file(&mut self, path: String, keep: bool, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let target = ReviewTarget::File { path: path.clone() };
+            let result = if keep {
+                conn.review_approve(&sid, &target).await
+            } else {
+                conn.review_revert(&sid, &target).await
+            };
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(()) => {
+                        view.review_diff = None;
+                        view.load_review(cx);
+                    }
+                    Err(e) => view.error = Some(format!("review write failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// `config/model/write` — pin a model (and keep its thinking effort).

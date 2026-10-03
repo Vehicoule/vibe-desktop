@@ -1864,6 +1864,36 @@ async fn main() {
                     params["userMessage"].as_str().unwrap_or(""))}))
                 .await;
             }
+            "review/state" => {
+                respond(json!({
+                    "files": [
+                        {"path": "src/main.rs", "status": "modified", "regions": [
+                            {"kind": "text", "versionIndex": 0, "ordinal": 0, "owner": {"kind": "agent", "turnId": 1}, "baselineStart": 1, "baselineLineCount": 2, "currentStart": 1, "currentLineCount": 3, "decision": "pending", "dependsOn": []}
+                        ]},
+                        {"path": "src/lib.rs", "status": "created", "regions": [
+                            {"kind": "text", "versionIndex": 0, "ordinal": 1, "owner": {"kind": "agent", "turnId": 1}, "baselineStart": 0, "baselineLineCount": 0, "currentStart": 0, "currentLineCount": 2, "decision": "pending", "dependsOn": []}
+                        ]}
+                    ],
+                    "scopes": [
+                        {"owner": {"kind": "agent", "turnId": 1}, "files": [
+                            {"path": "src/main.rs", "status": "modified", "regionCount": 1},
+                            {"path": "src/lib.rs", "status": "created", "regionCount": 1}
+                        ]}
+                    ]
+                }))
+                .await;
+            }
+            "review/turnDiff" => {
+                respond(json!({
+                    "status": "modified",
+                    "baseline": "fn main() {\n    old_call();\n}\n",
+                    "current": "fn main() {\n    old_call();\n    new_call();\n}\n"
+                }))
+                .await;
+            }
+            "review/approve" | "review/revert" => {
+                respond(json!({})).await;
+            }
             "runtime/read" => {
                 respond(json!({
                     "runtime": {

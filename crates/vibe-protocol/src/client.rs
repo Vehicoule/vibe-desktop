@@ -834,6 +834,56 @@ impl Connection {
         )
         .await
     }
+
+    // ── M3b: review diff ─────────────────────────────────────────────────
+
+    /// `review/state` → changed files + per-owner scopes.
+    pub async fn review_state(&self, session_id: &str) -> ClientResult<ReviewStateResponse> {
+        self.request_typed("review/state", json!({"sessionId": session_id}))
+            .await
+    }
+
+    /// `review/turnDiff` → baseline/current contents for one file+owner.
+    pub async fn review_turn_diff(
+        &self,
+        session_id: &str,
+        path: &str,
+        owner: &ReviewOwner,
+    ) -> ClientResult<ReviewTurnDiffResponse> {
+        self.request_typed(
+            "review/turnDiff",
+            json!({"sessionId": session_id, "path": path, "owner": owner}),
+        )
+        .await
+    }
+
+    /// `review/approve` — keep the target's changes (returns `{}`).
+    pub async fn review_approve(
+        &self,
+        session_id: &str,
+        target: &ReviewTarget,
+    ) -> ClientResult<()> {
+        self.request_typed::<serde_json::Value>(
+            "review/approve",
+            json!({"sessionId": session_id, "target": target}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `review/revert` — revert the target's changes (returns `{}`).
+    pub async fn review_revert(
+        &self,
+        session_id: &str,
+        target: &ReviewTarget,
+    ) -> ClientResult<()> {
+        self.request_typed::<serde_json::Value>(
+            "review/revert",
+            json!({"sessionId": session_id, "target": target}),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 impl Drop for Connection {

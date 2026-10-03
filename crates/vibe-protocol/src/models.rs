@@ -1705,3 +1705,140 @@ pub struct AgentSwitchParams {
     pub session_id: String,
     pub agent_name: String,
 }
+
+// --- M3b: review diff ----------------------------------------------------
+
+/// Who produced a review scope (`ReviewOwner` upstream — discriminated by
+/// `kind`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ReviewOwner {
+    Agent { turn_id: i64 },
+    Manual { index: i64 },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewRegionRef {
+    #[serde(default)]
+    pub version_index: u32,
+    #[serde(default)]
+    pub ordinal: u32,
+}
+
+/// `ReviewRegion` upstream — text regions carry line ranges; `decision` is
+/// "pending" | "keep" | "revert".
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ReviewRegion {
+    Text {
+        version_index: u32,
+        ordinal: u32,
+        owner: ReviewOwner,
+        #[serde(default)]
+        baseline_start: u32,
+        #[serde(default)]
+        baseline_line_count: u32,
+        #[serde(default)]
+        current_start: u32,
+        #[serde(default)]
+        current_line_count: u32,
+        decision: String,
+        #[serde(default)]
+        depends_on: Vec<ReviewRegionRef>,
+    },
+    Opaque {
+        version_index: u32,
+        ordinal: u32,
+        owner: ReviewOwner,
+        #[serde(default)]
+        reason: Option<String>,
+        decision: String,
+        #[serde(default)]
+        depends_on: Vec<ReviewRegionRef>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewFile {
+    pub path: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub regions: Vec<ReviewRegion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewScopeFile {
+    pub path: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub region_count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewScope {
+    pub owner: ReviewOwner,
+    #[serde(default)]
+    pub files: Vec<ReviewScopeFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewStateResponse {
+    #[serde(default)]
+    pub files: Vec<ReviewFile>,
+    #[serde(default)]
+    pub scopes: Vec<ReviewScope>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewTurnDiffResponse {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub baseline: String,
+    #[serde(default)]
+    pub current: String,
+}
+
+/// `review/approve|revert` target (`ReviewTarget` upstream, `kind`-tagged).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ReviewTarget {
+    Region {
+        path: String,
+        version_index: u32,
+        ordinal: u32,
+    },
+    Regions {
+        path: String,
+        regions: Vec<ReviewTargetRegionRef>,
+    },
+    Scope {
+        owner: ReviewOwner,
+    },
+    ScopeFile {
+        owner: ReviewOwner,
+        path: String,
+    },
+    File {
+        path: String,
+    },
+    All {},
+    LastTurns {
+        count: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewTargetRegionRef {
+    pub version_index: u32,
+    pub ordinal: u32,
+}

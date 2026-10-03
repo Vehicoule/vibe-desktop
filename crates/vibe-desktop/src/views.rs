@@ -627,6 +627,7 @@ impl Render for SessionView {
             .when_some(self.render_queue_strip(cx), |d, q| d.child(q))
             .when_some(self.render_rewind_sheet(cx), |d, s| d.child(s))
             .when_some(self.render_settings_sheet(cx), |d, s| d.child(s))
+            .when_some(self.render_review_sheet(cx), |d, s| d.child(s))
             .child(self.render_composer(cx))
             .child(self.render_status_bar(cx))
     }
@@ -1358,6 +1359,170 @@ impl SessionView {
         Some(sheet)
     }
 
+    /// Review sheet — changed files grouped by owner scope; clicking a file
+    /// swaps the list for its baseline→current diff with keep/revert.
+    fn render_review_sheet(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.review_open {
+            return None;
+        }
+        let mut sheet = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mx_4()
+            .mb_2()
+            .px_4()
+            .py_3()
+            .rounded_lg()
+            .bg(c(theme::CARD))
+            .border_1()
+            .border_color(c(theme::EDGE))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(text("review", 12.5, c(theme::INK)))
+                    .child(div().flex_1())
+                    .child(
+                        ghost_button("close-review", "close")
+                            .on_click(cx.listener(|v, _e, _w, cx| v.toggle_review(cx))),
+                    ),
+            );
+
+        // ── open diff view ──
+        if let Some((path, _owner, diff)) = &self.review_diff {
+            let keep_path = path.clone();
+            let revert_path = path.clone();
+            let mut lines = div().flex().flex_col();
+            for change in
+                similar::TextDiff::from_lines(&diff.baseline, &diff.current).iter_all_changes()
+            {
+                let (mark, color) = match change.tag() {
+                    similar::ChangeTag::Delete => ("−", theme::RED),
+                    similar::ChangeTag::Insert => ("+", theme::GREEN),
+                    similar::ChangeTag::Equal => (" ", theme::INK_FAINT),
+                };
+                lines = lines.child(text(
+                    format!("{mark}{}", change.value().trim_end()),
+                    10.5,
+                    c(color),
+                ));
+            }
+            return Some(
+                sheet
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(text(
+                                format!("{path} · {}", diff.status),
+                                11.5,
+                                c(theme::INK_SOFT),
+                            ))
+                            .child(div().flex_1())
+                            .child(
+                                ghost_button("review-keep", "keep")
+                                    .on_click(cx.listener(move |v, _e, _w, cx| {
+                                        v.review_apply_file(keep_path.clone(), true, cx)
+                                    })),
+                            )
+                            .child(
+                                ghost_button("review-revert", "revert")
+                                    .on_click(cx.listener(move |v, _e, _w, cx| {
+                                        v.review_apply_file(revert_path.clone(), false, cx)
+                                    })),
+                            )
+                            .child(
+                                ghost_button("review-diff-back", "back")
+                                    .on_click(cx.listener(|v, _e, _w, cx| {
+                                        v.close_review_diff(cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("review-diff-lines")
+                            .max_h(px(280.0))
+                            .overflow_y_scroll()
+                            .child(lines),
+                    ),
+            );
+        }
+
+        // ── file list, grouped by scope ──
+        let Some(state) = &self.review else {
+            return Some(sheet.child(text("no review state", 11.0, c(theme::INK_FAINT))));
+        };
+        let mut listed = Vec::new();
+        for scope in &state.scopes {
+            let scope_label = match &scope.owner {
+                ReviewOwner::Agent { turn_id } => format!("turn {turn_id}"),
+                ReviewOwner::Manual { index } => format!("manual {index}"),
+            };
+            sheet = sheet.child(text(scope_label, 10.5, c(theme::INK_FAINT)));
+            let mut rows = div().flex().flex_col().gap_1();
+            for f in &scope.files {
+                listed.push(f.path.clone());
+                let color = match f.status.as_str() {
+                    "created" => theme::GREEN,
+                    "deleted" => theme::RED,
+                    _ => theme::AMBER,
+                };
+                let path = f.path.clone();
+                rows = rows.child(
+                    div()
+                        .id(SharedString::from(format!("review-file-{}", f.path)))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            v.open_review_diff(path.clone(), cx)
+                        }))
+                        .child(text(
+                            format!("{}  {} ({} region{})", f.path, f.status, f.region_count,
+                                if f.region_count == 1 { "" } else { "s" }),
+                            11.5,
+                            c(color),
+                        )),
+                );
+            }
+            sheet = sheet.child(rows);
+        }
+        // Files not claimed by any scope (regions carry no scope grouping).
+        let unscoped: Vec<&ReviewFile> = state
+            .files
+            .iter()
+            .filter(|f| !listed.iter().any(|p| p == &f.path))
+            .collect();
+        if !unscoped.is_empty() {
+            sheet = sheet.child(text("all files", 10.5, c(theme::INK_FAINT)));
+            let mut rows = div().flex().flex_col().gap_1();
+            for f in unscoped {
+                let color = match f.status.as_str() {
+                    "created" => theme::GREEN,
+                    "deleted" => theme::RED,
+                    _ => theme::AMBER,
+                };
+                let path = f.path.clone();
+                rows = rows.child(
+                    div()
+                        .id(SharedString::from(format!("review-file-{}", f.path)))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            v.open_review_diff(path.clone(), cx)
+                        }))
+                        .child(text(
+                            format!("{}  {} ({} region{})", f.path, f.status, f.regions.len(),
+                                if f.regions.len() == 1 { "" } else { "s" }),
+                            11.5,
+                            c(color),
+                        )),
+                );
+            }
+            sheet = sheet.child(rows);
+        }
+        Some(sheet)
+    }
+
     fn render_composer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.active_turn_id().is_some();
         let hint = if running {
@@ -1550,6 +1715,32 @@ impl SessionView {
                 }
                 Narration::Idle => {}
             }
+        }
+        {
+            let file_count = self
+                .review
+                .as_ref()
+                .map(|r| r.files.len())
+                .unwrap_or(0);
+            bar = bar.child(
+                div()
+                    .id("review-toggle")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _e, _w, cx| v.toggle_review(cx)))
+                    .child(text(
+                        if file_count > 0 {
+                            format!("review ({file_count})")
+                        } else {
+                            "review".to_string()
+                        },
+                        10.5,
+                        c(if self.review_open {
+                            theme::AMBER
+                        } else {
+                            theme::INK_FAINT
+                        }),
+                    )),
+            );
         }
         {
             // Settings must not depend on the voice config reading — the
