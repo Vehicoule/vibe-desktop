@@ -94,6 +94,10 @@ pub struct SessionView {
     /// (`"skill:{name}"` | `"mcp:{name}"`) — second clicks are ignored
     /// while a toggle is unsettled.
     ext_inflight: HashSet<String>,
+    /// Generation for settings reads — a stale `load_settings` batch
+    /// can't undo a newer mutation reply (e.g. `runtime.mcp` after
+    /// `mcp/toggle`).
+    settings_gen: u64,
     /// `review/state` snapshot for the review sheet.
     pub review: Option<ReviewStateResponse>,
     /// Review sheet open/closed.
@@ -186,6 +190,7 @@ impl SessionView {
             plugins: Vec::new(),
             plugin_dropped: Vec::new(),
             ext_inflight: HashSet::new(),
+            settings_gen: 0,
             review: None,
             review_open: false,
             review_diff: None,
@@ -225,8 +230,12 @@ impl SessionView {
         .detach();
     }
 
-    /// Fetch `agents/list` + `config/fields/read` for the settings sheet.
+    /// Fetch `agents/list` + `config/fields/read` + extension reads for
+    /// the settings sheet. `settings_gen` drops a batch that loses the
+    /// race against a newer mutation reply.
     fn load_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_gen += 1;
+        let gen = self.settings_gen;
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -238,8 +247,9 @@ impl SessionView {
             let plugins = conn.plugins_read(&sid).await;
             let _ = this.update(cx, |view, cx| {
                 // A handoff may have swapped the session while this was
-                // in flight — the response belongs to the old session.
-                if view.session_id() != sid {
+                // in flight — the response belongs to the old session; a
+                // newer mutation reply already beat this batch.
+                if view.session_id() != sid || view.settings_gen != gen {
                     return;
                 }
                 if let Ok(list) = agents {
@@ -252,13 +262,20 @@ impl SessionView {
                 if let Ok(inst) = skills {
                     view.ext_skills = inst.skills;
                     // A pending toggle resolves once the list confirms the
-                    // requested state — or the skill disappears.
+                    // requested state — or the skill disappears; resolved
+                    // entries also release their inflight key so the row
+                    // becomes clickable again.
                     view.pending_skills.retain(|name, target| {
-                        view.ext_skills
+                        let unconfirmed = view
+                            .ext_skills
                             .iter()
                             .find(|s| &s.name == name)
                             .map(|s| s.enabled != *target)
-                            .unwrap_or(false)
+                            .unwrap_or(false);
+                        if !unconfirmed {
+                            view.ext_inflight.remove(&format!("skill:{name}"));
+                        }
+                        unconfirmed
                     });
                 }
                 if let Ok(resp) = mcp {
@@ -277,14 +294,11 @@ impl SessionView {
         .detach();
     }
 
-    /// Settings sheet toggle — loads pickers lazily the first time.
+    /// Settings sheet toggle — refreshes every section on every open so
+    /// a read that failed last time retries (gen-guarded).
     pub fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
-        if self.settings_open
-            && self.agents.is_empty()
-            && self.config_fields.is_empty()
-            && self.ext_skills.is_empty()
-        {
+        if self.settings_open {
             self.load_settings(cx);
         }
         cx.notify();
@@ -315,24 +329,31 @@ impl SessionView {
                 if view.session_id() != sid {
                     return;
                 }
-                view.ext_inflight.remove(&key);
                 match resp {
                     Ok(r) if r.rejected => {
+                        view.ext_inflight.remove(&key);
                         view.error = Some(format!(
                             "skill toggle rejected: {}",
                             r.failures.join(", ")
                         ));
                     }
                     Ok(r) if r.status.as_deref() == Some("pending") => {
+                        // Keep the inflight key — the row stays
+                        // non-clickable until a refreshed list confirms
+                        // the requested state (load_settings frees it).
                         view.pending_skills.insert(name.clone(), enabled);
                         view.load_settings(cx);
                     }
                     Ok(_) => {
+                        view.ext_inflight.remove(&key);
                         if let Some(s) = view.ext_skills.iter_mut().find(|s| s.name == name) {
                             s.enabled = enabled;
                         }
                     }
-                    Err(e) => view.error = Some(format!("skill toggle failed: {e}")),
+                    Err(e) => {
+                        view.ext_inflight.remove(&key);
+                        view.error = Some(format!("skill toggle failed: {e}"));
+                    }
                 }
                 cx.notify();
             });
@@ -378,6 +399,10 @@ impl SessionView {
                             .runtime
                             .and_then(|rt| serde_json::from_value::<MCPState>(rt["mcp"].clone()).ok());
                         if let Some(mcp) = fresh {
+                            // Invalidate any settings batch still in
+                            // flight — its older mcp read must not undo
+                            // this toggle's fresh state.
+                            view.settings_gen += 1;
                             view.mcp_state = Some(mcp);
                         } else {
                             view.load_settings(cx);

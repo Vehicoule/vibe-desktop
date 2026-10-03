@@ -1981,12 +1981,21 @@ async fn main() {
             }
             "skills/setEnabled" => {
                 // RuntimeMutationResponse-shaped; persists so installed
-                // reads reflect the toggle.
+                // reads reflect the toggle. Locked skills reject, same
+                // as upstream `_require_toggleable`.
                 let mut states = read_overlay(&store, "skill_states.json");
                 let name = params["name"].as_str().unwrap_or_default();
-                if name.is_empty() || !skills_value(&store).as_array().into_iter().flatten().any(|s| s["name"].as_str() == Some(name)) {
-                    respond_err("invalid_params", "fixture: unknown skill").await;
-                    continue;
+                let skill = skills_value(&store).as_array().into_iter().flatten().find(|s| s["name"].as_str() == Some(name)).cloned();
+                match skill {
+                    None => {
+                        respond_err("invalid_params", "fixture: unknown skill").await;
+                        continue;
+                    }
+                    Some(s) if s["locked"].as_bool().unwrap_or(false) => {
+                        respond(json!({"rejected": true, "failures": [format!("fixture: skill `{name}` is locked")], "status": null})).await;
+                        continue;
+                    }
+                    _ => {}
                 }
                 states.insert(name.to_string(), params["enabled"].clone());
                 if persist_overlay(&store, "skill_states.json", &states).await {

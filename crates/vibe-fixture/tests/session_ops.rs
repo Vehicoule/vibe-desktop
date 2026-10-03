@@ -663,6 +663,13 @@ async fn extensions_roundtrip() {
     let deploy = after.skills.iter().find(|s| s.name == "deploy-notes").unwrap();
     assert!(deploy.enabled);
 
+    // Locked skills reject and stay unchanged.
+    let locked = conn.skills_set_enabled(&sid, "vibe-release", false).await.unwrap();
+    assert!(locked.rejected);
+    assert!(!locked.failures.is_empty());
+    let still = conn.skills_installed(&sid).await.unwrap();
+    assert!(still.skills.iter().find(|s| s.name == "vibe-release").unwrap().enabled);
+
     // mcp: read → toggle → runtime.mcp and the next read both agree.
     let mcp = conn.mcp_read(&sid).await.unwrap();
     let fs = mcp.mcp.sources.iter().find(|s| s.name == "fs").unwrap();
