@@ -463,12 +463,36 @@ async fn set_status(data: &Arc<SessionData>, tx: &Tx, sid: &str, status: Value) 
 /// Status a session lands on when its turn ends without another queued:
 /// archived if it was archived mid-turn, else idle. Also the right status
 /// for a forked child — it inherits the archive marker but not the turn.
-fn terminal_status(session: &Value) -> Value {
+fn status_without_turn(session: &Value) -> Value {
     if session["archivedAt"].is_null() {
         json!({"type": "idle"})
     } else {
         json!({"type": "archived"})
     }
+}
+
+/// Terminal status for `data`, preferring the on-disk record — a rail
+/// process may have archived the session since this one loaded it into
+/// memory (catalog fields are disk-authoritative in `persist`).
+async fn terminal_status(data: &Arc<SessionData>) -> Value {
+    let (id, fallback) = {
+        let inner = data.inner.lock().await;
+        (
+            inner.session["id"].as_str().unwrap_or("").to_string(),
+            status_without_turn(&inner.session),
+        )
+    };
+    if store_safe_id(&id) {
+        let path = data.store.join(format!("{id}.json"));
+        if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+            if let Ok(disk) = serde_json::from_str::<Value>(&raw) {
+                if disk["deleted"] != true {
+                    return status_without_turn(&disk["session"]);
+                }
+            }
+        }
+    }
+    fallback
 }
 
 /// First text block of a queued turn's user entry (what the UI lists).
@@ -814,12 +838,12 @@ async fn finish_turn(
         ),
     )
     .await;
-    let term = {
+    {
         let mut inner = data.inner.lock().await;
         inner.active_turn = None;
         inner.active_abort = None;
-        terminal_status(&inner.session)
-    };
+    }
+    let term = terminal_status(&data).await;
     set_status(&data, &tx2, &sid, term).await;
     send(
         "turn/completed",
@@ -1086,7 +1110,7 @@ async fn main() {
                 session["parentSessionId"] = json!(src);
                 // The child has no turn — it inherits the archive marker,
                 // not the parent's live running/blocked status.
-                session["status"] = terminal_status(&session);
+                session["status"] = terminal_status(&d).await;
                 let fork = Arc::new(SessionData::new(session, store.clone()));
                 {
                     let mut inner = fork.inner.lock().await;
@@ -1267,20 +1291,20 @@ async fn main() {
                             // Interrupting pauses the queue (upstream
                             // _after_turn_terminal).
                             inner.queue_paused = true;
-                            let term = terminal_status(&inner.session);
                             data.persist(&inner).await;
-                            (true, Some(term))
+                            (true, true)
                         }
-                        Some(_) => (false, None),
-                        None => (true, None),
+                        Some(_) => (false, false),
+                        None => (true, false),
                     }
                 };
                 if !aborted {
                     respond_err("invalid_params", "expectedTurnId").await;
                     continue;
                 }
-                if let Some(status) = killed_status {
-                    set_status(&data, &tx, &sid, status).await;
+                if killed_status {
+                    let term = terminal_status(&data).await;
+                    set_status(&data, &tx, &sid, term).await;
                 }
                 respond(json!({"accepted": true, "lastEventId": 0})).await;
                 emit_queue_updated(&tx, &data, &sid).await;
@@ -1458,18 +1482,16 @@ async fn main() {
                     if let Some(abort) = inner.active_abort.take() {
                         abort.abort();
                     }
-                    let term = inner
-                        .active_turn
-                        .is_some()
-                        .then(|| terminal_status(&inner.session));
+                    let killed = inner.active_turn.is_some();
                     if let Some(t) = inner.active_turn.take() {
                         pending_callbacks.lock().await.remove(&format!("cb-{t}"));
                     }
                     data.persist(&inner).await;
-                    (changed, term)
+                    (changed, killed)
                 };
-                if let Some(status) = killed_status {
-                    set_status(&data, &tx, &sid, status).await;
+                if killed_status {
+                    let term = terminal_status(&data).await;
+                    set_status(&data, &tx, &sid, term).await;
                 }
                 if inplace {
                     // Drop the target message and everything after it.
@@ -1512,7 +1534,7 @@ async fn main() {
                     session["parentSessionId"] = json!(sid);
                     // Same normalization: the child's own turn set is empty,
                     // so it must not advertise the parent's activeTurnId.
-                    session["status"] = terminal_status(&session);
+                    session["status"] = terminal_status(&data).await;
                     let child = Arc::new(SessionData::new(session, store.clone()));
                     {
                         let mut inner = child.inner.lock().await;
