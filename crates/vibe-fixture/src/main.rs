@@ -495,6 +495,28 @@ async fn terminal_status(data: &Arc<SessionData>) -> Value {
     fallback
 }
 
+/// Merge the disk-authoritative catalog fields into a session record —
+/// for children built from an in-memory parent snapshot that may have
+/// missed a rail op on another process (same merge `persist` applies).
+async fn refresh_catalog_fields(data: &Arc<SessionData>, session: &mut Value) {
+    let id = session["id"].as_str().unwrap_or("").to_string();
+    if !store_safe_id(&id) {
+        return;
+    }
+    let path = data.store.join(format!("{id}.json"));
+    if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+        if let Ok(disk) = serde_json::from_str::<Value>(&raw) {
+            if disk["deleted"] != true {
+                for key in ["title", "pinnedAt", "archivedAt"] {
+                    if let Some(v) = disk["session"].get(key) {
+                        session[key] = v.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// First text block of a queued turn's user entry (what the UI lists).
 fn queued_item_text(item: &Value) -> String {
     item.pointer("/entries/0/content/0/text")
@@ -1106,11 +1128,15 @@ async fn main() {
                         d.turn_seq.load(Ordering::SeqCst),
                     )
                 };
+                // Refresh catalog fields from the parent's disk record while
+                // the clone still carries the parent's id — a rail process's
+                // archive/rename lands in memory only via this merge.
+                refresh_catalog_fields(&d, &mut session).await;
                 session["id"] = json!(fork_id);
                 session["parentSessionId"] = json!(src);
                 // The child has no turn — it inherits the archive marker,
                 // not the parent's live running/blocked status.
-                session["status"] = terminal_status(&d).await;
+                session["status"] = status_without_turn(&session);
                 let fork = Arc::new(SessionData::new(session, store.clone()));
                 {
                     let mut inner = fork.inner.lock().await;
@@ -1530,11 +1556,12 @@ async fn main() {
                             entry_text(&p.history[idx]),
                         )
                     };
+                    refresh_catalog_fields(&data, &mut session).await;
                     session["id"] = json!(rewind_id);
                     session["parentSessionId"] = json!(sid);
                     // Same normalization: the child's own turn set is empty,
                     // so it must not advertise the parent's activeTurnId.
-                    session["status"] = terminal_status(&data).await;
+                    session["status"] = status_without_turn(&session);
                     let child = Arc::new(SessionData::new(session, store.clone()));
                     {
                         let mut inner = child.inner.lock().await;
