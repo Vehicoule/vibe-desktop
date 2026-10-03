@@ -279,10 +279,13 @@ impl VibeApp {
                 RailOp::Pin(p) => s.pinned_at = if *p { stamp } else { None },
                 RailOp::Archive(a) => {
                     s.archived_at = if *a { stamp } else { None };
-                    s.status = if *a {
-                        PublicSessionStatus::Archived
-                    } else {
-                        PublicSessionStatus::Idle
+                    // Turn status is orthogonal: a live Running/Blocked
+                    // keeps its activeTurnId (steer/interrupt still work);
+                    // only Idle↔Archived translate.
+                    s.status = match (&s.status, a) {
+                        (PublicSessionStatus::Archived, false) => PublicSessionStatus::Idle,
+                        (PublicSessionStatus::Idle, true) => PublicSessionStatus::Archived,
+                        (other, _) => other.clone(),
                     };
                 }
                 RailOp::Rename(t) => s.title = Some(t.clone()),
@@ -299,10 +302,14 @@ impl VibeApp {
                             RailOp::Pin(p) => s.pinned_at = if *p { stamp } else { None },
                             RailOp::Archive(a) => {
                                 s.archived_at = if *a { stamp } else { None };
-                                s.status = if *a {
-                                    PublicSessionStatus::Archived
-                                } else {
-                                    PublicSessionStatus::Idle
+                                s.status = match (&s.status, a) {
+                                    (PublicSessionStatus::Archived, false) => {
+                                        PublicSessionStatus::Idle
+                                    }
+                                    (PublicSessionStatus::Idle, true) => {
+                                        PublicSessionStatus::Archived
+                                    }
+                                    (other, _) => other.clone(),
                                 };
                             }
                             RailOp::Rename(t) => s.title = Some(t.clone()),

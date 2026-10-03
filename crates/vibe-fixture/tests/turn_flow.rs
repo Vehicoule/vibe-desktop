@@ -196,9 +196,26 @@ async fn interrupt_returns_accepted() {
         .unwrap();
     let sid = state.session.id.clone();
     let turn = conn.turn_start(&sid, "work").await.unwrap();
+    // session.status must project the live turn — clients gate
+    // steer/interrupt on `active_turn_id` (status was idle-only before,
+    // which deaded both controls against the fixture).
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let st = conn.session_read(&sid).await.unwrap();
+    assert_eq!(
+        st.session.status,
+        vibe_protocol::models::PublicSessionStatus::Running {
+            active_turn_id: turn.id.clone()
+        }
+    );
     // interrupt is fire-and-forget correct: fixture accepts it when the
     // expected turn id matches (upstream rejects a stale id).
     conn.turn_interrupt(&sid, &turn.id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let st = conn.session_read(&sid).await.unwrap();
+    assert_eq!(
+        st.session.status,
+        vibe_protocol::models::PublicSessionStatus::Idle
+    );
     conn.session_stop(&sid).await.unwrap();
     drop(conn);
     tokio::time::sleep(Duration::from_millis(50)).await;

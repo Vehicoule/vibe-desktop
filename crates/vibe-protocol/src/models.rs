@@ -354,7 +354,7 @@ pub struct AgentSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum PublicSessionStatus {
     Idle,
     Running {

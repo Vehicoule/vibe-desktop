@@ -446,6 +446,20 @@ async fn emit_queue_updated(tx: &Tx, data: &Arc<SessionData>, sid: &str) {
         .await;
 }
 
+/// Project turn state into `session.status` — the real server keeps it in
+/// the session record (running/blocked/idle) so clients can derive the
+/// active turn id; the fixture serialized "idle" forever before this.
+async fn set_status(data: &Arc<SessionData>, tx: &Tx, sid: &str, status: Value) {
+    data.set_session_field("status", status.clone()).await;
+    emit_updated(
+        tx,
+        data,
+        sid,
+        json!([{"op": "replace", "path": "/session/status", "value": status}]),
+    )
+    .await;
+}
+
 /// First text block of a queued turn's user entry (what the UI lists).
 fn queued_item_text(item: &Value) -> String {
     item.pointer("/entries/0/content/0/text")
@@ -526,10 +540,19 @@ async fn spawn_turn(
         tx.clone(),
         pending.clone(),
     ));
-    let mut inner = data.inner.lock().await;
-    inner.active_turn = Some(turn_id.clone());
-    inner.active_abort = Some(task.abort_handle());
-    data.persist(&inner).await;
+    {
+        let mut inner = data.inner.lock().await;
+        inner.active_turn = Some(turn_id.clone());
+        inner.active_abort = Some(task.abort_handle());
+        data.persist(&inner).await;
+    }
+    set_status(
+        data,
+        tx,
+        sid,
+        json!({"type": "running", "activeTurnId": turn_id}),
+    )
+    .await;
     turn_id
 }
 
@@ -677,6 +700,18 @@ async fn run_turn_script(
         .lock()
         .await
         .insert(callback_id.clone(), (data.clone(), n, turn_id.clone()));
+    set_status(
+        &data,
+        &tx2,
+        &sid,
+        json!({
+            "type": "blocked",
+            "activeTurnId": turn_id,
+            "callbackId": callback_id,
+            "reason": "approval",
+        }),
+    )
+    .await;
     server_request(
         json!(format!("srv-cb-{n}")),
         "callback/call".to_string(),
@@ -773,6 +808,7 @@ async fn finish_turn(
         inner.active_turn = None;
         inner.active_abort = None;
     }
+    set_status(&data, &tx2, &sid, json!({"type": "idle"})).await;
     send(
         "turn/completed",
         evt(
@@ -815,6 +851,11 @@ async fn main() {
             Ok(v) => v,
             Err(_) => continue,
         };
+        // Client responses to fixture→client requests (callback/call) share
+        // the pipe: they carry `result`/`error` and no method — not ours.
+        if env.get("method").is_none() {
+            continue;
+        }
         let id = env.get("id").cloned();
         let method = env
             .get("method")
@@ -1068,6 +1109,17 @@ async fn main() {
                     let tx2 = tx.clone();
                     let pending = pending_callbacks.clone();
                     let output = params["output"].clone();
+                    let sid = {
+                        let inner = data.inner.lock().await;
+                        inner.session["id"].as_str().unwrap_or("").to_string()
+                    };
+                    set_status(
+                        &data,
+                        &tx2,
+                        &sid,
+                        json!({"type": "running", "activeTurnId": turn_id}),
+                    )
+                    .await;
                     tokio::spawn(async move {
                         finish_turn(data, n, turn_id, output, tx2, pending).await;
                     });
@@ -1188,7 +1240,7 @@ async fn main() {
                 // expectedTurnId"). Abort first and a stale id strands the
                 // queue: the script dies but active_turn stays set, so
                 // nothing can promote.
-                let aborted = {
+                let (aborted, killed) = {
                     let mut inner = data.inner.lock().await;
                     match inner.active_turn.clone() {
                         Some(t) if expected.is_empty() || t == expected => {
@@ -1201,15 +1253,18 @@ async fn main() {
                             // _after_turn_terminal).
                             inner.queue_paused = true;
                             data.persist(&inner).await;
-                            true
+                            (true, true)
                         }
-                        Some(_) => false,
-                        None => true,
+                        Some(_) => (false, false),
+                        None => (true, false),
                     }
                 };
                 if !aborted {
                     respond_err("invalid_params", "expectedTurnId").await;
                     continue;
+                }
+                if killed {
+                    set_status(&data, &tx, &sid, json!({"type": "idle"})).await;
                 }
                 respond(json!({"accepted": true, "lastEventId": 0})).await;
                 emit_queue_updated(&tx, &data, &sid).await;
@@ -1259,19 +1314,27 @@ async fn main() {
                 data.set_session_field(field, value.clone()).await;
                 // `status.type` tracks archive state too (upstream keeps them
                 // consistent) — without this an unarchived stored row would
-                // still report status "archived".
+                // still report status "archived". A live turn keeps its
+                // running/blocked/failed status; only idle↔archived move.
                 let mut patch_ops =
                     vec![json!({"op": "replace", "path": format!("/session/{field}"), "value": value})];
                 if field == "archivedAt" {
-                    let status = if params["archived"].as_bool().unwrap_or(false) {
-                        json!({"type": "archived"})
-                    } else {
-                        json!({"type": "idle"})
+                    let archived = params["archived"].as_bool().unwrap_or(false);
+                    let cur = {
+                        let inner = data.inner.lock().await;
+                        inner.session["status"]["type"].as_str().unwrap_or("").to_string()
                     };
-                    data.set_session_field("status", status.clone()).await;
-                    patch_ops.push(
-                        json!({"op": "replace", "path": "/session/status", "value": status}),
-                    );
+                    let status = match (cur.as_str(), archived) {
+                        ("idle", true) => Some(json!({"type": "archived"})),
+                        ("archived", false) => Some(json!({"type": "idle"})),
+                        _ => None,
+                    };
+                    if let Some(status) = status {
+                        data.set_session_field("status", status.clone()).await;
+                        patch_ops.push(
+                            json!({"op": "replace", "path": "/session/status", "value": status}),
+                        );
+                    }
                 }
                 let body = match field {
                     "pinnedAt" => json!({"pinnedAt": value}),
@@ -1369,7 +1432,7 @@ async fn main() {
                 // either way: kills the active turn and clears the queue, then
                 // emits turn/queueUpdated if anything changed. The new state
                 // travels in the RESPONSE (state), not a history patch.
-                let queue_changed = {
+                let (queue_changed, killed_turn) = {
                     let mut inner = data.inner.lock().await;
                     let changed = !inner.queue_items.is_empty()
                         || inner.queue_paused
@@ -1379,12 +1442,16 @@ async fn main() {
                     if let Some(abort) = inner.active_abort.take() {
                         abort.abort();
                     }
+                    let killed = inner.active_turn.is_some();
                     if let Some(t) = inner.active_turn.take() {
                         pending_callbacks.lock().await.remove(&format!("cb-{t}"));
                     }
                     data.persist(&inner).await;
-                    changed
+                    (changed, killed)
                 };
+                if killed_turn {
+                    set_status(&data, &tx, &sid, json!({"type": "idle"})).await;
+                }
                 if inplace {
                     // Drop the target message and everything after it.
                     let (message, state) = {
