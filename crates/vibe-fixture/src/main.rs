@@ -148,10 +148,6 @@ impl SessionData {
             json!(inner.history.clone()),
         )
     }
-
-    async fn clone_history(&self) -> Vec<Value> {
-        self.inner.lock().await.history.clone()
-    }
 }
 
 fn session_value(id: &str, cwd: &str, status: Value) -> Value {
@@ -499,13 +495,19 @@ async fn main() {
                 let fork = Arc::new(SessionData::new(session, store.clone()));
                 {
                     let mut inner = fork.inner.lock().await;
-                    inner.history = d.clone_history().await;
-                    inner.event_id = d.inner.lock().await.event_id;
+                    // Snapshot the parent's history and watermark under a
+                    // single inner lock — separate acquisitions could see
+                    // an entry the other missed, giving the child a
+                    // watermark ahead of its history.
+                    let parent = d.inner.lock().await;
+                    inner.history = parent.history.clone();
+                    inner.event_id = parent.event_id;
                     // Continue the parent's turn counter so the
                     // child's entry ids can never collide with the
                     // history it just inherited.
                     fork.turn_seq
                         .store(d.turn_seq.load(Ordering::SeqCst), Ordering::SeqCst);
+                    drop(parent);
                     fork.persist(&inner).await;
                 }
                 // Return the CHILD's state — the caller opens it.
