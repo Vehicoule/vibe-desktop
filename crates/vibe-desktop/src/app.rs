@@ -35,6 +35,8 @@ pub struct VibeApp {
     pub rename_focus: FocusHandle,
     pub status: String,
     pub spawning: bool,
+    /// Rail includes archived sessions (and offers unarchive) when set.
+    pub show_archived: bool,
     catalog_spawned: bool,
 }
 
@@ -72,6 +74,7 @@ impl VibeApp {
             rename_focus: cx.focus_handle(),
             status: "starting…".into(),
             spawning: false,
+            show_archived: false,
             catalog_spawned: false,
         };
         app.refresh_sessions(cx);
@@ -112,6 +115,7 @@ impl VibeApp {
         }
         self.catalog_spawned = true;
         let program = self.program();
+        let include_archived = self.show_archived;
         self.status = format!("connecting to {}…", program.display());
         cx.notify();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -131,7 +135,7 @@ impl VibeApp {
                         let page = conn
                             .session_list(SessionListParams {
                                 cursor: cursor.take(),
-                                include_archived: false,
+                                include_archived,
                                 ..Default::default()
                             })
                             .await?;
@@ -245,16 +249,26 @@ impl VibeApp {
         .detach();
     }
 
+    /// Toggle archived rows in the rail and reload the catalog.
+    pub fn toggle_archived(&mut self, cx: &mut Context<Self>) {
+        self.show_archived = !self.show_archived;
+        self.refresh_sessions(cx);
+    }
+
     /// Reflect a completed rail op in the catalog row and any open view's
     /// projection — the wire ops don't echo back over other connections.
     fn apply_rail_op(&mut self, session_id: &str, op: RailOp, cx: &mut Context<Self>) {
         let stamp = Some(1_700_000_000);
-        if matches!(op, RailOp::Archive(true) | RailOp::Delete) {
+        // Archiving hides the row only while the rail shows unarchived
+        // sessions; with archived rows visible it stays, marked archived.
+        let hide_row = matches!(op, RailOp::Delete)
+            || (matches!(op, RailOp::Archive(true)) && !self.show_archived);
+        if hide_row {
             self.sessions.retain(|s| s.id != session_id);
         } else if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             match &op {
                 RailOp::Pin(p) => s.pinned_at = if *p { stamp } else { None },
-                RailOp::Archive(_) => s.archived_at = None,
+                RailOp::Archive(a) => s.archived_at = if *a { stamp } else { None },
                 RailOp::Rename(t) => s.title = Some(t.clone()),
                 RailOp::Delete => {}
             }

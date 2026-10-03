@@ -195,9 +195,10 @@ async fn interrupt_returns_accepted() {
         .await
         .unwrap();
     let sid = state.session.id.clone();
-    conn.turn_start(&sid, "work").await.unwrap();
-    // interrupt is fire-and-forget correct: fixture accepts it.
-    conn.turn_interrupt(&sid, "turn-1").await.unwrap();
+    let turn = conn.turn_start(&sid, "work").await.unwrap();
+    // interrupt is fire-and-forget correct: fixture accepts it when the
+    // expected turn id matches (upstream rejects a stale id).
+    conn.turn_interrupt(&sid, &turn.id).await.unwrap();
     conn.session_stop(&sid).await.unwrap();
     drop(conn);
     tokio::time::sleep(Duration::from_millis(50)).await;

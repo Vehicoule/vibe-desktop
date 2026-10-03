@@ -257,10 +257,26 @@ impl VibeApp {
             )
             .child(div().px_2().py_1().child(continue_btn))
             .child(
-                div().px_2().child(
-                    ghost_button("refresh", "⟳ refresh")
-                        .on_click(cx.listener(|app, _e, _w, cx| app.refresh_sessions(cx))),
-                ),
+                div()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .child(
+                        ghost_button("refresh", "⟳ refresh")
+                            .on_click(cx.listener(|app, _e, _w, cx| app.refresh_sessions(cx))),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        ghost_button(
+                            "toggle-archived",
+                            if self.show_archived {
+                                "☑ archived"
+                            } else {
+                                "☐ archived"
+                            },
+                        )
+                        .on_click(cx.listener(|app, _e, _w, cx| app.toggle_archived(cx))),
+                    ),
             )
             .child(list)
             .child(
@@ -321,7 +337,11 @@ impl VibeApp {
                     }))
                     .child("rename…"),
             )
-            .child(row("archive", RailOp::Archive(true)))
+            .child(if s.archived_at.is_some() {
+                row("unarchive", RailOp::Archive(false))
+            } else {
+                row("archive", RailOp::Archive(true))
+            })
             .child(row("delete", RailOp::Delete))
     }
 
@@ -1121,9 +1141,10 @@ impl SessionView {
             .child(text("rewind to this message?", 12.5, c(theme::INK)))
             .child(text(dlg.preview.clone(), 11.0, c(theme::INK_SOFT)));
         match dlg.has_changes {
-            None => {
+            None if dlg.read_error.is_none() => {
                 sheet = sheet.child(text("checking file changes…", 11.0, c(theme::INK_FAINT)));
             }
+            None => {}
             Some(true) => {
                 sheet = sheet
                     .child(text(
@@ -1154,15 +1175,22 @@ impl SessionView {
             }
             Some(false) => {}
         }
-        sheet = sheet.child(
-            div()
-                .flex()
-                .gap_2()
-                .justify_end()
-                .child(
-                    ghost_button("cancel-rewind", "cancel")
-                        .on_click(cx.listener(|v, _e, _w, cx| v.close_rewind(cx))),
-                )
+        if let Some(err) = &dlg.read_error {
+            sheet = sheet.child(text(
+                format!("file-change preview failed: {err}"),
+                11.0,
+                c(theme::RED),
+            ));
+        }
+        let mut actions = div().flex().gap_2().justify_end().child(
+            ghost_button("cancel-rewind", "cancel")
+                .on_click(cx.listener(|v, _e, _w, cx| v.close_rewind(cx))),
+        );
+        // Rewind only once the preview resolves — truncating blind would
+        // hide whether files changed (and a failed read means we can't
+        // vouch for the path list either).
+        if dlg.has_changes.is_some() {
+            actions = actions
                 .child(
                     ghost_button("rewind-here", "rewind here")
                         .on_click(cx.listener(|v, _e, _w, cx| v.apply_rewind(true, cx))),
@@ -1170,8 +1198,9 @@ impl SessionView {
                 .child(
                     accent_button("rewind-fork", "rewind into new session")
                         .on_click(cx.listener(|v, _e, _w, cx| v.apply_rewind(false, cx))),
-                ),
-        );
+                );
+        }
+        sheet = sheet.child(actions);
         Some(sheet)
     }
 

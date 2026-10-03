@@ -40,6 +40,18 @@ fn queue_value(inner: &SessionInner) -> Value {
     json!({"items": inner.queue_items, "paused": inner.queue_paused, "maxItems": 32})
 }
 
+/// Trusted cwd set — file-backed in the shared store like the real
+/// settings file, so trust survives across fixture processes.
+async fn trusted_cwds(store: &std::path::Path) -> std::collections::HashSet<String> {
+    tokio::fs::read_to_string(store.join("trusted.json"))
+        .await
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
 fn inner_default() -> SessionInner {
     SessionInner {
         session: json!({}),
@@ -114,9 +126,32 @@ impl SessionData {
     }
 
     /// Snapshot current contents to the shared store (atomic write).
+    ///
+    /// Catalog fields (`title`, `pinnedAt`, `archivedAt`) are
+    /// disk-authoritative: rail ops can land on a different fixture
+    /// process than the one holding a running turn, and the turn's later
+    /// persists must not revert them — or resurrect a tombstoned session.
     async fn persist(&self, inner: &SessionInner) {
+        let id = inner.session["id"].as_str().unwrap_or("x");
+        if !store_safe_id(id) {
+            return;
+        }
+        let path = self.store.join(format!("{id}.json"));
+        let mut session = inner.session.clone();
+        if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+            if let Ok(disk) = serde_json::from_str::<Value>(&raw) {
+                if disk["deleted"] == true {
+                    return;
+                }
+                for k in ["title", "pinnedAt", "archivedAt"] {
+                    if disk["session"].get(k).is_some() {
+                        session[k] = disk["session"][k].clone();
+                    }
+                }
+            }
+        }
         let body = json!({
-            "session": inner.session,
+            "session": session,
             "history": inner.history,
             "event_id": inner.event_id,
             "turn_seq": self.turn_seq.load(Ordering::SeqCst),
@@ -124,11 +159,6 @@ impl SessionData {
             "queue_paused": inner.queue_paused,
             "queue_seq": self.queue_seq.load(Ordering::SeqCst),
         });
-        let id = inner.session["id"].as_str().unwrap_or("x");
-        if !store_safe_id(id) {
-            return;
-        }
-        let path = self.store.join(format!("{id}.json"));
         let tmp = self.store.join(format!("{id}.json.tmp"));
         if tokio::fs::write(&tmp, body.to_string()).await.is_ok() {
             let _ = tokio::fs::rename(&tmp, &path).await;
@@ -176,9 +206,26 @@ impl SessionData {
 
     /// Mutate one field of the session record (title, pinnedAt, …) and
     /// persist under the same lock — returned patch carries the new value.
+    /// The disk file gets the field first so concurrent persists on other
+    /// fixture processes pick it up as disk-authoritative.
     async fn set_session_field(&self, key: &str, value: Value) {
         let mut inner = self.inner.lock().await;
-        inner.session[key] = value;
+        inner.session[key] = value.clone();
+        let id = inner.session["id"].as_str().unwrap_or("x");
+        if store_safe_id(id) {
+            let path = self.store.join(format!("{id}.json"));
+            if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+                if let Ok(mut disk) = serde_json::from_str::<Value>(&raw) {
+                    if disk["deleted"] != true {
+                        disk["session"][key] = value;
+                        let tmp = self.store.join(format!("{id}.json.tmp"));
+                        if tokio::fs::write(&tmp, disk.to_string()).await.is_ok() {
+                            let _ = tokio::fs::rename(&tmp, &path).await;
+                        }
+                    }
+                }
+            }
+        }
         self.persist(&inner).await;
     }
 
@@ -756,9 +803,6 @@ async fn main() {
         BTreeMap::<String, Arc<SessionData>>::new(),
     ));
     let pending_callbacks: PendingCallbacks = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
-    let trusted_cwds = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashSet::<String>::new(),
-    ));
     let store = store_dir();
     let _ = tokio::fs::create_dir_all(&store).await;
 
@@ -915,6 +959,20 @@ async fn main() {
             "session/resume" | "session/read" => {
                 let sid = params["sessionId"].as_str().unwrap_or("saved-aaaa1111");
                 let data = find_session(&sessions, &store, sid).await;
+                // A tombstoned id reads as not_found, never the demo stub —
+                // read must not resurrect a deleted session.
+                let tombstoned = data.is_none() && {
+                    store_safe_id(sid)
+                        && tokio::fs::read_to_string(store.join(format!("{sid}.json")))
+                            .await
+                            .ok()
+                            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                            .is_some_and(|v| v["deleted"] == true)
+                };
+                if tombstoned {
+                    respond_err("not_found", "session").await;
+                    continue;
+                }
                 let state = match data {
                     Some(d) => {
                         sessions.lock().await.insert(sid.to_string(), d.clone());
@@ -1118,21 +1176,33 @@ async fn main() {
                     respond_err("not_found", "session").await;
                     continue;
                 };
-                // Interrupting pauses the queue (upstream _after_turn_terminal).
-                {
+                // Upstream validates expectedTurnId BEFORE aborting
+                // (`_require_active_turn` raises "Active turn does not match
+                // expectedTurnId"). Abort first and a stale id strands the
+                // queue: the script dies but active_turn stays set, so
+                // nothing can promote.
+                let aborted = {
                     let mut inner = data.inner.lock().await;
-                    if let Some(abort) = inner.active_abort.take() {
-                        abort.abort();
-                    }
-                    if let Some(t) = inner.active_turn.take() {
-                        if expected.is_empty() || t == expected {
+                    match inner.active_turn.clone() {
+                        Some(t) if expected.is_empty() || t == expected => {
+                            if let Some(abort) = inner.active_abort.take() {
+                                abort.abort();
+                            }
+                            inner.active_turn = None;
                             pending_callbacks.lock().await.remove(&format!("cb-{t}"));
-                        } else {
-                            inner.active_turn = Some(t);
+                            // Interrupting pauses the queue (upstream
+                            // _after_turn_terminal).
+                            inner.queue_paused = true;
+                            data.persist(&inner).await;
+                            true
                         }
+                        Some(_) => false,
+                        None => true,
                     }
-                    inner.queue_paused = true;
-                    data.persist(&inner).await;
+                };
+                if !aborted {
+                    respond_err("invalid_params", "expectedTurnId").await;
+                    continue;
                 }
                 respond(json!({"accepted": true, "lastEventId": 0})).await;
                 emit_queue_updated(&tx, &data, &sid).await;
@@ -1278,6 +1348,26 @@ async fn main() {
                 } else {
                     json!([])
                 };
+                // Upstream _rewind runs _turns.reset() on the source session
+                // either way: kills the active turn and clears the queue, then
+                // emits turn/queueUpdated if anything changed. The new state
+                // travels in the RESPONSE (state), not a history patch.
+                let queue_changed = {
+                    let mut inner = data.inner.lock().await;
+                    let changed = !inner.queue_items.is_empty()
+                        || inner.queue_paused
+                        || inner.active_turn.is_some();
+                    inner.queue_items.clear();
+                    inner.queue_paused = false;
+                    if let Some(abort) = inner.active_abort.take() {
+                        abort.abort();
+                    }
+                    if let Some(t) = inner.active_turn.take() {
+                        pending_callbacks.lock().await.remove(&format!("cb-{t}"));
+                    }
+                    data.persist(&inner).await;
+                    changed
+                };
                 if inplace {
                     // Drop the target message and everything after it.
                     let (message, state) = {
@@ -1285,30 +1375,21 @@ async fn main() {
                         let message = entry_text(&inner.history[idx]);
                         inner.history.truncate(idx);
                         inner.event_id += 1;
+                        let state = state_value(
+                            inner.session.clone(),
+                            inner.event_id,
+                            json!(inner.history.clone()),
+                            Value::Null,
+                            queue_value(&inner),
+                        );
                         data.persist(&inner).await;
-                        (
-                            message,
-                            state_value(
-                                inner.session.clone(),
-                                inner.event_id,
-                                json!(inner.history.clone()),
-                                Value::Null,
-                                queue_value(&inner),
-                            ),
-                        )
+                        (message, state)
                     };
                     respond(json!({
                         "message": message, "restoreErrors": [],
                         "restoredPaths": restored, "state": state,
                         "sessionLog": {"enabled": false}
                     }))
-                    .await;
-                    emit_updated(
-                        &tx,
-                        &data,
-                        &sid,
-                        json!([{"op": "replace", "path": "/history", "value": state["history"]}]),
-                    )
                     .await;
                 } else {
                     // Fork semantics: parent keeps its history; the child
@@ -1342,6 +1423,9 @@ async fn main() {
                         "sessionLog": {"enabled": false}
                     }))
                     .await;
+                }
+                if queue_changed {
+                    emit_queue_updated(&tx, &data, &sid).await;
                 }
             }
             "session/history/list" => {
@@ -1398,7 +1482,7 @@ async fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or("/tmp")
                     .to_string();
-                let trusted = trusted_cwds.lock().await.contains(&cwd);
+                let trusted = trusted_cwds(&store).await.contains(&cwd);
                 if trusted {
                     respond(json!({"status": "trusted", "details": null})).await;
                 } else {
@@ -1410,7 +1494,7 @@ async fn main() {
                             "detectedFiles": [".vibe/settings.toml"],
                             "repoDetectedFiles": [],
                             "repoExplicitlyUntrusted": false,
-                            "settingsPath": "/tmp/.vibe/trusted.json",
+                            "settingsPath": store.join("trusted.json").to_string_lossy(),
                             "availableDecisions": ["trust_repo", "trust_cwd", "decline"]
                         }
                     }))
@@ -1424,7 +1508,15 @@ async fn main() {
                     .unwrap_or("/tmp")
                     .to_string();
                 if params["decision"].as_str().unwrap_or("decline") != "decline" {
-                    trusted_cwds.lock().await.insert(cwd);
+                    let mut set = trusted_cwds(&store).await;
+                    set.insert(cwd);
+                    let mut list: Vec<String> = set.into_iter().collect();
+                    list.sort();
+                    let _ = tokio::fs::write(
+                        store.join("trusted.json"),
+                        serde_json::to_string(&list).unwrap_or_default(),
+                    )
+                    .await;
                 }
                 respond(json!({})).await;
             }
@@ -1434,12 +1526,16 @@ async fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or("/tmp")
                     .to_string();
-                let dirs = if trusted_cwds.lock().await.contains(&cwd) {
+                let dirs = if trusted_cwds(&store).await.contains(&cwd) {
                     json!([])
                 } else {
                     json!([cwd])
                 };
-                respond(json!({"dirs": dirs, "settingsPath": "/tmp/.vibe/trusted.json"})).await;
+                respond(json!({
+                    "dirs": dirs,
+                    "settingsPath": store.join("trusted.json").to_string_lossy()
+                }))
+                .await;
             }
             "session/compact" => {
                 let sid = params["sessionId"].as_str().unwrap_or("");

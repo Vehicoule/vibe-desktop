@@ -202,9 +202,14 @@ async fn queue_enqueue_remove_resume() {
     let queue = conn.turn_queue_read(&sid).await.unwrap();
     assert!(queue.items.is_empty());
 
-    // Interrupt pauses the queue (upstream _after_turn_terminal). The
-    // expected turn id must match — a mismatch keeps the turn active and
-    // nothing promotes (asserted by the resume leg below).
+    // A stale expectedTurnId is rejected without side effects — the
+    // running turn and the queue must survive (upstream raises
+    // "Active turn does not match expectedTurnId").
+    assert!(conn.turn_interrupt(&sid, "bogus-turn").await.is_err());
+    let queue = conn.turn_queue_read(&sid).await.unwrap();
+    assert!(!queue.paused);
+
+    // Interrupt pauses the queue (upstream _after_turn_terminal).
     conn.turn_interrupt(&sid, &turn.id).await.unwrap();
     wait_for(&mut rx, |m| {
         matches!(m, ServerMessage::Notification { method, params, .. }
@@ -290,7 +295,7 @@ async fn rewind_fork_and_inplace() {
     let (dir, envs) = store();
     let mut conn = spawn_fixture(&envs).await;
     conn.initialize(info(), caps()).await.unwrap();
-    let (sid, mut rx) = session_with_completed_turn(&mut conn).await;
+    let (sid, _rx) = session_with_completed_turn(&mut conn).await;
 
     let state = conn.session_read(&sid).await.unwrap();
     let history = state.history.as_deref().unwrap_or(&[]);
@@ -335,14 +340,59 @@ async fn rewind_fork_and_inplace() {
         resp.state.history.as_deref().map(<[_]>::len),
         Some(child_len)
     );
-    // The truncation is observable via session/updated.
-    wait_for(
-        &mut rx,
-        |m| matches!(m, ServerMessage::Notification { method, .. } if method == "session/updated"),
-    )
-    .await;
+    // Upstream carries the truncated state in the rewind RESPONSE, not a
+    // /history patch (projection only applies session/updated to session
+    // metadata). Nothing else should be emitted when the queue was empty.
     let state = conn.session_read(&sid).await.unwrap();
     assert_eq!(state.history.as_deref().map(<[_]>::len), Some(child_len));
+
+    cleanup(conn, &dir).await;
+}
+
+/// Deleting a session with a running turn must stick: the orphaned
+/// script keeps persisting, and each later write must bounce off the
+/// tombstone instead of resurrecting the catalog row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_during_active_turn_stays_deleted() {
+    let (dir, envs) = store();
+    let conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+
+    let state = conn
+        .session_start(SessionStartParams {
+            agent_config: AgentConfig {
+                cwd: Some("/tmp/demo-delete".into()),
+                ..Default::default()
+            },
+            history_limit: 50,
+            idempotency_key: None,
+            kind: None,
+        })
+        .await
+        .unwrap();
+    let sid = state.session.id.clone();
+    conn.turn_start(&sid, "keep me busy").await.unwrap();
+
+    conn.request("session/delete", serde_json::json!({"sessionId": sid}))
+        .await
+        .unwrap();
+
+    // Let the orphaned turn run long enough to persist again (the
+    // scripted turn bumps/persists on every emitted entry).
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let list = conn
+        .session_list(SessionListParams {
+            include_archived: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        !list.items.iter().any(|s| s.id == sid),
+        "tombstone must survive the orphaned turn's persists"
+    );
+    assert!(conn.session_read(&sid).await.is_err());
 
     cleanup(conn, &dir).await;
 }
@@ -376,7 +426,15 @@ async fn trust_roundtrip() {
         .unwrap();
     assert!(cfg.dirs.is_empty());
 
+    // Trust is file-backed: a second fixture process agrees without a
+    // new prompt (matches the real settings file).
+    let conn2 = spawn_fixture(&envs).await;
+    conn2.initialize(info(), caps()).await.unwrap();
+    let status = conn2.workspace_trust_status(Some(cwd)).await.unwrap();
+    assert_eq!(status.status, "trusted");
+
     cleanup(conn, &dir).await;
+    cleanup(conn2, &dir).await;
 }
 
 /// A small `historyLimit` windows the resume tail and exposes

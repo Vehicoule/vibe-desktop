@@ -19,13 +19,15 @@ pub enum CallbackAnswer {
 }
 
 /// State of the rewind confirmation sheet. `has_changes == None` means the
-/// `session/rewind/read` preview is still in flight.
+/// `session/rewind/read` preview is still in flight — rewind stays disabled
+/// until it resolves (a failed read surfaces in `read_error`).
 pub struct RewindDialog {
     pub entry_id: String,
     pub preview: String,
     pub has_changes: Option<bool>,
     pub paths: Vec<String>,
     pub restore_files: bool,
+    pub read_error: Option<String>,
 }
 
 pub struct SessionView {
@@ -496,6 +498,7 @@ impl SessionView {
             has_changes: None,
             paths: Vec::new(),
             restore_files: false,
+            read_error: None,
         });
         let conn = self.conn.clone();
         let session_id = self.session_id().to_string();
@@ -509,7 +512,7 @@ impl SessionView {
                                 dlg.has_changes = Some(r.has_file_changes);
                                 dlg.paths = r.paths;
                             }
-                            Err(e) => view.error = Some(e.to_string()),
+                            Err(e) => dlg.read_error = Some(e.to_string()),
                         }
                     }
                 }
@@ -565,6 +568,8 @@ impl SessionView {
     // -- history paging ------------------------------------------------------------
 
     /// Fetch one older page (`history_before_cursor`) and prepend it.
+    /// A compact handoff or rewind that lands while the request is in
+    /// flight replaces the state — the stale page must not be prepended.
     pub fn load_earlier(&mut self, cx: &mut Context<Self>) {
         let Some(cursor) = self.projection.state.history_before_cursor.clone() else {
             return;
@@ -581,7 +586,7 @@ impl SessionView {
                     &session_id,
                     None,
                     PageRequest {
-                        cursor: Some(cursor),
+                        cursor: Some(cursor.clone()),
                         limit: 50,
                         direction: "backward".into(),
                     },
@@ -591,11 +596,20 @@ impl SessionView {
                 view.loading_earlier = false;
                 match result {
                     Ok(page) => {
-                        let history = view.projection.state.history.get_or_insert_with(Vec::new);
-                        let mut merged = page.items;
-                        merged.append(history);
-                        *history = merged;
-                        view.projection.state.history_before_cursor = page.previous_cursor;
+                        // Same session and still the same pagination
+                        // boundary — otherwise the state was replaced
+                        // mid-flight and this page no longer belongs.
+                        let still_valid = view.session_id() == session_id
+                            && view.projection.state.history_before_cursor.as_deref()
+                                == Some(cursor.as_str());
+                        if still_valid {
+                            let history =
+                                view.projection.state.history.get_or_insert_with(Vec::new);
+                            let mut merged = page.items;
+                            merged.append(history);
+                            *history = merged;
+                            view.projection.state.history_before_cursor = page.previous_cursor;
+                        }
                     }
                     Err(e) => view.error = Some(e.to_string()),
                 }
