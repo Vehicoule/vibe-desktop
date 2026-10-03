@@ -817,23 +817,22 @@ impl Connection {
             .await
     }
 
-    /// `session/agent/update` → switch the session's agent. Returns the
-    /// mutation status ("applied"/"pending") or a default when omitted.
+    /// `session/agent/update` → switch the session's agent. The response is
+    /// a `RuntimeMutationResponse`-shaped object: `rejected`/`failures`,
+    /// `status` ("applied" | "pending"), and a `runtime` snapshot.
     pub async fn session_agent_update(
         &self,
         session_id: &str,
         agent_name: &str,
-    ) -> ClientResult<String> {
-        let resp: ConfigWriteResponse = self
-            .request_typed(
-                "session/agent/update",
-                AgentSwitchParams {
-                    session_id: session_id.to_string(),
-                    agent_name: agent_name.to_string(),
-                },
-            )
-            .await?;
-        Ok(resp.status.unwrap_or_else(|| "applied".to_string()))
+    ) -> ClientResult<ConfigWriteResponse> {
+        self.request_typed(
+            "session/agent/update",
+            AgentSwitchParams {
+                session_id: session_id.to_string(),
+                agent_name: agent_name.to_string(),
+            },
+        )
+        .await
     }
 }
 

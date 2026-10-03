@@ -1,7 +1,7 @@
 //! One attached session: its `vibe-app-server` process, protocol projection,
 //! composer state, and callback handling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -71,6 +71,13 @@ pub struct SessionView {
     pub config_fields: Vec<ConfigFieldView>,
     /// Settings sheet open/closed.
     pub settings_open: bool,
+    /// Agent a `session/agent/update` mutation reported as `pending` —
+    /// not yet the active agent; reconciled from `agents/list` on the
+    /// next `session/updated`.
+    pub pending_agent: Option<String>,
+    /// Config paths with an in-flight `config/write` — repeat clicks
+    /// during the write would send the same value again.
+    cfg_inflight: HashSet<String>,
     /// Dictation run in flight while the mic toggle is down.
     pub dictation: Option<DictationRun>,
     dictation_pump: Option<Task<()>>,
@@ -140,6 +147,8 @@ impl SessionView {
             active_agent: String::new(),
             config_fields: Vec::new(),
             settings_open: false,
+            pending_agent: None,
+            cfg_inflight: HashSet::new(),
             dictation: None,
             dictation_pump: None,
             dictation_meter: None,
@@ -235,7 +244,10 @@ impl SessionView {
         .detach();
     }
 
-    /// `session/agent/update` — switch the session's agent.
+    /// `session/agent/update` — switch the session's agent. A `pending`
+    /// mutation keeps `pending_agent` until `session/updated` reconciles
+    /// the authoritative active agent; `applied` reads the runtime
+    /// snapshot when present.
     pub fn pick_agent(&mut self, name: String, cx: &mut Context<Self>) {
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
@@ -243,10 +255,28 @@ impl SessionView {
             let resp = conn.session_agent_update(&sid, &name).await;
             let _ = this.update(cx, |view, cx| {
                 match resp {
-                    Ok(_) => {
-                        view.active_agent = name.clone();
+                    Ok(r) if r.rejected => {
+                        view.error = Some(format!(
+                            "agent switch rejected: {}",
+                            r.failures.join(", ")
+                        ));
+                    }
+                    Ok(r) if r.status.as_deref() == Some("pending") => {
+                        view.pending_agent = Some(name.clone());
+                    }
+                    Ok(r) => {
+                        let applied = r
+                            .runtime
+                            .as_ref()
+                            .and_then(|rt| rt.get("activeAgent"))
+                            .and_then(|a| a.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| name.clone());
+                        view.active_agent = applied.clone();
+                        view.pending_agent = None;
                         if let Some(cfg) = &mut view.config {
-                            cfg.default_agent = name.clone();
+                            cfg.default_agent = applied;
                         }
                     }
                     Err(e) => view.error = Some(format!("agent switch failed: {e}")),
@@ -257,25 +287,54 @@ impl SessionView {
         .detach();
     }
 
+    /// Re-fetch `agents/list` to learn the authoritative active agent
+    /// after a pending switch applies.
+    fn refresh_agents(&mut self, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let agents = conn.agents_list(&sid).await;
+            let _ = this.update(cx, |view, cx| {
+                if let Ok(list) = agents {
+                    view.active_agent = list.active.name.clone();
+                    view.agents = list.agents;
+                    view.pending_agent = None;
+                    if let Some(cfg) = &mut view.config {
+                        cfg.default_agent = list.active.name.clone();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// `config/write` — flip a bool field; enum fields cycle their
-    /// `enum_choices`.
+    /// `enum_choices`. One write per path at a time: a click while the
+    /// previous write is in flight would resend the same value.
     pub fn toggle_config_field(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.cfg_inflight.insert(path.clone()) {
+            return;
+        }
         let Some(field) = self.config_fields.iter().find(|f| f.path == path).cloned() else {
+            self.cfg_inflight.remove(&path);
             return;
         };
         let next = if field.kind == "bool" {
             serde_json::Value::Bool(!field.value.as_bool().unwrap_or(false))
         } else if field.kind == "enum" && !field.enum_choices.is_empty() {
             let cur = field.value.as_str().unwrap_or_default();
+            // A value outside `enum_choices` starts cycling at the first
+            // choice rather than skipping it.
             let idx = field
                 .enum_choices
                 .iter()
                 .position(|c| c == cur)
+                .map(|i| (i + 1) % field.enum_choices.len())
                 .unwrap_or(0);
-            serde_json::Value::String(
-                field.enum_choices[(idx + 1) % field.enum_choices.len()].clone(),
-            )
+            serde_json::Value::String(field.enum_choices[idx].clone())
         } else {
+            self.cfg_inflight.remove(&path);
             return;
         };
         let conn = self.conn.clone();
@@ -293,6 +352,7 @@ impl SessionView {
                 )
                 .await;
             let _ = this.update(cx, |view, cx| {
+                view.cfg_inflight.remove(&field.path);
                 match resp {
                     Ok(r) if !r.rejected => {
                         if let Some(f) =
@@ -373,6 +433,7 @@ impl SessionView {
     fn on_server_message(&mut self, msg: &ServerMessage, cx: &mut Context<Self>) -> bool {
         match msg {
             ServerMessage::Notification { method, params } => {
+                let session_updated = method == "session/updated";
                 let narrate_turn = (method == "turn/completed")
                     .then(|| {
                         params
@@ -388,6 +449,9 @@ impl SessionView {
                 );
                 if resync {
                     self.resync(cx);
+                }
+                if session_updated && self.pending_agent.is_some() {
+                    self.refresh_agents(cx);
                 }
                 if narrate_turn.is_some() && self.narrator_on {
                     self.narrate_turn(narrate_turn, cx);
@@ -410,6 +474,16 @@ impl SessionView {
             let old = std::mem::replace(&mut self.reported_id, current.clone());
             if let Some(app) = self.app.as_ref().and_then(|w| w.upgrade()) {
                 app.update(cx, |app, _| app.sync_session_id(&old, &current));
+            }
+            // A compact/fork handoff swaps the session id under this view —
+            // drop session-scoped settings so nothing stale survives it.
+            self.agents.clear();
+            self.active_agent.clear();
+            self.pending_agent = None;
+            self.config_fields.clear();
+            self.cfg_inflight.clear();
+            if self.settings_open {
+                self.load_settings(cx);
             }
         }
     }
@@ -982,12 +1056,17 @@ impl SessionView {
         if !cfg.voice_mode_enabled {
             return;
         }
+        let Some(t) = cfg.transcription.as_ref() else {
+            self.error = Some("dictation needs a transcription config".to_string());
+            cx.notify();
+            return;
+        };
         let tcfg = voice::TranscriptionConfig {
-            api_base: cfg.transcription.provider.api_base.clone(),
-            api_key_env_var: cfg.transcription.provider.api_key_env_var.clone(),
-            model_name: cfg.transcription.model.name.clone(),
-            encoding: cfg.transcription.model.encoding.clone(),
-            target_streaming_delay_ms: cfg.transcription.model.target_streaming_delay_ms,
+            api_base: t.provider.api_base.clone(),
+            api_key_env_var: t.provider.api_key_env_var.clone(),
+            model_name: t.model.name.clone(),
+            encoding: t.model.encoding.clone(),
+            target_streaming_delay_ms: t.model.target_streaming_delay_ms,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let peak = Arc::new(AtomicU32::new(0));
@@ -1098,16 +1177,17 @@ impl SessionView {
             return;
         }
         let Some(turn_id) = turn_id else { return };
+        let Some(s) = cfg.speech.as_ref() else { return };
         let history = self.projection.state.history.as_deref().unwrap_or(&[]);
         let Some((user, asst)) = voice::turn_text(history, &turn_id) else {
             return;
         };
         let scfg = voice::SpeechConfig {
-            api_base: cfg.speech.provider.api_base.clone(),
-            api_key_env_var: cfg.speech.provider.api_key_env_var.clone(),
-            model_name: cfg.speech.model.name.clone(),
-            voice: cfg.speech.model.voice.clone(),
-            response_format: cfg.speech.model.response_format.clone(),
+            api_base: s.provider.api_base.clone(),
+            api_key_env_var: s.provider.api_key_env_var.clone(),
+            model_name: s.model.name.clone(),
+            voice: s.model.voice.clone(),
+            response_format: s.model.response_format.clone(),
         };
         self.cancel_narration(cx);
         self.narrating = Narration::Preparing;

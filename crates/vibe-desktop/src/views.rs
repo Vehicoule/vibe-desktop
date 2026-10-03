@@ -1277,11 +1277,19 @@ impl SessionView {
             let mut rows = div().flex().flex_col().gap_1();
             for a in &self.agents {
                 let picked = a.name == self.active_agent;
+                let pending = self.pending_agent.as_deref() == Some(a.name.as_str());
                 let name = a.name.clone();
                 let label = if a.display_name.is_empty() {
                     a.name.clone()
                 } else {
                     a.display_name.clone()
+                };
+                let (mark, suffix) = if pending {
+                    ("◐", " (pending)")
+                } else if picked {
+                    ("●", "")
+                } else {
+                    ("○", "")
                 };
                 rows = rows.child(
                     div()
@@ -1289,9 +1297,9 @@ impl SessionView {
                         .cursor_pointer()
                         .on_click(cx.listener(move |v, _e, _w, cx| v.pick_agent(name.clone(), cx)))
                         .child(text(
-                            format!("{} {label}", if picked { "●" } else { "○" }),
+                            format!("{mark} {label}{suffix}"),
                             11.5,
-                            c(if picked {
+                            c(if picked || pending {
                                 theme::AMBER
                             } else {
                                 theme::INK_SOFT
@@ -1543,7 +1551,9 @@ impl SessionView {
                 Narration::Idle => {}
             }
         }
-        if self.config.is_some() {
+        {
+            // Settings must not depend on the voice config reading — the
+            // sheet's own sections degrade independently.
             let model = self
                 .config
                 .as_ref()
@@ -1555,13 +1565,18 @@ impl SessionView {
                     }
                 })
                 .unwrap_or_default();
+            let agent_label = if let Some(p) = &self.pending_agent {
+                format!("{p}…")
+            } else {
+                self.active_agent.clone()
+            };
             bar = bar.child(
                 div()
                     .id("settings-toggle")
                     .cursor_pointer()
                     .on_click(cx.listener(|v, _e, _w, cx| v.toggle_settings(cx)))
                     .child(text(
-                        format!("⚙ {model} · {}", self.active_agent),
+                        format!("⚙ {model} · {agent_label}"),
                         10.5,
                         c(if self.settings_open {
                             theme::AMBER

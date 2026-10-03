@@ -1529,8 +1529,10 @@ pub struct ConfigView {
     pub voice_mode_enabled: bool,
     #[serde(default)]
     pub narrator_enabled: bool,
-    pub speech: SpeechConfigView,
-    pub transcription: TranscriptionConfigView,
+    /// Voice sub-views are optional — a server without speech/
+    /// transcription config must not sink the whole read (ADR-0014 skew).
+    pub speech: Option<SpeechConfigView>,
+    pub transcription: Option<TranscriptionConfigView>,
     // --- M3a: settings ---
     #[serde(default)]
     pub active_model: ModelConfigView,
@@ -1679,6 +1681,10 @@ pub struct ConfigWriteResponse {
     pub failures: Vec<String>,
     #[serde(default)]
     pub status: Option<String>,
+    /// `RuntimeMutationResponse` embeds a `runtime` snapshot — kept as a
+    /// loose `Value` so `activeAgent` etc. can be read tolerantly.
+    #[serde(default)]
+    pub runtime: Option<serde_json::Value>,
 }
 
 /// `config/model/write` params (`ModelConfigWriteParams`).

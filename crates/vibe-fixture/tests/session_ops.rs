@@ -506,13 +506,15 @@ async fn config_read_returns_voice_views() {
     let cfg = conn.config_read().await.unwrap();
     assert!(cfg.voice_mode_enabled);
     assert!(cfg.narrator_enabled);
-    assert_eq!(cfg.speech.model.name, "voxtral-mini-tts-latest");
-    assert_eq!(cfg.speech.provider.api_base, "https://tts.fixture.invalid");
+    let speech = cfg.speech.expect("fixture sends a speech view");
+    assert_eq!(speech.model.name, "voxtral-mini-tts-latest");
+    assert_eq!(speech.provider.api_base, "https://tts.fixture.invalid");
+    let transcription = cfg.transcription.expect("fixture sends a transcription view");
     assert_eq!(
-        cfg.transcription.model.encoding, "pcm_s16le",
+        transcription.model.encoding, "pcm_s16le",
         "transcription model should mirror upstream realtime encoding"
     );
-    assert_eq!(cfg.transcription.model.target_streaming_delay_ms, 240);
+    assert_eq!(transcription.model.target_streaming_delay_ms, 240);
 
     cleanup(conn, &dir).await;
 }
@@ -569,6 +571,15 @@ async fn settings_roundtrip_reads_and_writes() {
         .unwrap();
     assert!(!write.rejected);
 
+    // The write is observable: a later read reflects the stored value.
+    let after = conn.config_fields_read(&sid).await.unwrap();
+    let notif = after
+        .fields
+        .iter()
+        .find(|f| f.path == "enable_notifications")
+        .unwrap();
+    assert_eq!(notif.value, serde_json::Value::Bool(false));
+
     let model = conn.config_model_write(&sid, "small", None).await.unwrap();
     assert_eq!(model.status.as_deref(), Some("applied"));
 
@@ -576,8 +587,9 @@ async fn settings_roundtrip_reads_and_writes() {
     assert_eq!(agents.active.name, "build");
     assert_eq!(agents.agents.len(), 3);
 
-    let status = conn.session_agent_update(&sid, "plan").await.unwrap();
-    assert_eq!(status, "applied");
+    let resp = conn.session_agent_update(&sid, "plan").await.unwrap();
+    assert!(!resp.rejected);
+    assert_eq!(resp.status.as_deref(), Some("applied"));
 
     cleanup(conn, &dir).await;
 }
