@@ -354,7 +354,7 @@ pub struct AgentSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum PublicSessionStatus {
     Idle,
     Running {
@@ -1303,4 +1303,163 @@ pub struct RuntimeSnapshot {
     pub config: Value,
     #[serde(default)]
     pub issues: Vec<Value>,
+}
+
+// --- M2: queue / rewind / history / trust ------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnQueueReadParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnQueueReadResponse {
+    pub queue: PublicTurnQueue,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnQueueResumeParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnQueueSteerParams {
+    pub session_id: String,
+    pub queue_item_id: String,
+    pub expected_turn_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnQueueSteerResponse {
+    pub queue_item_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnQueueReplaceParams {
+    pub session_id: String,
+    pub queue_item_id: String,
+    pub entries: Vec<TurnInputEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRewindReadParams {
+    pub session_id: String,
+    pub entry_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRewindReadResponse {
+    pub has_file_changes: bool,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRewindParams {
+    pub session_id: String,
+    pub entry_id: String,
+    #[serde(default)]
+    pub restore_files: bool,
+    #[serde(default)]
+    pub inplace: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRewindResponse {
+    pub message: String,
+    #[serde(default)]
+    pub restore_errors: Vec<String>,
+    #[serde(default)]
+    pub restored_paths: Vec<String>,
+    pub state: PublicSessionState,
+    #[serde(default)]
+    pub session_log: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionHistoryListParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub page: PageRequest,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionHistoryListResponse {
+    #[serde(default)]
+    pub items: Vec<PublicHistoryEntry>,
+    pub next_cursor: Option<String>,
+    pub previous_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTrustStatusParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTrustDetails {
+    pub cwd: String,
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub detected_files: Vec<String>,
+    #[serde(default)]
+    pub repo_detected_files: Vec<String>,
+    #[serde(default)]
+    pub repo_explicitly_untrusted: bool,
+    #[serde(default)]
+    pub settings_path: String,
+    #[serde(default)]
+    pub available_decisions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTrustStatusResponse {
+    pub status: String,
+    pub details: Option<WorkspaceTrustDetails>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTrustDecisionParams {
+    pub decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceUntrustedConfigParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceUntrustedConfigResponse {
+    #[serde(default)]
+    pub dirs: Vec<String>,
+    #[serde(default)]
+    pub settings_path: String,
 }

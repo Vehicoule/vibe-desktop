@@ -15,19 +15,53 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use vibe_protocol::json_patch::apply_patch;
 use vibe_protocol::models::JsonPatchOperation;
 
-/// Live session contents. History and its watermark live behind ONE lock so
-/// `session/read` always returns a consistent (history, eventId) pair — a
-/// snapshot never pairs a patched entry with the previous event id.
+/// Live session contents. Session record, history, watermark, turn queue,
+/// and the in-flight turn live behind ONE lock so every read-modify-write
+/// stays consistent — a snapshot never pairs a patched entry with the
+/// previous event id, and a queue patch never races a turn transition.
 struct SessionData {
-    session: Value,
     inner: tokio::sync::Mutex<SessionInner>,
     turn_seq: AtomicU64,
+    queue_seq: AtomicU64,
     store: std::path::PathBuf,
 }
 
 struct SessionInner {
+    session: Value,
     history: Vec<Value>,
     event_id: u64,
+    queue_items: Vec<Value>,
+    queue_paused: bool,
+    active_turn: Option<String>,
+    active_abort: Option<tokio::task::AbortHandle>,
+}
+
+fn queue_value(inner: &SessionInner) -> Value {
+    json!({"items": inner.queue_items, "paused": inner.queue_paused, "maxItems": 32})
+}
+
+/// Trusted cwd set — file-backed in the shared store like the real
+/// settings file, so trust survives across fixture processes.
+async fn trusted_cwds(store: &std::path::Path) -> std::collections::HashSet<String> {
+    tokio::fs::read_to_string(store.join("trusted.json"))
+        .await
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+fn inner_default() -> SessionInner {
+    SessionInner {
+        session: json!({}),
+        history: Vec::new(),
+        event_id: 0,
+        queue_items: Vec::new(),
+        queue_paused: false,
+        active_turn: None,
+        active_abort: None,
+    }
 }
 
 /// File-backed session store shared by every fixture process — the real
@@ -51,13 +85,14 @@ fn store_safe_id(sid: &str) -> bool {
 
 impl SessionData {
     fn new(session: Value, store: std::path::PathBuf) -> Self {
-        Self {
+        let inner = SessionInner {
             session,
-            inner: tokio::sync::Mutex::new(SessionInner {
-                history: Vec::new(),
-                event_id: 0,
-            }),
+            ..inner_default()
+        };
+        Self {
+            inner: tokio::sync::Mutex::new(inner),
             turn_seq: AtomicU64::new(0),
+            queue_seq: AtomicU64::new(0),
             store,
         }
     }
@@ -71,30 +106,59 @@ impl SessionData {
         let path = store.join(format!("{sid}.json"));
         let raw = tokio::fs::read_to_string(path).await.ok()?;
         let v: Value = serde_json::from_str(&raw).ok()?;
-        Some(Arc::new(SessionData {
+        if v["deleted"] == true {
+            return None;
+        }
+        let inner = SessionInner {
             session: v["session"].clone(),
-            inner: tokio::sync::Mutex::new(SessionInner {
-                history: serde_json::from_value(v["history"].clone()).unwrap_or_default(),
-                event_id: v["event_id"].as_u64().unwrap_or(0),
-            }),
+            history: serde_json::from_value(v["history"].clone()).unwrap_or_default(),
+            event_id: v["event_id"].as_u64().unwrap_or(0),
+            queue_items: serde_json::from_value(v["queue_items"].clone()).unwrap_or_default(),
+            queue_paused: v["queue_paused"].as_bool().unwrap_or(false),
+            ..inner_default()
+        };
+        Some(Arc::new(SessionData {
+            inner: tokio::sync::Mutex::new(inner),
             turn_seq: AtomicU64::new(v["turn_seq"].as_u64().unwrap_or(0)),
+            queue_seq: AtomicU64::new(v["queue_seq"].as_u64().unwrap_or(0)),
             store: store.to_path_buf(),
         }))
     }
 
     /// Snapshot current contents to the shared store (atomic write).
+    ///
+    /// Catalog fields (`title`, `pinnedAt`, `archivedAt`) are
+    /// disk-authoritative: rail ops can land on a different fixture
+    /// process than the one holding a running turn, and the turn's later
+    /// persists must not revert them — or resurrect a tombstoned session.
     async fn persist(&self, inner: &SessionInner) {
-        let body = json!({
-            "session": self.session,
-            "history": inner.history,
-            "event_id": inner.event_id,
-            "turn_seq": self.turn_seq.load(Ordering::SeqCst),
-        });
-        let id = self.session["id"].as_str().unwrap_or("x");
+        let id = inner.session["id"].as_str().unwrap_or("x");
         if !store_safe_id(id) {
             return;
         }
         let path = self.store.join(format!("{id}.json"));
+        let mut session = inner.session.clone();
+        if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+            if let Ok(disk) = serde_json::from_str::<Value>(&raw) {
+                if disk["deleted"] == true {
+                    return;
+                }
+                for k in ["title", "pinnedAt", "archivedAt"] {
+                    if disk["session"].get(k).is_some() {
+                        session[k] = disk["session"][k].clone();
+                    }
+                }
+            }
+        }
+        let body = json!({
+            "session": session,
+            "history": inner.history,
+            "event_id": inner.event_id,
+            "turn_seq": self.turn_seq.load(Ordering::SeqCst),
+            "queue_items": inner.queue_items,
+            "queue_paused": inner.queue_paused,
+            "queue_seq": self.queue_seq.load(Ordering::SeqCst),
+        });
         let tmp = self.store.join(format!("{id}.json.tmp"));
         if tokio::fs::write(&tmp, body.to_string()).await.is_ok() {
             let _ = tokio::fs::rename(&tmp, &path).await;
@@ -140,12 +204,54 @@ impl SessionData {
         eid
     }
 
+    /// Mutate one field of the session record (title, pinnedAt, …) and
+    /// persist under the same lock — returned patch carries the new value.
+    /// The disk file gets the field first so concurrent persists on other
+    /// fixture processes pick it up as disk-authoritative.
+    async fn set_session_field(&self, key: &str, value: Value) {
+        let mut inner = self.inner.lock().await;
+        inner.session[key] = value.clone();
+        let id = inner.session["id"].as_str().unwrap_or("x");
+        if store_safe_id(id) {
+            let path = self.store.join(format!("{id}.json"));
+            if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+                if let Ok(mut disk) = serde_json::from_str::<Value>(&raw) {
+                    if disk["deleted"] != true {
+                        disk["session"][key] = value;
+                        let tmp = self.store.join(format!("{id}.json.tmp"));
+                        if tokio::fs::write(&tmp, disk.to_string()).await.is_ok() {
+                            let _ = tokio::fs::rename(&tmp, &path).await;
+                        }
+                    }
+                }
+            }
+        }
+        self.persist(&inner).await;
+    }
+
     async fn state(&self) -> Value {
+        self.state_windowed(None).await
+    }
+
+    /// `limit` windows the history to its tail; when older entries exist
+    /// `historyBeforeCursor` points at the boundary (fixture cursor `h-N`).
+    async fn state_windowed(&self, limit: Option<usize>) -> Value {
         let inner = self.inner.lock().await;
+        let len = inner.history.len();
+        let start = match limit {
+            Some(l) if l < len => len - l,
+            _ => 0,
+        };
         state_value(
-            self.session.clone(),
+            inner.session.clone(),
             inner.event_id,
-            json!(inner.history.clone()),
+            json!(inner.history[start..].to_vec()),
+            if start > 0 {
+                json!(format!("h-{start}"))
+            } else {
+                Value::Null
+            },
+            queue_value(&inner),
         )
     }
 }
@@ -175,20 +281,30 @@ fn session_value(id: &str, cwd: &str, status: Value) -> Value {
     })
 }
 
-fn state_value(session: Value, event_id: u64, history: Value) -> Value {
+fn state_value(
+    session: Value,
+    event_id: u64,
+    history: Value,
+    before_cursor: Value,
+    queue: Value,
+) -> Value {
     json!({
         "format": "vibe.public-session-state/v1",
         "eventId": event_id,
         "session": session,
         "isQuiescent": true,
         "history": history,
-        "historyBeforeCursor": null,
+        "historyBeforeCursor": before_cursor,
         "turns": [],
         "activeCallbacks": [],
         "childSessions": [],
-        "turnQueue": {"items": [], "paused": false, "maxItems": 32},
+        "turnQueue": queue,
         "retrying": null
     })
+}
+
+fn empty_queue() -> Value {
+    json!({"items": [], "paused": false, "maxItems": 32})
 }
 
 fn msg_base(id: &str, session_id: &str, turn_id: Option<&str>) -> Value {
@@ -267,6 +383,10 @@ fn approval_callback(
 }
 
 fn turn(id: &str, session_id: &str, status: &str) -> Value {
+    turn_with_queue(id, session_id, status, Value::Null)
+}
+
+fn turn_with_queue(id: &str, session_id: &str, status: &str, queue_item_id: Value) -> Value {
     json!({
         "id": id,
         "sessionId": session_id,
@@ -275,8 +395,487 @@ fn turn(id: &str, session_id: &str, status: &str) -> Value {
         "completedAt": null,
         "error": null,
         "stopReason": null,
-        "queueItemId": null
+        "queueItemId": queue_item_id
     })
+}
+
+type Sessions = Arc<tokio::sync::Mutex<BTreeMap<String, Arc<SessionData>>>>;
+type PendingCallbacks = Arc<tokio::sync::Mutex<BTreeMap<String, (Arc<SessionData>, u64, String)>>>;
+type Tx = tokio::sync::mpsc::Sender<String>;
+
+/// Session lookup: in-memory first, then the shared store — a session may
+/// live in a different fixture process (forks, earlier runs).
+async fn find_session(
+    sessions: &Sessions,
+    store: &std::path::Path,
+    sid: &str,
+) -> Option<Arc<SessionData>> {
+    if let Some(d) = sessions.lock().await.get(sid).cloned() {
+        return Some(d);
+    }
+    SessionData::load(store, sid).await
+}
+
+/// Emit a `session/updated` JSON-patch notification (claiming its event id).
+async fn emit_updated(tx: &Tx, data: &Arc<SessionData>, sid: &str, patch: Value) {
+    let eid = data.bump().await;
+    let _ = tx
+        .send(
+            json!({"jsonrpc": "2.0", "method": "session/updated", "params": {
+                "eventId": eid, "sessionId": sid, "emittedAt": 1_700_000_000,
+                "patch": patch
+            }})
+            .to_string(),
+        )
+        .await;
+}
+
+/// Upstream emits a dedicated `turn/queueUpdated` notification carrying the
+/// whole queue (ADR `_emit_queue_updated`), not a session/updated patch.
+async fn emit_queue_updated(tx: &Tx, data: &Arc<SessionData>, sid: &str) {
+    let queue = queue_value(&*data.inner.lock().await);
+    let eid = data.bump().await;
+    let _ = tx
+        .send(
+            json!({"jsonrpc": "2.0", "method": "turn/queueUpdated", "params": {
+                "eventId": eid, "sessionId": sid, "emittedAt": 1_700_000_000,
+                "queue": queue,
+            }})
+            .to_string(),
+        )
+        .await;
+}
+
+/// Project turn state into `session.status` — the real server keeps it in
+/// the session record (running/blocked/idle) so clients can derive the
+/// active turn id; the fixture serialized "idle" forever before this.
+async fn set_status(data: &Arc<SessionData>, tx: &Tx, sid: &str, status: Value) {
+    data.set_session_field("status", status.clone()).await;
+    emit_updated(
+        tx,
+        data,
+        sid,
+        json!([{"op": "replace", "path": "/session/status", "value": status}]),
+    )
+    .await;
+}
+
+/// Status a session lands on when its turn ends without another queued:
+/// archived if it was archived mid-turn, else idle. Also the right status
+/// for a forked child — it inherits the archive marker but not the turn.
+fn status_without_turn(session: &Value) -> Value {
+    if session["archivedAt"].is_null() {
+        json!({"type": "idle"})
+    } else {
+        json!({"type": "archived"})
+    }
+}
+
+/// Terminal status for `data`, preferring the on-disk record — a rail
+/// process may have archived the session since this one loaded it into
+/// memory (catalog fields are disk-authoritative in `persist`).
+async fn terminal_status(data: &Arc<SessionData>) -> Value {
+    let (id, fallback) = {
+        let inner = data.inner.lock().await;
+        (
+            inner.session["id"].as_str().unwrap_or("").to_string(),
+            status_without_turn(&inner.session),
+        )
+    };
+    if store_safe_id(&id) {
+        let path = data.store.join(format!("{id}.json"));
+        if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+            if let Ok(disk) = serde_json::from_str::<Value>(&raw) {
+                if disk["deleted"] != true {
+                    return status_without_turn(&disk["session"]);
+                }
+            }
+        }
+    }
+    fallback
+}
+
+/// Merge the disk-authoritative catalog fields into a session record —
+/// for children built from an in-memory parent snapshot that may have
+/// missed a rail op on another process (same merge `persist` applies).
+async fn refresh_catalog_fields(data: &Arc<SessionData>, session: &mut Value) {
+    let id = session["id"].as_str().unwrap_or("").to_string();
+    if !store_safe_id(&id) {
+        return;
+    }
+    let path = data.store.join(format!("{id}.json"));
+    if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+        if let Ok(disk) = serde_json::from_str::<Value>(&raw) {
+            if disk["deleted"] != true {
+                for key in ["title", "pinnedAt", "archivedAt"] {
+                    if let Some(v) = disk["session"].get(key) {
+                        session[key] = v.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// First text block of a queued turn's user entry (what the UI lists).
+fn queued_item_text(item: &Value) -> String {
+    item.pointer("/entries/0/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// First text block of a history entry (rewind response `message`).
+fn entry_text(entry: &Value) -> String {
+    entry
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// History index of `entry_id` when it names a user message (the only
+/// entries `session/rewind` may target upstream).
+fn rewind_index(inner: &SessionInner, entry_id: &str) -> Option<usize> {
+    inner
+        .history
+        .iter()
+        .position(|e| e["id"].as_str() == Some(entry_id))
+        .filter(|&i| {
+            inner.history[i]["type"].as_str() == Some("message")
+                && inner.history[i]["role"].as_str() == Some("user")
+        })
+}
+
+/// Whether any entry after `idx` ran a tool (fixture says file changes
+/// exist only when an effect followed the target message).
+fn rewind_has_changes(inner: &SessionInner, idx: usize) -> bool {
+    inner
+        .history
+        .iter()
+        .skip(idx + 1)
+        .any(|e| e["type"].as_str() == Some("effect"))
+}
+
+/// Open the turn queue when it has items and no turn is in flight — the
+/// real server promotes the head item into a running turn.
+async fn promote_next(data: &Arc<SessionData>, sid: &str, tx: &Tx, pending: &PendingCallbacks) {
+    let item = {
+        let mut inner = data.inner.lock().await;
+        if inner.queue_paused || inner.active_turn.is_some() || inner.queue_items.is_empty() {
+            None
+        } else {
+            Some(inner.queue_items.remove(0))
+        }
+    };
+    let Some(item) = item else { return };
+    emit_queue_updated(tx, data, sid).await;
+    let text = queued_item_text(&item);
+    let qid = item["id"].clone();
+    spawn_turn(data, sid, text, qid, tx, pending).await;
+}
+
+/// Register a scripted turn as active and spawn part 1 (up to the
+/// approval callback, which `callback/respond` resumes).
+async fn spawn_turn(
+    data: &Arc<SessionData>,
+    sid: &str,
+    text: String,
+    queue_item_id: Value,
+    tx: &Tx,
+    pending: &PendingCallbacks,
+) -> String {
+    let n = data.turn_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let turn_id = format!("t-{sid}-{n}");
+    let task = tokio::spawn(run_turn_script(
+        data.clone(),
+        sid.to_string(),
+        text,
+        n,
+        turn_id.clone(),
+        queue_item_id,
+        tx.clone(),
+        pending.clone(),
+    ));
+    {
+        let mut inner = data.inner.lock().await;
+        inner.active_turn = Some(turn_id.clone());
+        inner.active_abort = Some(task.abort_handle());
+        data.persist(&inner).await;
+    }
+    set_status(
+        data,
+        tx,
+        sid,
+        json!({"type": "running", "activeTurnId": turn_id}),
+    )
+    .await;
+    turn_id
+}
+
+/// Part 1 of the scripted turn: user entry → reasoning → assistant stream
+/// → shell effect → approval `callback/call`. Part 2 resumes in the
+/// `callback/respond` handler once the client answers.
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_script(
+    data: Arc<SessionData>,
+    sid: String,
+    text: String,
+    n: u64,
+    turn_id: String,
+    queue_item_id: Value,
+    tx2: Tx,
+    pending: PendingCallbacks,
+) {
+    let evt = |method: &str, eid: u64, extra: Value| {
+        let mut p = extra;
+        p["eventId"] = json!(eid);
+        p["sessionId"] = json!(sid);
+        p["emittedAt"] = json!(1_700_000_000);
+        (method.to_string(), p)
+    };
+    let send = |m: String, p: Value| {
+        let tx = tx2.clone();
+        async move {
+            let _ = tx
+                .send(json!({"jsonrpc": "2.0", "method": m, "params": p}).to_string())
+                .await;
+        }
+    };
+    let server_request = |id: Value, m: String, p: Value| {
+        let tx = tx2.clone();
+        async move {
+            let _ = tx
+                .send(json!({"jsonrpc": "2.0", "id": id, "method": m, "params": p}).to_string())
+                .await;
+        }
+    };
+    let e_user = format!("e-user-{n}");
+    let e_think = format!("e-think-{n}");
+    let e_asst = format!("e-asst-{n}");
+    let e_shell = format!("e-shell-{n}");
+    let e_cb = format!("e-cb-{n}");
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let user_entry = message_entry(&e_user, &sid, &turn_id, "user", &text);
+    let eid = data.add_entry(user_entry.clone()).await;
+    let (m, p) = evt(
+        "history/entryAdded",
+        eid,
+        json!({"turnId": turn_id, "entry": user_entry}),
+    );
+    send(m, p).await;
+    let (m, p) = evt(
+        "turn/started",
+        data.bump().await,
+        json!({"turn": turn_with_queue(&turn_id, &sid, "in_progress", queue_item_id)}),
+    );
+    send(m, p).await;
+    let think_entry = json!({
+        "type": "reasoning",
+        "id": e_think, "sessionId": sid, "turnId": turn_id,
+        "createdAt": 1, "updatedAt": 1, "generationStatus": "in_progress",
+        "relatedEntryId": null,
+        "text": "", "summary": []
+    });
+    let eid = data.add_entry(think_entry.clone()).await;
+    let (m, p) = evt(
+        "history/entryAdded",
+        eid,
+        json!({"turnId": turn_id, "entry": think_entry}),
+    );
+    send(m, p).await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let patch = json!([{"op": "append", "path": "/text", "value": "Thinking about the request… "}]);
+    let eid = data.patch_entry(&e_think, &patch).await;
+    let (m, p) = evt(
+        "history/entryUpdated",
+        eid,
+        json!({"turnId": turn_id, "entryId": e_think, "patch": patch}),
+    );
+    send(m, p).await;
+    let asst_entry = message_entry(&e_asst, &sid, &turn_id, "assistant", "");
+    let eid = data.add_entry(asst_entry.clone()).await;
+    let (m, p) = evt(
+        "history/entryAdded",
+        eid,
+        json!({"turnId": turn_id, "entry": asst_entry}),
+    );
+    send(m, p).await;
+    for chunk in [
+        "Fixture response: ".to_string(),
+        format!("echo “{text}” — "),
+        "running a shell effect next.".to_string(),
+    ] {
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        let patch = json!([{"op": "append", "path": "/content/0/text", "value": chunk}]);
+        let eid = data.patch_entry(&e_asst, &patch).await;
+        let (m, p) = evt(
+            "history/entryUpdated",
+            eid,
+            json!({"turnId": turn_id, "entryId": e_asst, "patch": patch}),
+        );
+        send(m, p).await;
+    }
+    // Shell effect: pending → running → blocked on approval.
+    let shell_entry = shell_effect(&e_shell, &sid, &turn_id, json!({"status": "pending"}));
+    let eid = data.add_entry(shell_entry.clone()).await;
+    let (m, p) = evt(
+        "history/entryAdded",
+        eid,
+        json!({"turnId": turn_id, "entry": shell_entry}),
+    );
+    send(m, p).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let patch = json!([{"op": "replace", "path": "/state", "value": {"status": "running", "outputText": ""}}]);
+    let eid = data.patch_entry(&e_shell, &patch).await;
+    let (m, p) = evt(
+        "history/entryUpdated",
+        eid,
+        json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
+    );
+    send(m, p).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let callback_id = format!("cb-{turn_id}");
+    let cb_entry = approval_callback(&e_cb, &sid, &turn_id, &callback_id, &e_shell);
+    let eid = data.add_entry(cb_entry.clone()).await;
+    let (m, p) = evt(
+        "history/entryAdded",
+        eid,
+        json!({"turnId": turn_id, "entry": cb_entry}),
+    );
+    send(m, p).await;
+    let patch = json!([{"op": "replace", "path": "/state", "value": {"status": "blocked", "callbackId": callback_id, "outputText": ""}}]);
+    let eid = data.patch_entry(&e_shell, &patch).await;
+    let (m, p) = evt(
+        "history/entryUpdated",
+        eid,
+        json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
+    );
+    send(m, p).await;
+    // Server→client request: the client must ack, then answer via callback/respond.
+    pending
+        .lock()
+        .await
+        .insert(callback_id.clone(), (data.clone(), n, turn_id.clone()));
+    set_status(
+        &data,
+        &tx2,
+        &sid,
+        json!({
+            "type": "blocked",
+            "activeTurnId": turn_id,
+            "callbackId": callback_id,
+            "reason": "approval",
+        }),
+    )
+    .await;
+    server_request(
+        json!(format!("srv-cb-{n}")),
+        "callback/call".to_string(),
+        json!({"callback": cb_entry}),
+    )
+    .await;
+}
+
+/// Part 2: approval answered → resolve the callback, complete the effect,
+/// finish the turn, then promote the next queued turn (fixture mirrors
+/// `_after_turn_terminal`).
+async fn finish_turn(
+    data: Arc<SessionData>,
+    n: u64,
+    turn_id: String,
+    output: Value,
+    tx2: Tx,
+    pending: PendingCallbacks,
+) {
+    let sid = {
+        let inner = data.inner.lock().await;
+        inner.session["id"].as_str().unwrap_or("").to_string()
+    };
+    let send = |m: &str, p: Value| {
+        let tx = tx2.clone();
+        let m = m.to_string();
+        async move {
+            let _ = tx
+                .send(json!({"jsonrpc": "2.0", "method": m, "params": p}).to_string())
+                .await;
+        }
+    };
+    let evt = |eid: u64, extra: Value| {
+        let mut p = extra;
+        p["eventId"] = json!(eid);
+        p["sessionId"] = json!(sid);
+        p["emittedAt"] = json!(1_700_000_000);
+        p
+    };
+    let e_think = format!("e-think-{n}");
+    let e_asst = format!("e-asst-{n}");
+    let e_shell = format!("e-shell-{n}");
+    let e_cb = format!("e-cb-{n}");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Resolve the callback entry.
+    let patch = json!([{"op": "replace", "path": "/state", "value": {"status": "answered", "output": output}}]);
+    let eid = data.patch_entry(&e_cb, &patch).await;
+    send(
+        "history/entryUpdated",
+        evt(
+            eid,
+            json!({"turnId": turn_id, "entryId": e_cb, "patch": patch}),
+        ),
+    )
+    .await;
+    // Effect completes.
+    let patch = json!([{"op": "replace", "path": "/state", "value": {
+        "status": "completed", "output": {"stdout": "fixture-output"},
+        "outputText": "fixture-output", "durationMs": 42,
+        "display": {"success": true, "verb": "Ran", "message": "fixture-output", "warnings": [], "suffix": ""}
+    }}]);
+    let eid = data.patch_entry(&e_shell, &patch).await;
+    send(
+        "history/entryUpdated",
+        evt(
+            eid,
+            json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
+        ),
+    )
+    .await;
+    // Final assistant text + turn completed.
+    let patch = json!([{"op": "append", "path": "/content/0/text", "value": " Done — effect approved and completed."}]);
+    let eid = data.patch_entry(&e_asst, &patch).await;
+    send(
+        "history/entryUpdated",
+        evt(
+            eid,
+            json!({"turnId": turn_id, "entryId": e_asst, "patch": patch}),
+        ),
+    )
+    .await;
+    let patch = json!([{"op": "replace", "path": "/generationStatus", "value": "completed"}]);
+    let eid = data.patch_entry(&e_think, &patch).await;
+    send(
+        "history/entryUpdated",
+        evt(
+            eid,
+            json!({"turnId": turn_id, "entryId": e_think, "patch": patch}),
+        ),
+    )
+    .await;
+    {
+        let mut inner = data.inner.lock().await;
+        inner.active_turn = None;
+        inner.active_abort = None;
+    }
+    let term = terminal_status(&data).await;
+    set_status(&data, &tx2, &sid, term).await;
+    send(
+        "turn/completed",
+        evt(
+            data.bump().await,
+            json!({"turn": {"id": turn_id, "sessionId": sid, "status": "completed", "startedAt": 1, "completedAt": 2, "error": null, "stopReason": null, "queueItemId": null}}),
+        ),
+    )
+    .await;
+    promote_next(&data, &sid, &tx2, &pending).await;
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -294,13 +893,10 @@ async fn main() {
         }
     });
 
-    let sessions = Arc::new(tokio::sync::Mutex::new(
+    let sessions: Sessions = Arc::new(tokio::sync::Mutex::new(
         BTreeMap::<String, Arc<SessionData>>::new(),
     ));
-    let pending_callbacks = Arc::new(tokio::sync::Mutex::new(BTreeMap::<
-        String,
-        (Arc<SessionData>, u64),
-    >::new()));
+    let pending_callbacks: PendingCallbacks = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
     let store = store_dir();
     let _ = tokio::fs::create_dir_all(&store).await;
 
@@ -313,6 +909,11 @@ async fn main() {
             Ok(v) => v,
             Err(_) => continue,
         };
+        // Client responses to fixture→client requests (callback/call) share
+        // the pipe: they carry `result`/`error` and no method — not ours.
+        if env.get("method").is_none() {
+            continue;
+        }
         let id = env.get("id").cloned();
         let method = env
             .get("method")
@@ -361,21 +962,6 @@ async fn main() {
                 }
             }
         };
-        let server_request = {
-            let tx = tx.clone();
-            move |id: Value, method: &str, params: Value| {
-                let tx = tx.clone();
-                let method = method.to_string();
-                async move {
-                    let _ = tx
-                        .send(
-                            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
-                                .to_string(),
-                        )
-                        .await;
-                }
-            }
-        };
 
         match method.as_str() {
             "initialize" => {
@@ -387,20 +973,13 @@ async fn main() {
             "initialized" => {}
             "session/list" => {
                 let include_archived = params["includeArchived"].as_bool().unwrap_or(false);
-                let mut items = vec![session_value(
-                    "saved-aaaa1111",
-                    "/tmp/project-a",
-                    json!({"type": "idle"}),
-                )];
-                if include_archived {
-                    items.push(session_value(
-                        "saved-bbbb2222",
-                        "/tmp/project-b",
-                        json!({"type": "archived"}),
-                    ));
-                }
-                // Merge stored sessions (created/forked by any fixture
-                // process) into the demo catalog.
+                // Stored sessions win over the canned demo rows so pin /
+                // archive / rename mutations stay visible across lists.
+                // `stored_ids` tracks every stored session — even an archived
+                // one filtered out of `items` — so its demo twin can't
+                // slip back in.
+                let mut items: Vec<Value> = Vec::new();
+                let mut stored_ids: std::collections::HashSet<String> = Default::default();
                 if let Ok(mut dir) = tokio::fs::read_dir(&store).await {
                     while let Ok(Some(ent)) = dir.next_entry().await {
                         let path = ent.path();
@@ -410,12 +989,44 @@ async fn main() {
                         if let Ok(raw) = tokio::fs::read_to_string(&path).await {
                             if let Ok(v) = serde_json::from_str::<Value>(&raw) {
                                 if let Some(sid) = v["session"]["id"].as_str() {
-                                    if !items.iter().any(|i| i["id"] == json!(sid)) {
+                                    stored_ids.insert(sid.to_string());
+                                    // Tombstone: a deleted id still suppresses
+                                    // its canned demo row.
+                                    if v["deleted"] == true {
+                                        continue;
+                                    }
+                                    if (include_archived || v["session"]["archivedAt"].is_null())
+                                        && !items.iter().any(|i| i["id"] == json!(sid))
+                                    {
                                         items.push(v["session"].clone());
                                     }
                                 }
                             }
                         }
+                    }
+                }
+                for mut demo in [
+                    session_value("saved-aaaa1111", "/tmp/project-a", json!({"type": "idle"})),
+                    session_value(
+                        "saved-bbbb2222",
+                        "/tmp/project-b",
+                        json!({"type": "archived"}),
+                    ),
+                ] {
+                    // An archived row carries `archivedAt` — the rail reads
+                    // the timestamp to decide archive vs unarchive.
+                    if demo["status"]["type"] == json!("archived")
+                        && demo["archivedAt"].is_null()
+                    {
+                        demo["archivedAt"] = json!(1_700_000_000);
+                    }
+                    let archived = !demo["archivedAt"].is_null()
+                        || demo["status"]["type"] == json!("archived");
+                    if archived && !include_archived {
+                        continue;
+                    }
+                    if !stored_ids.contains(demo["id"].as_str().unwrap_or("")) {
+                        items.push(demo);
                     }
                 }
                 respond(json!({
@@ -453,22 +1064,38 @@ async fn main() {
             }
             "session/resume" | "session/read" => {
                 let sid = params["sessionId"].as_str().unwrap_or("saved-aaaa1111");
-                let data = sessions.lock().await.get(sid).cloned();
-                // Fall back to the shared store — the session may live in
-                // another fixture process (e.g. a forked child).
-                let data = match data {
-                    Some(d) => Some(d),
-                    None => SessionData::load(&store, sid).await,
+                let data = find_session(&sessions, &store, sid).await;
+                // A tombstoned id reads as not_found, never the demo stub —
+                // read must not resurrect a deleted session.
+                let tombstoned = data.is_none() && {
+                    store_safe_id(sid)
+                        && tokio::fs::read_to_string(store.join(format!("{sid}.json")))
+                            .await
+                            .ok()
+                            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                            .is_some_and(|v| v["deleted"] == true)
                 };
+                if tombstoned {
+                    respond_err("not_found", "session").await;
+                    continue;
+                }
                 let state = match data {
                     Some(d) => {
                         sessions.lock().await.insert(sid.to_string(), d.clone());
-                        d.state().await
+                        // Honor historyLimit (resume) / history.limit (read)
+                        // like the real server: tail window + before-cursor.
+                        let limit = params["historyLimit"]
+                            .as_u64()
+                            .or_else(|| params.pointer("/history/limit").and_then(Value::as_u64))
+                            .map(|l| l as usize);
+                        d.state_windowed(limit).await
                     }
                     None => state_value(
                         session_value(sid, "/tmp", json!({"type": "idle"})),
                         0,
                         json!([]),
+                        Value::Null,
+                        empty_queue(),
                     ),
                 };
                 respond(json!({"state": state, "lastEventId": 0})).await;
@@ -489,25 +1116,33 @@ async fn main() {
                     continue;
                 };
                 let fork_id = format!("{src}-fork");
-                let mut session = d.session.clone();
+                // Snapshot session + history + watermark + turn counter
+                // under one parent lock — the child must never claim a
+                // watermark ahead of the history it inherited.
+                let (mut session, history, event_id, turn_seq) = {
+                    let p = d.inner.lock().await;
+                    (
+                        p.session.clone(),
+                        p.history.clone(),
+                        p.event_id,
+                        d.turn_seq.load(Ordering::SeqCst),
+                    )
+                };
+                // Refresh catalog fields from the parent's disk record while
+                // the clone still carries the parent's id — a rail process's
+                // archive/rename lands in memory only via this merge.
+                refresh_catalog_fields(&d, &mut session).await;
                 session["id"] = json!(fork_id);
                 session["parentSessionId"] = json!(src);
+                // The child has no turn — it inherits the archive marker,
+                // not the parent's live running/blocked status.
+                session["status"] = status_without_turn(&session);
                 let fork = Arc::new(SessionData::new(session, store.clone()));
                 {
                     let mut inner = fork.inner.lock().await;
-                    // Snapshot the parent's history and watermark under a
-                    // single inner lock — separate acquisitions could see
-                    // an entry the other missed, giving the child a
-                    // watermark ahead of its history.
-                    let parent = d.inner.lock().await;
-                    inner.history = parent.history.clone();
-                    inner.event_id = parent.event_id;
-                    // Continue the parent's turn counter so the
-                    // child's entry ids can never collide with the
-                    // history it just inherited.
-                    fork.turn_seq
-                        .store(d.turn_seq.load(Ordering::SeqCst), Ordering::SeqCst);
-                    drop(parent);
+                    inner.history = history;
+                    inner.event_id = event_id;
+                    fork.turn_seq.store(turn_seq, Ordering::SeqCst);
                     fork.persist(&inner).await;
                 }
                 // Return the CHILD's state — the caller opens it.
@@ -522,286 +1157,597 @@ async fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let data = sessions.lock().await.get(&sid).cloned();
-                let data = match data {
-                    Some(d) => Some(d),
-                    None => SessionData::load(&store, &sid).await,
-                };
-                let Some(data) = data else {
+                let Some(data) = find_session(&sessions, &store, &sid).await else {
                     respond_err("not_found", "session").await;
                     continue;
                 };
-                let n = data.turn_seq.fetch_add(1, Ordering::SeqCst) + 1;
-                let turn_id = format!("t-{sid}-{n}");
-                let e_user = format!("e-user-{n}");
-                let e_think = format!("e-think-{n}");
-                let e_asst = format!("e-asst-{n}");
-                let e_shell = format!("e-shell-{n}");
-                let e_cb = format!("e-cb-{n}");
+                let turn_id =
+                    spawn_turn(&data, &sid, text, Value::Null, &tx, &pending_callbacks).await;
                 respond(json!({"turn": turn(&turn_id, &sid, "in_progress"), "lastEventId": 0}))
                     .await;
-                // Scripted turn.
-                let tx2 = tx.clone();
-                let pending = pending_callbacks.clone();
-                tokio::spawn(async move {
-                    let evt = |method: &str, eid: u64, extra: Value| {
-                        let mut p = extra;
-                        p["eventId"] = json!(eid);
-                        p["sessionId"] = json!(sid);
-                        p["emittedAt"] = json!(1_700_000_000);
-                        (method.to_string(), p)
-                    };
-                    let send = |m: String, p: Value| {
-                        let tx = tx2.clone();
-                        async move {
-                            let _ = tx
-                                .send(
-                                    json!({"jsonrpc": "2.0", "method": m, "params": p}).to_string(),
-                                )
-                                .await;
-                        }
-                    };
-                    tokio::time::sleep(Duration::from_millis(60)).await;
-                    let user_entry = message_entry(&e_user, &sid, &turn_id, "user", &text);
-                    let eid = data.add_entry(user_entry.clone()).await;
-                    let (m, p) = evt(
-                        "history/entryAdded",
-                        eid,
-                        json!({"turnId": turn_id, "entry": user_entry}),
-                    );
-                    send(m, p).await;
-                    let (m, p) = evt(
-                        "turn/started",
-                        data.bump().await,
-                        json!({"turn": turn(&turn_id, &sid, "in_progress")}),
-                    );
-                    send(m, p).await;
-                    let think_entry = json!({
-                        "type": "reasoning",
-                        "id": e_think, "sessionId": sid, "turnId": turn_id,
-                        "createdAt": 1, "updatedAt": 1, "generationStatus": "in_progress",
-                        "relatedEntryId": null,
-                        "text": "", "summary": []
-                    });
-                    let eid = data.add_entry(think_entry.clone()).await;
-                    let (m, p) = evt(
-                        "history/entryAdded",
-                        eid,
-                        json!({"turnId": turn_id, "entry": think_entry}),
-                    );
-                    send(m, p).await;
-                    tokio::time::sleep(Duration::from_millis(120)).await;
-                    let patch = json!([
-                        {"op": "append", "path": "/text", "value": "Thinking about the request… "}
-                    ]);
-                    let eid = data.patch_entry(&e_think, &patch).await;
-                    let (m, p) = evt(
-                        "history/entryUpdated",
-                        eid,
-                        json!({"turnId": turn_id, "entryId": e_think, "patch": patch}),
-                    );
-                    send(m, p).await;
-                    let asst_entry = message_entry(&e_asst, &sid, &turn_id, "assistant", "");
-                    let eid = data.add_entry(asst_entry.clone()).await;
-                    let (m, p) = evt(
-                        "history/entryAdded",
-                        eid,
-                        json!({"turnId": turn_id, "entry": asst_entry}),
-                    );
-                    send(m, p).await;
-                    for chunk in [
-                        "Fixture response: ",
-                        &format!("echo “{text}” — "),
-                        "running a shell effect next.",
-                    ] {
-                        tokio::time::sleep(Duration::from_millis(90)).await;
-                        let patch = json!([
-                            {"op": "append", "path": "/content/0/text", "value": chunk}
-                        ]);
-                        let eid = data.patch_entry(&e_asst, &patch).await;
-                        let (m, p) = evt(
-                            "history/entryUpdated",
-                            eid,
-                            json!({"turnId": turn_id, "entryId": e_asst, "patch": patch}),
-                        );
-                        send(m, p).await;
-                    }
-                    // Shell effect: pending → running → blocked on approval.
-                    let shell_entry =
-                        shell_effect(&e_shell, &sid, &turn_id, json!({"status": "pending"}));
-                    let eid = data.add_entry(shell_entry.clone()).await;
-                    let (m, p) = evt(
-                        "history/entryAdded",
-                        eid,
-                        json!({"turnId": turn_id, "entry": shell_entry}),
-                    );
-                    send(m, p).await;
-                    tokio::time::sleep(Duration::from_millis(80)).await;
-                    let patch = json!([
-                        {"op": "replace", "path": "/state", "value": {"status": "running", "outputText": ""}}
-                    ]);
-                    let eid = data.patch_entry(&e_shell, &patch).await;
-                    let (m, p) = evt(
-                        "history/entryUpdated",
-                        eid,
-                        json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
-                    );
-                    send(m, p).await;
-                    tokio::time::sleep(Duration::from_millis(80)).await;
-                    let callback_id = format!("cb-{turn_id}");
-                    let cb_entry = approval_callback(&e_cb, &sid, &turn_id, &callback_id, &e_shell);
-                    let eid = data.add_entry(cb_entry.clone()).await;
-                    let (m, p) = evt(
-                        "history/entryAdded",
-                        eid,
-                        json!({"turnId": turn_id, "entry": cb_entry}),
-                    );
-                    send(m, p).await;
-                    let patch = json!([
-                        {"op": "replace", "path": "/state", "value": {"status": "blocked", "callbackId": callback_id, "outputText": ""}}
-                    ]);
-                    let eid = data.patch_entry(&e_shell, &patch).await;
-                    let (m, p) = evt(
-                        "history/entryUpdated",
-                        eid,
-                        json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
-                    );
-                    send(m, p).await;
-                    // Server→client request: the client must ack, then answer via callback/respond.
-                    pending
-                        .lock()
-                        .await
-                        .insert(callback_id.clone(), (data.clone(), n));
-                    server_request(
-                        json!(format!("srv-cb-{n}")),
-                        "callback/call",
-                        json!({"callback": cb_entry}),
-                    )
-                    .await;
-                });
             }
             "callback/respond" => {
                 let cb_id = params["callbackId"].as_str().unwrap_or("").to_string();
                 respond(json!({"status": "accepted"})).await;
                 // Finish the scripted turn once the answer lands.
-                if let Some((data, n)) = pending_callbacks.lock().await.remove(&cb_id) {
+                if let Some((data, n, turn_id)) = pending_callbacks.lock().await.remove(&cb_id) {
                     let tx2 = tx.clone();
+                    let pending = pending_callbacks.clone();
+                    let output = params["output"].clone();
+                    let sid = {
+                        let inner = data.inner.lock().await;
+                        inner.session["id"].as_str().unwrap_or("").to_string()
+                    };
+                    set_status(
+                        &data,
+                        &tx2,
+                        &sid,
+                        json!({"type": "running", "activeTurnId": turn_id}),
+                    )
+                    .await;
                     tokio::spawn(async move {
-                        let send = |m: &str, p: Value| {
-                            let tx = tx2.clone();
-                            let m = m.to_string();
-                            async move {
-                                let _ = tx
-                                    .send(
-                                        json!({"jsonrpc": "2.0", "method": m, "params": p})
-                                            .to_string(),
-                                    )
-                                    .await;
-                            }
-                        };
-                        let evt = |eid: u64, extra: Value| {
-                            let mut p = extra;
-                            p["eventId"] = json!(eid);
-                            p["sessionId"] = data.session["id"].clone();
-                            p["emittedAt"] = json!(1_700_000_000);
-                            p
-                        };
-                        let sid = data.session["id"].as_str().unwrap_or("").to_string();
-                        let turn_id = format!("t-{sid}-{n}");
-                        let e_think = format!("e-think-{n}");
-                        let e_asst = format!("e-asst-{n}");
-                        let e_shell = format!("e-shell-{n}");
-                        let e_cb = format!("e-cb-{n}");
-                        tokio::time::sleep(Duration::from_millis(80)).await;
-                        // Resolve the callback entry.
-                        let patch = json!([
-                            {"op": "replace", "path": "/state", "value": {"status": "answered", "output": params["output"]}}
-                        ]);
-                        let eid = data.patch_entry(&e_cb, &patch).await;
-                        send(
-                            "history/entryUpdated",
-                            evt(
-                                eid,
-                                json!({"turnId": turn_id, "entryId": e_cb, "patch": patch}),
-                            ),
-                        )
-                        .await;
-                        // Effect completes.
-                        let patch = json!([
-                            {"op": "replace", "path": "/state", "value": {
-                                "status": "completed", "output": {"stdout": "fixture-output"},
-                                "outputText": "fixture-output", "durationMs": 42,
-                                "display": {"success": true, "verb": "Ran", "message": "fixture-output", "warnings": [], "suffix": ""}
-                            }}
-                        ]);
-                        let eid = data.patch_entry(&e_shell, &patch).await;
-                        send(
-                            "history/entryUpdated",
-                            evt(
-                                eid,
-                                json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
-                            ),
-                        )
-                        .await;
-                        // Final assistant text + turn completed.
-                        let patch = json!([
-                            {"op": "append", "path": "/content/0/text", "value": " Done — effect approved and completed."}
-                        ]);
-                        let eid = data.patch_entry(&e_asst, &patch).await;
-                        send(
-                            "history/entryUpdated",
-                            evt(
-                                eid,
-                                json!({"turnId": turn_id, "entryId": e_asst, "patch": patch}),
-                            ),
-                        )
-                        .await;
-                        let patch = json!([
-                            {"op": "replace", "path": "/generationStatus", "value": "completed"}
-                        ]);
-                        let eid = data.patch_entry(&e_think, &patch).await;
-                        send(
-                            "history/entryUpdated",
-                            evt(
-                                eid,
-                                json!({"turnId": turn_id, "entryId": e_think, "patch": patch}),
-                            ),
-                        )
-                        .await;
-                        send("turn/completed", evt(data.bump().await, json!({"turn": {"id": turn_id, "sessionId": sid, "status": "completed", "startedAt": 1, "completedAt": 2, "error": null, "stopReason": null, "queueItemId": null}}))).await;
+                        finish_turn(data, n, turn_id, output, tx2, pending).await;
                     });
                 }
             }
             "session/turn/enqueue" => {
-                respond(json!({"queueItemId": "q-fixture-1"})).await;
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                let Some(data) = find_session(&sessions, &store, &sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                let qn = data.queue_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                let qid = format!("q-{sid}-{qn}");
+                {
+                    let mut inner = data.inner.lock().await;
+                    inner.queue_items.push(json!({
+                        "id": qid,
+                        "createdAt": 1_700_000_000,
+                        "entries": params["entries"],
+                    }));
+                    data.persist(&inner).await;
+                }
+                respond(json!({"queueItemId": qid})).await;
+                emit_queue_updated(&tx, &data, &sid).await;
+                // Idle queue promotes immediately — same as the real server.
+                promote_next(&data, &sid, &tx, &pending_callbacks).await;
             }
-            "turn/interrupt"
-            | "turn/steer"
-            | "session/turn/queue/remove"
-            | "session/turn/queue/replace"
-            | "session/turn/queue/steer"
-            | "session/turn/queue/resume" => {
+            "session/turn/queue/read" => {
+                let sid = params["sessionId"].as_str().unwrap_or("");
+                let Some(data) = find_session(&sessions, &store, sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                let queue = queue_value(&*data.inner.lock().await);
+                respond(json!({"queue": queue})).await;
+            }
+            "session/turn/queue/remove" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                let item_id = params["queueItemId"].as_str().unwrap_or("");
+                let Some(data) = find_session(&sessions, &store, &sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                {
+                    let mut inner = data.inner.lock().await;
+                    inner
+                        .queue_items
+                        .retain(|i| i["id"].as_str() != Some(item_id));
+                    data.persist(&inner).await;
+                }
+                respond(json!({})).await;
+                emit_queue_updated(&tx, &data, &sid).await;
+            }
+            "session/turn/queue/replace" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                let item_id = params["queueItemId"].as_str().unwrap_or("");
+                let Some(data) = find_session(&sessions, &store, &sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                {
+                    let mut inner = data.inner.lock().await;
+                    if let Some(item) = inner
+                        .queue_items
+                        .iter_mut()
+                        .find(|i| i["id"].as_str() == Some(item_id))
+                    {
+                        item["entries"] = params["entries"].clone();
+                    }
+                    data.persist(&inner).await;
+                }
+                respond(json!({"queueItemId": item_id})).await;
+                emit_queue_updated(&tx, &data, &sid).await;
+            }
+            "session/turn/queue/steer" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                let item_id = params["queueItemId"].as_str().unwrap_or("");
+                let expected = params["expectedTurnId"].as_str().unwrap_or("");
+                let Some(data) = find_session(&sessions, &store, &sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                {
+                    let mut inner = data.inner.lock().await;
+                    inner
+                        .queue_items
+                        .retain(|i| i["id"].as_str() != Some(item_id));
+                    data.persist(&inner).await;
+                }
+                respond(json!({"queueItemId": item_id, "turnId": expected, "lastEventId": 0}))
+                    .await;
+                emit_queue_updated(&tx, &data, &sid).await;
+            }
+            "session/turn/queue/resume" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                let Some(data) = find_session(&sessions, &store, &sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                {
+                    let mut inner = data.inner.lock().await;
+                    inner.queue_paused = false;
+                    data.persist(&inner).await;
+                }
+                respond(json!({})).await;
+                emit_queue_updated(&tx, &data, &sid).await;
+                promote_next(&data, &sid, &tx, &pending_callbacks).await;
+            }
+            "turn/interrupt" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                let expected = params["expectedTurnId"].as_str().unwrap_or("");
+                let Some(data) = find_session(&sessions, &store, &sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                // Upstream validates expectedTurnId BEFORE aborting
+                // (`_require_active_turn` raises "Active turn does not match
+                // expectedTurnId"). Abort first and a stale id strands the
+                // queue: the script dies but active_turn stays set, so
+                // nothing can promote.
+                let (aborted, killed_status) = {
+                    let mut inner = data.inner.lock().await;
+                    match inner.active_turn.clone() {
+                        Some(t) if expected.is_empty() || t == expected => {
+                            if let Some(abort) = inner.active_abort.take() {
+                                abort.abort();
+                            }
+                            inner.active_turn = None;
+                            pending_callbacks.lock().await.remove(&format!("cb-{t}"));
+                            // Interrupting pauses the queue (upstream
+                            // _after_turn_terminal).
+                            inner.queue_paused = true;
+                            data.persist(&inner).await;
+                            (true, true)
+                        }
+                        Some(_) => (false, false),
+                        None => (true, false),
+                    }
+                };
+                if !aborted {
+                    respond_err("invalid_params", "expectedTurnId").await;
+                    continue;
+                }
+                if killed_status {
+                    let term = terminal_status(&data).await;
+                    set_status(&data, &tx, &sid, term).await;
+                }
+                respond(json!({"accepted": true, "lastEventId": 0})).await;
+                emit_queue_updated(&tx, &data, &sid).await;
+            }
+            "turn/steer" => {
                 respond(json!({"accepted": true, "lastEventId": 0})).await;
             }
             "session/stop" | "session/close" => {
                 respond(json!({"closed": true})).await;
             }
-            "session/pin"
-            | "session/archive"
-            | "session/rename"
-            | "session/title/update"
-            | "session/markAsSeen"
-            | "session/delete" => {
+            "session/pin" | "session/archive" | "session/markAsSeen" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                // Unknown-but-safe ids materialize — the demo catalog rows
+                // aren't in the store until an op persists them.
+                let data = find_session(&sessions, &store, &sid).await.or_else(|| {
+                    store_safe_id(&sid).then(|| {
+                        Arc::new(SessionData::new(
+                            session_value(&sid, "/tmp", json!({"type": "idle"})),
+                            store.clone(),
+                        ))
+                    })
+                });
+                let Some(data) = data else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                sessions.lock().await.insert(sid.clone(), data.clone());
+                let (field, value) = match method.as_str() {
+                    "session/pin" => (
+                        "pinnedAt",
+                        if params["pinned"].as_bool().unwrap_or(false) {
+                            json!(1_700_000_000)
+                        } else {
+                            Value::Null
+                        },
+                    ),
+                    "session/archive" => (
+                        "archivedAt",
+                        if params["archived"].as_bool().unwrap_or(false) {
+                            json!(1_700_000_000)
+                        } else {
+                            Value::Null
+                        },
+                    ),
+                    _ => ("isUnseen", json!(false)),
+                };
+                data.set_session_field(field, value.clone()).await;
+                // `status.type` tracks archive state too (upstream keeps them
+                // consistent) — without this an unarchived stored row would
+                // still report status "archived". A live turn keeps its
+                // running/blocked/failed status; only idle↔archived move.
+                let mut patch_ops =
+                    vec![json!({"op": "replace", "path": format!("/session/{field}"), "value": value})];
+                if field == "archivedAt" {
+                    let archived = params["archived"].as_bool().unwrap_or(false);
+                    let cur = {
+                        let inner = data.inner.lock().await;
+                        inner.session["status"]["type"].as_str().unwrap_or("").to_string()
+                    };
+                    let status = match (cur.as_str(), archived) {
+                        ("idle", true) => Some(json!({"type": "archived"})),
+                        ("archived", false) => Some(json!({"type": "idle"})),
+                        _ => None,
+                    };
+                    if let Some(status) = status {
+                        data.set_session_field("status", status.clone()).await;
+                        patch_ops.push(
+                            json!({"op": "replace", "path": "/session/status", "value": status}),
+                        );
+                    }
+                }
+                let body = match field {
+                    "pinnedAt" => json!({"pinnedAt": value}),
+                    "archivedAt" => json!({"archivedAt": value}),
+                    _ => json!({}),
+                };
+                respond(body).await;
+                emit_updated(&tx, &data, &sid, Value::Array(patch_ops)).await;
+            }
+            "session/rename" | "session/title/update" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                let title = params["title"].as_str().unwrap_or("").to_string();
+                let data = find_session(&sessions, &store, &sid).await.or_else(|| {
+                    store_safe_id(&sid).then(|| {
+                        Arc::new(SessionData::new(
+                            session_value(&sid, "/tmp", json!({"type": "idle"})),
+                            store.clone(),
+                        ))
+                    })
+                });
+                let Some(data) = data else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                sessions.lock().await.insert(sid.clone(), data.clone());
+                data.set_session_field("title", json!(title)).await;
+                respond(json!({"title": title, "updatedAt": "1", "lastEventId": 0})).await;
+                emit_updated(
+                    &tx,
+                    &data,
+                    &sid,
+                    json!([{"op": "replace", "path": "/session/title", "value": title}]),
+                )
+                .await;
+            }
+            "session/delete" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                sessions.lock().await.remove(&sid);
+                if store_safe_id(&sid) {
+                    // Tombstone instead of a bare remove: the canned demo
+                    // row for this id must stay suppressed on later lists.
+                    let _ = tokio::fs::write(
+                        store.join(format!("{sid}.json")),
+                        json!({"session": {"id": sid}, "deleted": true}).to_string(),
+                    )
+                    .await;
+                }
                 respond(json!({})).await;
+            }
+            "session/rewind/read" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                let entry_id = params["entryId"].as_str().unwrap_or("");
+                let Some(data) = find_session(&sessions, &store, &sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                let inner = data.inner.lock().await;
+                match rewind_index(&inner, entry_id) {
+                    Some(idx) => {
+                        let changed = rewind_has_changes(&inner, idx);
+                        respond(json!({
+                            "hasFileChanges": changed,
+                            "paths": if changed { json!(["src/fixture.rs"]) } else { json!([]) }
+                        }))
+                        .await;
+                    }
+                    None => respond_err("invalid_params", "entryId").await,
+                }
+            }
+            "session/rewind" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                let entry_id = params["entryId"].as_str().unwrap_or("");
+                let inplace = params["inplace"].as_bool().unwrap_or(false);
+                let restore_files = params["restoreFiles"].as_bool().unwrap_or(false);
+                let Some(data) = find_session(&sessions, &store, &sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                let idx = {
+                    let inner = data.inner.lock().await;
+                    match rewind_index(&inner, entry_id) {
+                        Some(i) => i,
+                        None => {
+                            respond_err("invalid_params", "entryId").await;
+                            continue;
+                        }
+                    }
+                };
+                let restored = if restore_files {
+                    json!(["src/fixture.rs"])
+                } else {
+                    json!([])
+                };
+                // Upstream _rewind runs _turns.reset() on the source session
+                // either way: kills the active turn and clears the queue, then
+                // emits turn/queueUpdated if anything changed. The new state
+                // travels in the RESPONSE (state), not a history patch.
+                let (queue_changed, killed_status) = {
+                    let mut inner = data.inner.lock().await;
+                    let changed = !inner.queue_items.is_empty()
+                        || inner.queue_paused
+                        || inner.active_turn.is_some();
+                    inner.queue_items.clear();
+                    inner.queue_paused = false;
+                    if let Some(abort) = inner.active_abort.take() {
+                        abort.abort();
+                    }
+                    let killed = inner.active_turn.is_some();
+                    if let Some(t) = inner.active_turn.take() {
+                        pending_callbacks.lock().await.remove(&format!("cb-{t}"));
+                    }
+                    data.persist(&inner).await;
+                    (changed, killed)
+                };
+                if killed_status {
+                    let term = terminal_status(&data).await;
+                    set_status(&data, &tx, &sid, term).await;
+                }
+                if inplace {
+                    // Drop the target message and everything after it.
+                    let (message, state) = {
+                        let mut inner = data.inner.lock().await;
+                        let message = entry_text(&inner.history[idx]);
+                        inner.history.truncate(idx);
+                        inner.event_id += 1;
+                        let state = state_value(
+                            inner.session.clone(),
+                            inner.event_id,
+                            json!(inner.history.clone()),
+                            Value::Null,
+                            queue_value(&inner),
+                        );
+                        data.persist(&inner).await;
+                        (message, state)
+                    };
+                    respond(json!({
+                        "message": message, "restoreErrors": [],
+                        "restoredPaths": restored, "state": state,
+                        "sessionLog": {"enabled": false}
+                    }))
+                    .await;
+                } else {
+                    // Fork semantics: parent keeps its history; the child
+                    // carries the truncated copy.
+                    let rewind_id = format!("{sid}-rewind");
+                    let (mut session, history, event_id, turn_seq, message) = {
+                        let p = data.inner.lock().await;
+                        (
+                            p.session.clone(),
+                            p.history[..idx].to_vec(),
+                            p.event_id,
+                            data.turn_seq.load(Ordering::SeqCst),
+                            entry_text(&p.history[idx]),
+                        )
+                    };
+                    refresh_catalog_fields(&data, &mut session).await;
+                    session["id"] = json!(rewind_id);
+                    session["parentSessionId"] = json!(sid);
+                    // Same normalization: the child's own turn set is empty,
+                    // so it must not advertise the parent's activeTurnId.
+                    session["status"] = status_without_turn(&session);
+                    let child = Arc::new(SessionData::new(session, store.clone()));
+                    {
+                        let mut inner = child.inner.lock().await;
+                        inner.history = history;
+                        inner.event_id = event_id;
+                        child.turn_seq.store(turn_seq, Ordering::SeqCst);
+                        child.persist(&inner).await;
+                    }
+                    let state = child.state().await;
+                    sessions.lock().await.insert(rewind_id, child);
+                    respond(json!({
+                        "message": message, "restoreErrors": [],
+                        "restoredPaths": restored, "state": state,
+                        "sessionLog": {"enabled": false}
+                    }))
+                    .await;
+                }
+                if queue_changed {
+                    emit_queue_updated(&tx, &data, &sid).await;
+                }
+            }
+            "session/history/list" => {
+                let sid = params["sessionId"].as_str().unwrap_or("").to_string();
+                let Some(data) = find_session(&sessions, &store, &sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
+                };
+                let inner = data.inner.lock().await;
+                let len = inner.history.len();
+                let limit = params
+                    .pointer("/page/limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(200) as usize;
+                let cursor = params
+                    .pointer("/page/cursor")
+                    .and_then(Value::as_str)
+                    .and_then(|c| c.strip_prefix("h-"))
+                    .and_then(|c| c.parse::<usize>().ok());
+                let direction = params
+                    .pointer("/page/direction")
+                    .and_then(Value::as_str)
+                    .unwrap_or("backward");
+                let (items, next, prev) = if direction == "forward" {
+                    let start = cursor.unwrap_or(0).min(len);
+                    let end = (start + limit).min(len);
+                    (
+                        inner.history[start..end].to_vec(),
+                        if end < len {
+                            json!(format!("h-{end}"))
+                        } else {
+                            Value::Null
+                        },
+                        Value::Null,
+                    )
+                } else {
+                    let end = cursor.unwrap_or(len).min(len);
+                    let start = end.saturating_sub(limit);
+                    (
+                        inner.history[start..end].to_vec(),
+                        Value::Null,
+                        if start > 0 {
+                            json!(format!("h-{start}"))
+                        } else {
+                            Value::Null
+                        },
+                    )
+                };
+                respond(json!({"items": items, "nextCursor": next, "previousCursor": prev})).await;
+            }
+            "workspace/trust/status" => {
+                let cwd = params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or("/tmp")
+                    .to_string();
+                let trusted = trusted_cwds(&store).await.contains(&cwd);
+                if trusted {
+                    respond(json!({"status": "trusted", "details": null})).await;
+                } else {
+                    respond(json!({
+                        "status": "untrusted",
+                        "details": {
+                            "cwd": cwd,
+                            "repoRoot": null,
+                            "detectedFiles": [".vibe/settings.toml"],
+                            "repoDetectedFiles": [],
+                            "repoExplicitlyUntrusted": false,
+                            "settingsPath": store.join("trusted.json").to_string_lossy(),
+                            "availableDecisions": ["trust_repo", "trust_cwd", "decline"]
+                        }
+                    }))
+                    .await;
+                }
+            }
+            "workspace/trust/decision" => {
+                let cwd = params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or("/tmp")
+                    .to_string();
+                if params["decision"].as_str().unwrap_or("decline") != "decline" {
+                    let mut set = trusted_cwds(&store).await;
+                    set.insert(cwd);
+                    let mut list: Vec<String> = set.into_iter().collect();
+                    list.sort();
+                    let _ = tokio::fs::write(
+                        store.join("trusted.json"),
+                        serde_json::to_string(&list).unwrap_or_default(),
+                    )
+                    .await;
+                }
+                respond(json!({})).await;
+            }
+            "workspace/trust/untrustedConfig" => {
+                let cwd = params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or("/tmp")
+                    .to_string();
+                let dirs = if trusted_cwds(&store).await.contains(&cwd) {
+                    json!([])
+                } else {
+                    json!([cwd])
+                };
+                respond(json!({
+                    "dirs": dirs,
+                    "settingsPath": store.join("trusted.json").to_string_lossy()
+                }))
+                .await;
             }
             "session/compact" => {
                 let sid = params["sessionId"].as_str().unwrap_or("");
-                let data = sessions.lock().await.get(sid).cloned();
-                let state = match data {
-                    Some(d) => d.state().await,
-                    None => Value::Null,
+                let Some(data) = find_session(&sessions, &store, sid).await else {
+                    respond_err("not_found", "session").await;
+                    continue;
                 };
-                respond(json!({"summary": "fixture summary", "state": state, "sessionLog": {"enabled": false}})).await;
+                // Compaction hands off to a fresh session carrying a summary
+                // entry — same event shape as the real server.
+                let compact_id = format!("{sid}-compact");
+                let (mut session, event_id, turn_seq) = {
+                    let p = data.inner.lock().await;
+                    (
+                        p.session.clone(),
+                        p.event_id,
+                        data.turn_seq.load(Ordering::SeqCst),
+                    )
+                };
+                session["id"] = json!(compact_id);
+                session["parentSessionId"] = json!(sid);
+                let child = Arc::new(SessionData::new(session, store.clone()));
+                {
+                    let mut inner = child.inner.lock().await;
+                    let summary = message_entry(
+                        "e-compact-1",
+                        &compact_id,
+                        "",
+                        "assistant",
+                        "Fixture summary of the compacted conversation.",
+                    );
+                    inner.history = vec![summary];
+                    inner.event_id = event_id + 1;
+                    child.turn_seq.store(turn_seq, Ordering::SeqCst);
+                    child.persist(&inner).await;
+                }
+                let state = child.state().await;
+                sessions
+                    .lock()
+                    .await
+                    .insert(compact_id.clone(), child.clone());
+                respond(json!({
+                    "summary": "fixture summary",
+                    "state": state,
+                    "sessionLog": {"enabled": false}
+                }))
+                .await;
+                let eid = child.bump().await;
+                let _ = tx
+                    .send(
+                        json!({"jsonrpc": "2.0", "method": "session/compacted", "params": {
+                            "eventId": eid, "sessionId": compact_id, "emittedAt": 1_700_000_000,
+                            "oldSessionId": sid, "state": state,
+                            "sessionLog": {"enabled": false}, "summaryLength": 15
+                        }})
+                        .to_string(),
+                    )
+                    .await;
             }
             "runtime/read" => {
                 respond(json!({

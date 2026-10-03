@@ -535,6 +535,200 @@ impl Connection {
         Ok(())
     }
 
+    // -- Turn queue -------------------------------------------------------------
+
+    pub async fn turn_queue_read(&self, session_id: &str) -> ClientResult<PublicTurnQueue> {
+        Ok(self
+            .request_typed::<TurnQueueReadResponse>(
+                "session/turn/queue/read",
+                TurnQueueReadParams {
+                    session_id: session_id.to_string(),
+                },
+            )
+            .await?
+            .queue)
+    }
+
+    pub async fn turn_queue_remove(
+        &self,
+        session_id: &str,
+        queue_item_id: &str,
+    ) -> ClientResult<()> {
+        self.request(
+            "session/turn/queue/remove",
+            TurnQueueRemoveParams {
+                session_id: session_id.to_string(),
+                queue_item_id: queue_item_id.to_string(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Resume a paused turn queue.
+    pub async fn turn_queue_resume(&self, session_id: &str) -> ClientResult<()> {
+        self.request(
+            "session/turn/queue/resume",
+            TurnQueueResumeParams {
+                session_id: session_id.to_string(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Steer a queued item into the currently active turn.
+    pub async fn turn_queue_steer(
+        &self,
+        session_id: &str,
+        queue_item_id: &str,
+        expected_turn_id: &str,
+    ) -> ClientResult<TurnQueueSteerResponse> {
+        self.request_typed(
+            "session/turn/queue/steer",
+            TurnQueueSteerParams {
+                session_id: session_id.to_string(),
+                queue_item_id: queue_item_id.to_string(),
+                expected_turn_id: expected_turn_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Replace a queued item's content (queue edit mode).
+    pub async fn turn_queue_replace(
+        &self,
+        session_id: &str,
+        queue_item_id: &str,
+        text: &str,
+    ) -> ClientResult<String> {
+        let resp: QueueItemResponse = self
+            .request_typed(
+                "session/turn/queue/replace",
+                TurnQueueReplaceParams {
+                    session_id: session_id.to_string(),
+                    queue_item_id: queue_item_id.to_string(),
+                    entries: vec![TurnInputEntry::User {
+                        entry_id: None,
+                        content: vec![SessionContentBlock::Text {
+                            text: text.to_string(),
+                        }],
+                    }],
+                    idempotency_key: None,
+                },
+            )
+            .await?;
+        Ok(resp.queue_item_id)
+    }
+
+    // -- Rewind -------------------------------------------------------------------
+
+    /// Preview what a rewind to `entry_id` would restore (file changes + paths).
+    pub async fn session_rewind_read(
+        &self,
+        session_id: &str,
+        entry_id: &str,
+    ) -> ClientResult<SessionRewindReadResponse> {
+        self.request_typed(
+            "session/rewind/read",
+            SessionRewindReadParams {
+                session_id: session_id.to_string(),
+                entry_id: entry_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Rewind the session to `entry_id`. `inplace` rewinds this session;
+    /// otherwise the server forks into a new session whose state is returned.
+    pub async fn session_rewind(
+        &self,
+        session_id: &str,
+        entry_id: &str,
+        restore_files: bool,
+        inplace: bool,
+    ) -> ClientResult<SessionRewindResponse> {
+        self.request_typed(
+            "session/rewind",
+            SessionRewindParams {
+                session_id: session_id.to_string(),
+                entry_id: entry_id.to_string(),
+                restore_files,
+                inplace,
+            },
+        )
+        .await
+    }
+
+    // -- History ------------------------------------------------------------------
+
+    /// Page through the session's history (older entries via `page.cursor`
+    /// seeded from `state.history_before_cursor`).
+    pub async fn session_history_list(
+        &self,
+        session_id: &str,
+        turn_id: Option<&str>,
+        page: PageRequest,
+    ) -> ClientResult<SessionHistoryListResponse> {
+        self.request_typed(
+            "session/history/list",
+            SessionHistoryListParams {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.map(str::to_string),
+                page,
+            },
+        )
+        .await
+    }
+
+    // -- Workspace trust ------------------------------------------------------------
+
+    pub async fn workspace_trust_status(
+        &self,
+        cwd: Option<&str>,
+    ) -> ClientResult<WorkspaceTrustStatusResponse> {
+        self.request_typed(
+            "workspace/trust/status",
+            WorkspaceTrustStatusParams {
+                cwd: cwd.map(str::to_string),
+            },
+        )
+        .await
+    }
+
+    /// `decision` is one of `trust_repo`, `trust_cwd`, `decline`.
+    pub async fn workspace_trust_decision(
+        &self,
+        decision: &str,
+        cwd: Option<&str>,
+        session_id: Option<&str>,
+    ) -> ClientResult<()> {
+        self.request(
+            "workspace/trust/decision",
+            WorkspaceTrustDecisionParams {
+                decision: decision.to_string(),
+                cwd: cwd.map(str::to_string),
+                session_id: session_id.map(str::to_string),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Directories carrying config the workspace doesn't trust yet.
+    pub async fn workspace_trust_untrusted_config(
+        &self,
+        cwd: Option<&str>,
+    ) -> ClientResult<WorkspaceUntrustedConfigResponse> {
+        self.request_typed(
+            "workspace/trust/untrustedConfig",
+            WorkspaceUntrustedConfigParams {
+                cwd: cwd.map(str::to_string),
+            },
+        )
+        .await
+    }
+
     pub async fn session_shell_command(
         &self,
         session_id: &str,
