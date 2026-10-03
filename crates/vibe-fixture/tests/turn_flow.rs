@@ -63,7 +63,15 @@ async fn scripted_turn_with_approval() {
         .session_list(SessionListParams::default())
         .await
         .expect("session/list");
-    assert_eq!(sessions.items.len(), 2);
+    assert_eq!(sessions.items.len(), 1);
+    let all = conn
+        .session_list(SessionListParams {
+            include_archived: true,
+            ..Default::default()
+        })
+        .await
+        .expect("session/list archived");
+    assert_eq!(all.items.len(), 2);
 
     let state = conn
         .session_start(SessionStartParams {
@@ -144,7 +152,7 @@ async fn scripted_turn_with_approval() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupt_returns_accepted() {
-    let mut conn = Connection::spawn(&fixture()).await.expect("spawn");
+    let conn = Connection::spawn(&fixture()).await.expect("spawn");
     conn.initialize(info(), caps()).await.unwrap();
     let state = conn
         .session_start(SessionStartParams {

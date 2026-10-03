@@ -94,19 +94,32 @@ impl VibeApp {
                     let conn = host::spawn_connection(&program, None).await?;
                     conn.initialize(Self::client_info(), Self::capabilities())
                         .await?;
-                    conn.session_list(SessionListParams {
-                        include_archived: false,
-                        ..Default::default()
-                    })
-                    .await
+                    // Follow the cursor — sessions past page 1 exist too.
+                    let mut items = Vec::new();
+                    let mut cursor = None;
+                    for _ in 0..32 {
+                        let page = conn
+                            .session_list(SessionListParams {
+                                cursor: cursor.take(),
+                                include_archived: false,
+                                ..Default::default()
+                            })
+                            .await?;
+                        items.extend(page.items);
+                        match page.next_cursor {
+                            Some(c) => cursor = Some(c),
+                            None => break,
+                        }
+                    }
+                    Ok(items)
                 })
                 .await
                 .map_err(|_| vibe_protocol::client::ClientError::Closed)
                 .and_then(|r| r);
             let _ = this.update(cx, |app, cx| {
                 match out {
-                    Ok(list) => {
-                        app.sessions = list.items;
+                    Ok(items) => {
+                        app.sessions = items;
                         app.sort_sessions();
                         app.status = format!("{} session(s)", app.sessions.len());
                     }
@@ -213,6 +226,8 @@ impl VibeApp {
                         let title = state.session.display_title();
                         let view =
                             cx.new(|cx| SessionView::attached(conn, state, cx.focus_handle(), cx));
+                        let app_weak = cx.entity().downgrade();
+                        view.update(cx, |v, _cx| v.app = Some(app_weak));
                         app.open.push(view);
                         app.selected = app.open.len() - 1;
                         app.status = format!("attached {title}");

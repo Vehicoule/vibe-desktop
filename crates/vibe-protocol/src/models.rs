@@ -63,9 +63,11 @@ enum RawIncoming {
         id: Option<Value>,
         params: Option<Value>,
     },
+    // `result` must be required: an error envelope has an `id` and no
+    // `result`, so an optional field would swallow the error as `null`.
     Result {
         id: Value,
-        result: Option<Value>,
+        result: Value,
     },
     Error {
         id: Value,
@@ -97,7 +99,7 @@ pub fn parse_incoming(line: &str) -> Result<Incoming, serde_json::Error> {
         }),
         RawIncoming::Result { id, result } => Incoming::Response {
             id,
-            result: Ok(result.unwrap_or(Value::Null)),
+            result: Ok(result),
         },
         RawIncoming::Error { id, error } => Incoming::Response {
             id,
@@ -940,20 +942,22 @@ pub enum PublicHistoryEntry {
 }
 
 impl PublicHistoryEntry {
-    pub fn base(&self) -> &HistoryEntryBase {
+    pub fn base(&self) -> Option<&HistoryEntryBase> {
         match self {
             Self::Message { base, .. }
             | Self::Reasoning { base, .. }
             | Self::Effect { base, .. }
             | Self::Callback { base, .. }
             | Self::Checkpoint { base, .. }
-            | Self::Notice { base, .. } => base,
-            Self::Unknown => unreachable!("unknown entries carry no base"),
+            | Self::Notice { base, .. } => Some(base),
+            Self::Unknown => None,
         }
     }
 
-    pub fn id(&self) -> &str {
-        &self.base().id
+    /// None for `Unknown` entries (they carry no base) — callers must not
+    /// assume every entry has an id.
+    pub fn id(&self) -> Option<&str> {
+        self.base().map(|b| b.id.as_str())
     }
 
     /// For `Callback` entries: the wire callback id (`cb-…`) used by

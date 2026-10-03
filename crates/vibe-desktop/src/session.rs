@@ -1,6 +1,7 @@
 //! One attached session: its `vibe-app-server` process, protocol projection,
 //! composer state, and callback handling.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -8,6 +9,8 @@ use gpui::{AsyncApp, Context, FocusHandle, Task, WeakEntity};
 use vibe_protocol::client::{ClientResult, Connection};
 use vibe_protocol::models::*;
 use vibe_protocol::projection::{Projection, Reduce};
+
+use crate::app::VibeApp;
 
 /// User action destined for a callback.
 pub enum CallbackAnswer {
@@ -23,6 +26,11 @@ pub struct SessionView {
     pub error: Option<String>,
     /// Focus the composer once when the session is first shown.
     pub autofocused: bool,
+    /// Root view, for opening forked sessions in new tabs.
+    pub app: Option<WeakEntity<VibeApp>>,
+    /// `user_input` callback selections, per callback id → per question.
+    /// Accumulated until the user submits the whole request.
+    pub question_selections: HashMap<String, Vec<Vec<String>>>,
     events_task: Option<Task<()>>,
 }
 
@@ -45,6 +53,8 @@ impl SessionView {
             composer_focus,
             error: None,
             autofocused: false,
+            app: None,
+            question_selections: HashMap::new(),
             events_task: None,
         };
         if let Some(rx) = events {
@@ -107,7 +117,8 @@ impl SessionView {
                         callback_id: p
                             .callback
                             .callback_id()
-                            .unwrap_or_else(|| p.callback.id())
+                            .or_else(|| p.callback.id())
+                            .unwrap_or_default()
                             .to_string(),
                         accepted: true,
                     };
@@ -161,8 +172,13 @@ impl SessionView {
         cx.spawn(async move |this, cx| {
             if let Ok(state) = conn.session_read(&session_id).await {
                 let _ = this.update(cx, |view, cx| {
-                    view.projection.adopt(state);
-                    cx.notify();
+                    if view.projection.adopt(state) {
+                        cx.notify();
+                    } else {
+                        // The read raced behind the live stream — its
+                        // snapshot is already stale; read again.
+                        view.resync(cx);
+                    }
                 });
             }
         })
@@ -286,7 +302,7 @@ impl SessionView {
         };
         // Optimistically mark answered so the card flips immediately.
         for e in self.projection.state.active_callbacks.iter_mut() {
-            if e.id() == callback_id {
+            if e.callback_id() == Some(callback_id) {
                 if let PublicHistoryEntry::Callback { state, .. } = e {
                     *state = CallbackState::Answered {
                         output: output.clone(),
@@ -325,9 +341,113 @@ impl SessionView {
         .detach();
     }
 
-    pub fn fork(&mut self, cx: &mut Context<Self>) -> Task<ClientResult<PublicSessionState>> {
+    /// Fork this session server-side, then open the child in a new tab
+    /// through the root app (a fork needs its own server process).
+    pub fn request_fork(&mut self, cx: &mut Context<Self>) {
         let conn = self.conn.clone();
         let session_id = self.session_id().to_string();
-        cx.spawn(async move |_, _| conn.session_fork(&session_id, None, 200).await)
+        cx.spawn(async move |this, cx| {
+            let result = conn.session_fork(&session_id, None, 200).await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(state) => {
+                        if let Some(app) = view.app.as_ref().and_then(|w| w.upgrade()) {
+                            let id = state.session.id.clone();
+                            app.update(cx, |app, cx| app.open_session(&id, cx));
+                        }
+                    }
+                    Err(e) => view.error = Some(e.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Toggle a question option for a `user_input` callback.
+    pub fn select_question_option(
+        &mut self,
+        callback_id: &str,
+        question_index: usize,
+        option: &str,
+        multi_select: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let selections = self
+            .question_selections
+            .entry(callback_id.to_string())
+            .or_default();
+        if selections.len() <= question_index {
+            selections.resize(question_index + 1, Vec::new());
+        }
+        let chosen = &mut selections[question_index];
+        if multi_select {
+            if let Some(pos) = chosen.iter().position(|o| o == option) {
+                chosen.remove(pos);
+            } else {
+                chosen.push(option.to_string());
+            }
+        } else {
+            *chosen = vec![option.to_string()];
+        }
+        cx.notify();
+    }
+
+    /// Current selections for a `user_input` callback.
+    pub fn selected_options(&self, callback_id: &str, question_index: usize) -> Vec<String> {
+        self.question_selections
+            .get(callback_id)
+            .and_then(|s| s.get(question_index))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Submit the accumulated answers for a `user_input` callback.
+    pub fn submit_question(
+        &mut self,
+        callback_id: &str,
+        request: &UserQuestionRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let selections = self
+            .question_selections
+            .remove(callback_id)
+            .unwrap_or_default();
+        let answers = request
+            .questions
+            .iter()
+            .enumerate()
+            .flat_map(|(i, q)| {
+                selections
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|answer| UserAnswer {
+                        question: q.question.clone(),
+                        answer,
+                        is_other: false,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        self.answer_callback(
+            callback_id,
+            CallbackAnswer::UserInput(UserQuestionResult {
+                answers,
+                cancelled: false,
+            }),
+            cx,
+        );
+    }
+
+    /// Every question has at least one selected option.
+    pub fn question_complete(&self, callback_id: &str, request: &UserQuestionRequest) -> bool {
+        request.questions.iter().enumerate().all(|(i, _)| {
+            self.question_selections
+                .get(callback_id)
+                .and_then(|s| s.get(i))
+                .is_some_and(|c| !c.is_empty())
+        })
     }
 }

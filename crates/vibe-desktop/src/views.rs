@@ -443,7 +443,7 @@ impl Render for SessionView {
                     )
                     .child(
                         ghost_button("fork", "fork").on_click(cx.listener(|v, _e, _w, cx| {
-                            v.fork(cx).detach();
+                            v.request_fork(cx);
                         })),
                     )
                     .child(
@@ -685,61 +685,75 @@ impl SessionView {
                     .border_color(c(theme::AMBER))
                     .child(text("question", 12.5, c(theme::INK)));
                 if let Some(req) = &input.request {
-                    for q in &req.questions {
-                        let qtext = q.question.clone();
-                        let cb = cb_id.clone();
-                        col = col.child(text(qtext.clone(), 12.0, c(theme::INK))).child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .flex_wrap()
-                                .children(q.options.iter().map(|opt| {
+                    let complete = self.question_complete(&cb_id, req);
+                    for (qi, q) in req.questions.iter().enumerate() {
+                        let selected = self.selected_options(&cb_id, qi);
+                        col = col
+                            .child(text(q.question.clone(), 12.0, c(theme::INK)))
+                            .child(div().flex().gap_2().flex_wrap().children(
+                                q.options.iter().map(|opt| {
                                     let answer = opt.label.clone();
-                                    let q2 = qtext.clone();
-                                    let cb2 = cb.clone();
+                                    let cb2 = cb_id.clone();
+                                    let multi = q.multi_select;
+                                    let chosen = selected.contains(&answer);
                                     div()
                                         .id(gpui::ElementId::Name(
-                                            format!("opt-{}-{}", cb2, opt.label).into(),
+                                            format!("opt-{}-{}-{}", cb2, qi, opt.label).into(),
                                         ))
                                         .px_3()
                                         .py_1()
                                         .rounded_sm()
                                         .cursor_pointer()
-                                        .bg(c(theme::IVORY_DEEP))
                                         .text_size(px(11.5))
+                                        .bg(if chosen {
+                                            c(theme::SUNSET)
+                                        } else {
+                                            c(theme::IVORY_DEEP)
+                                        })
+                                        .text_color(if chosen {
+                                            gpui::white()
+                                        } else {
+                                            c(theme::INK)
+                                        })
                                         .hover(|s| s.bg(c(theme::SUNSET_WASH)))
                                         .on_click(cx.listener(move |v, _e, _w, cx| {
-                                            v.answer_callback(
-                                                &cb2,
-                                                CallbackAnswer::UserInput(UserQuestionResult {
-                                                    answers: vec![UserAnswer {
-                                                        question: q2.clone(),
-                                                        answer: answer.clone(),
-                                                        is_other: false,
-                                                    }],
-                                                    cancelled: false,
-                                                }),
-                                                cx,
-                                            );
+                                            v.select_question_option(&cb2, qi, &answer, multi, cx);
                                         }))
                                         .child(opt.label.clone())
-                                })),
-                        );
+                                }),
+                            ));
                     }
+                    let req2 = req.clone();
+                    let cb3 = cb_id.clone();
+                    col = col.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(ghost_button("cancel-q", "cancel").on_click(cx.listener(
+                                move |v, _e, _w, cx| {
+                                    v.answer_callback(
+                                        &cb_id,
+                                        CallbackAnswer::UserInput(UserQuestionResult {
+                                            answers: vec![],
+                                            cancelled: true,
+                                        }),
+                                        cx,
+                                    );
+                                },
+                            )))
+                            .child(
+                                accent_button("submit-q", "submit")
+                                    .when(!complete, |d| d.opacity(0.4))
+                                    .on_click(cx.listener(move |v, _e, _w, cx| {
+                                        if v.question_complete(&cb3, &req2) {
+                                            v.submit_question(&cb3, &req2, cx);
+                                        }
+                                    })),
+                            ),
+                    );
                 }
-                col.child(ghost_button("cancel-q", "cancel").on_click(cx.listener(
-                    move |v, _e, _w, cx| {
-                        let cb = cb_id.clone();
-                        v.answer_callback(
-                            &cb,
-                            CallbackAnswer::UserInput(UserQuestionResult {
-                                answers: vec![],
-                                cancelled: true,
-                            }),
-                            cx,
-                        );
-                    },
-                )))
+                col
             }
             CallbackDetail::Unknown => div(),
         }

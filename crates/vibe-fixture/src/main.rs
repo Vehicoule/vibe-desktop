@@ -12,10 +12,55 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use vibe_protocol::json_patch::apply_patch;
+use vibe_protocol::models::JsonPatchOperation;
 
+/// Live session contents — history entries accumulate as the scripted turn
+/// emits them, so `session/read` answers with the real current snapshot.
 struct SessionData {
-    state: Value,
+    session: Value,
+    history: tokio::sync::Mutex<Vec<Value>>,
     event_id: AtomicU64,
+    turn_seq: AtomicU64,
+}
+
+impl SessionData {
+    fn new(session: Value) -> Self {
+        Self {
+            session,
+            history: tokio::sync::Mutex::new(Vec::new()),
+            event_id: AtomicU64::new(0),
+            turn_seq: AtomicU64::new(0),
+        }
+    }
+
+    async fn add_entry(&self, entry: Value) {
+        self.history.lock().await.push(entry);
+    }
+
+    async fn patch_entry(&self, entry_id: &str, patch: &Value) {
+        let mut history = self.history.lock().await;
+        let Some(entry) = history
+            .iter_mut()
+            .find(|e| e["id"].as_str() == Some(entry_id))
+        else {
+            return;
+        };
+        if let Ok(ops) = serde_json::from_value::<Vec<JsonPatchOperation>>(patch.clone()) {
+            if let Ok(next) = apply_patch(entry, &ops) {
+                *entry = next;
+            }
+        }
+    }
+
+    async fn state(&self) -> Value {
+        let history = self.history.lock().await.clone();
+        state_value(
+            self.session.clone(),
+            self.event_id.load(Ordering::SeqCst),
+            json!(history),
+        )
+    }
 }
 
 fn session_value(id: &str, cwd: &str, status: Value) -> Value {
@@ -165,9 +210,10 @@ async fn main() {
     let sessions = Arc::new(tokio::sync::Mutex::new(
         BTreeMap::<String, Arc<SessionData>>::new(),
     ));
-    let pending_callbacks = Arc::new(tokio::sync::Mutex::new(
-        BTreeMap::<String, Arc<SessionData>>::new(),
-    ));
+    let pending_callbacks = Arc::new(tokio::sync::Mutex::new(BTreeMap::<
+        String,
+        (Arc<SessionData>, u64),
+    >::new()));
 
     let mut lines = BufReader::new(stdin).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -237,15 +283,26 @@ async fn main() {
             }
             "initialized" => {}
             "session/list" => {
+                let include_archived = params["includeArchived"].as_bool().unwrap_or(false);
+                let mut items = vec![session_value(
+                    "saved-aaaa1111",
+                    "/tmp/project-a",
+                    json!({"type": "idle"}),
+                )];
+                if include_archived {
+                    items.push(session_value(
+                        "saved-bbbb2222",
+                        "/tmp/project-b",
+                        json!({"type": "archived"}),
+                    ));
+                }
                 respond(json!({
-                    "items": [
-                        session_value("saved-aaaa1111", "/tmp/project-a", json!({"type": "idle"})),
-                        session_value("saved-bbbb2222", "/tmp/project-b", json!({"type": "archived"})),
-                    ],
+                    "items": items,
                     "nextCursor": null,
                     "previousCursor": null,
                     "continueSessionId": "saved-aaaa1111"
-                })).await;
+                }))
+                .await;
             }
             "session/start" | "session/continue" => {
                 let cwd = params
@@ -261,38 +318,43 @@ async fn main() {
                         .as_millis() as u64
                         & 0xffffffff
                 );
-                let data = Arc::new(SessionData {
-                    state: state_value(
-                        session_value(&sid, &cwd, json!({"type": "idle"})),
-                        0,
-                        json!([]),
-                    ),
-                    event_id: AtomicU64::new(0),
-                });
+                let data = Arc::new(SessionData::new(session_value(
+                    &sid,
+                    &cwd,
+                    json!({"type": "idle"}),
+                )));
                 sessions.lock().await.insert(sid.clone(), data.clone());
-                respond(json!({"state": data.state, "lastEventId": 0})).await;
+                respond(json!({"state": data.state().await, "lastEventId": 0})).await;
             }
             "session/resume" | "session/read" => {
                 let sid = params["sessionId"].as_str().unwrap_or("saved-aaaa1111");
                 let data = sessions.lock().await.get(sid).cloned();
-                let state = data.map(|d| d.state.clone()).unwrap_or_else(|| {
-                    state_value(
+                let state = match data {
+                    Some(d) => d.state().await,
+                    None => state_value(
                         session_value(sid, "/tmp", json!({"type": "idle"})),
                         0,
                         json!([]),
-                    )
-                });
+                    ),
+                };
                 respond(json!({"state": state, "lastEventId": 0})).await;
             }
             "session/fork" => {
                 let src = params["sourceSessionId"].as_str().unwrap_or("");
                 let data = sessions.lock().await.get(src).cloned();
-                let state = data.map(|d| {
-                    let mut s = d.state.clone();
-                    s["session"]["id"] = json!(format!("{src}-fork"));
-                    s
-                });
-                respond(json!({"state": state.unwrap_or(Value::Null), "sourceSessionId": src, "lastEventId": 0})).await;
+                let state = match data {
+                    Some(d) => {
+                        let fork_id = format!("{src}-fork");
+                        let mut session = d.session.clone();
+                        session["id"] = json!(fork_id);
+                        let fork = Arc::new(SessionData::new(session));
+                        *fork.history.lock().await = d.history.lock().await.clone();
+                        sessions.lock().await.insert(fork_id, fork);
+                        d.state().await
+                    }
+                    None => Value::Null,
+                };
+                respond(json!({"state": state, "sourceSessionId": src, "lastEventId": 0})).await;
             }
             "turn/start" => {
                 let sid = params["sessionId"].as_str().unwrap_or("").to_string();
@@ -301,7 +363,6 @@ async fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let turn_id = format!("t-{}", sid);
                 let data = sessions.lock().await.get(&sid).cloned();
                 let Some(data) = data else {
                     if let Some(id) = id {
@@ -309,6 +370,13 @@ async fn main() {
                     }
                     continue;
                 };
+                let n = data.turn_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                let turn_id = format!("t-{sid}-{n}");
+                let e_user = format!("e-user-{n}");
+                let e_think = format!("e-think-{n}");
+                let e_asst = format!("e-asst-{n}");
+                let e_shell = format!("e-shell-{n}");
+                let e_cb = format!("e-cb-{n}");
                 respond(json!({"turn": turn(&turn_id, &sid, "in_progress"), "lastEventId": 0}))
                     .await;
                 // Scripted turn.
@@ -334,10 +402,12 @@ async fn main() {
                         }
                     };
                     tokio::time::sleep(Duration::from_millis(60)).await;
+                    let user_entry = message_entry(&e_user, &sid, &turn_id, "user", &text);
+                    data.add_entry(user_entry.clone()).await;
                     let (m, p) = evt(
                         "history/entryAdded",
                         seq(),
-                        json!({"turnId": turn_id, "entry": message_entry("e-user", &sid, &turn_id, "user", &text)}),
+                        json!({"turnId": turn_id, "entry": user_entry}),
                     );
                     send(m, p).await;
                     let (m, p) = evt(
@@ -346,31 +416,37 @@ async fn main() {
                         json!({"turn": turn(&turn_id, &sid, "in_progress")}),
                     );
                     send(m, p).await;
+                    let think_entry = json!({
+                        "type": "reasoning",
+                        "id": e_think, "sessionId": sid, "turnId": turn_id,
+                        "createdAt": 1, "updatedAt": 1, "generationStatus": "in_progress",
+                        "relatedEntryId": null,
+                        "text": "", "summary": []
+                    });
+                    data.add_entry(think_entry.clone()).await;
                     let (m, p) = evt(
                         "history/entryAdded",
                         seq(),
-                        json!({"turnId": turn_id, "entry": {
-                            "type": "reasoning",
-                            "id": "e-think", "sessionId": sid, "turnId": turn_id,
-                            "createdAt": 1, "updatedAt": 1, "generationStatus": "in_progress",
-                            "relatedEntryId": null,
-                            "text": "", "summary": []
-                        }}),
+                        json!({"turnId": turn_id, "entry": think_entry}),
                     );
                     send(m, p).await;
                     tokio::time::sleep(Duration::from_millis(120)).await;
+                    let patch = json!([
+                        {"op": "append", "path": "/text", "value": "Thinking about the request… "}
+                    ]);
+                    data.patch_entry(&e_think, &patch).await;
                     let (m, p) = evt(
                         "history/entryUpdated",
                         seq(),
-                        json!({"turnId": turn_id, "entryId": "e-think", "patch": [
-                            {"op": "append", "path": "/text", "value": "Thinking about the request… "}
-                        ]}),
+                        json!({"turnId": turn_id, "entryId": e_think, "patch": patch}),
                     );
                     send(m, p).await;
+                    let asst_entry = message_entry(&e_asst, &sid, &turn_id, "assistant", "");
+                    data.add_entry(asst_entry.clone()).await;
                     let (m, p) = evt(
                         "history/entryAdded",
                         seq(),
-                        json!({"turnId": turn_id, "entry": message_entry("e-asst", &sid, &turn_id, "assistant", "")}),
+                        json!({"turnId": turn_id, "entry": asst_entry}),
                     );
                     send(m, p).await;
                     for chunk in [
@@ -379,56 +455,65 @@ async fn main() {
                         "running a shell effect next.",
                     ] {
                         tokio::time::sleep(Duration::from_millis(90)).await;
+                        let patch = json!([
+                            {"op": "append", "path": "/content/0/text", "value": chunk}
+                        ]);
+                        data.patch_entry(&e_asst, &patch).await;
                         let (m, p) = evt(
                             "history/entryUpdated",
                             seq(),
-                            json!({"turnId": turn_id, "entryId": "e-asst", "patch": [
-                                {"op": "append", "path": "/content/0/text", "value": chunk}
-                            ]}),
+                            json!({"turnId": turn_id, "entryId": e_asst, "patch": patch}),
                         );
                         send(m, p).await;
                     }
                     // Shell effect: pending → running → blocked on approval.
+                    let shell_entry =
+                        shell_effect(&e_shell, &sid, &turn_id, json!({"status": "pending"}));
+                    data.add_entry(shell_entry.clone()).await;
                     let (m, p) = evt(
                         "history/entryAdded",
                         seq(),
-                        json!({"turnId": turn_id, "entry": shell_effect("e-shell", &sid, &turn_id, json!({"status": "pending"}))}),
+                        json!({"turnId": turn_id, "entry": shell_entry}),
                     );
                     send(m, p).await;
                     tokio::time::sleep(Duration::from_millis(80)).await;
+                    let patch = json!([
+                        {"op": "replace", "path": "/state", "value": {"status": "running", "outputText": ""}}
+                    ]);
+                    data.patch_entry(&e_shell, &patch).await;
                     let (m, p) = evt(
                         "history/entryUpdated",
                         seq(),
-                        json!({"turnId": turn_id, "entryId": "e-shell", "patch": [
-                            {"op": "replace", "path": "/state", "value": {"status": "running", "outputText": ""}}
-                        ]}),
+                        json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
                     );
                     send(m, p).await;
                     tokio::time::sleep(Duration::from_millis(80)).await;
                     let callback_id = format!("cb-{turn_id}");
-                    let cb_entry =
-                        approval_callback("e-cb", &sid, &turn_id, &callback_id, "e-shell");
+                    let cb_entry = approval_callback(&e_cb, &sid, &turn_id, &callback_id, &e_shell);
+                    data.add_entry(cb_entry.clone()).await;
                     let (m, p) = evt(
                         "history/entryAdded",
                         seq(),
                         json!({"turnId": turn_id, "entry": cb_entry}),
                     );
                     send(m, p).await;
+                    let patch = json!([
+                        {"op": "replace", "path": "/state", "value": {"status": "blocked", "callbackId": callback_id, "outputText": ""}}
+                    ]);
+                    data.patch_entry(&e_shell, &patch).await;
                     let (m, p) = evt(
                         "history/entryUpdated",
                         seq(),
-                        json!({"turnId": turn_id, "entryId": "e-shell", "patch": [
-                            {"op": "replace", "path": "/state", "value": {"status": "blocked", "callbackId": callback_id, "outputText": ""}}
-                        ]}),
+                        json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
                     );
                     send(m, p).await;
                     // Server→client request: the client must ack, then answer via callback/respond.
                     pending
                         .lock()
                         .await
-                        .insert(callback_id.clone(), data.clone());
+                        .insert(callback_id.clone(), (data.clone(), n));
                     server_request(
-                        json!("srv-cb-1"),
+                        json!(format!("srv-cb-{n}")),
                         "callback/call",
                         json!({"callback": cb_entry}),
                     )
@@ -439,7 +524,7 @@ async fn main() {
                 let cb_id = params["callbackId"].as_str().unwrap_or("").to_string();
                 respond(json!({"status": "accepted"})).await;
                 // Finish the scripted turn once the answer lands.
-                if let Some(data) = pending_callbacks.lock().await.remove(&cb_id) {
+                if let Some((data, n)) = pending_callbacks.lock().await.remove(&cb_id) {
                     let tx2 = tx.clone();
                     tokio::spawn(async move {
                         let seq = || data.event_id.fetch_add(1, Ordering::SeqCst) + 1;
@@ -458,35 +543,72 @@ async fn main() {
                         let evt = |eid: u64, extra: Value| {
                             let mut p = extra;
                             p["eventId"] = json!(eid);
-                            p["sessionId"] = json!(data.state["session"]["id"]);
+                            p["sessionId"] = data.session["id"].clone();
                             p["emittedAt"] = json!(1_700_000_000);
                             p
                         };
-                        let sid = data.state["session"]["id"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
-                        let turn_id = format!("t-{sid}");
+                        let sid = data.session["id"].as_str().unwrap_or("").to_string();
+                        let turn_id = format!("t-{sid}-{n}");
+                        let e_think = format!("e-think-{n}");
+                        let e_asst = format!("e-asst-{n}");
+                        let e_shell = format!("e-shell-{n}");
+                        let e_cb = format!("e-cb-{n}");
                         tokio::time::sleep(Duration::from_millis(80)).await;
                         // Resolve the callback entry.
-                        send("history/entryUpdated", evt(seq(), json!({"turnId": turn_id, "entryId": "e-cb", "patch": [
+                        let patch = json!([
                             {"op": "replace", "path": "/state", "value": {"status": "answered", "output": params["output"]}}
-                        ]}))).await;
+                        ]);
+                        data.patch_entry(&e_cb, &patch).await;
+                        send(
+                            "history/entryUpdated",
+                            evt(
+                                seq(),
+                                json!({"turnId": turn_id, "entryId": e_cb, "patch": patch}),
+                            ),
+                        )
+                        .await;
                         // Effect completes.
-                        send("history/entryUpdated", evt(seq(), json!({"turnId": turn_id, "entryId": "e-shell", "patch": [
+                        let patch = json!([
                             {"op": "replace", "path": "/state", "value": {
                                 "status": "completed", "output": {"stdout": "fixture-output"},
                                 "outputText": "fixture-output", "durationMs": 42,
                                 "display": {"success": true, "verb": "Ran", "message": "fixture-output", "warnings": [], "suffix": ""}
                             }}
-                        ]}))).await;
+                        ]);
+                        data.patch_entry(&e_shell, &patch).await;
+                        send(
+                            "history/entryUpdated",
+                            evt(
+                                seq(),
+                                json!({"turnId": turn_id, "entryId": e_shell, "patch": patch}),
+                            ),
+                        )
+                        .await;
                         // Final assistant text + turn completed.
-                        send("history/entryUpdated", evt(seq(), json!({"turnId": turn_id, "entryId": "e-asst", "patch": [
+                        let patch = json!([
                             {"op": "append", "path": "/content/0/text", "value": " Done — effect approved and completed."}
-                        ]}))).await;
-                        send("history/entryUpdated", evt(seq(), json!({"turnId": turn_id, "entryId": "e-think", "patch": [
+                        ]);
+                        data.patch_entry(&e_asst, &patch).await;
+                        send(
+                            "history/entryUpdated",
+                            evt(
+                                seq(),
+                                json!({"turnId": turn_id, "entryId": e_asst, "patch": patch}),
+                            ),
+                        )
+                        .await;
+                        let patch = json!([
                             {"op": "replace", "path": "/generationStatus", "value": "completed"}
-                        ]}))).await;
+                        ]);
+                        data.patch_entry(&e_think, &patch).await;
+                        send(
+                            "history/entryUpdated",
+                            evt(
+                                seq(),
+                                json!({"turnId": turn_id, "entryId": e_think, "patch": patch}),
+                            ),
+                        )
+                        .await;
                         send("turn/completed", evt(seq(), json!({"turn": {"id": turn_id, "sessionId": sid, "status": "completed", "startedAt": 1, "completedAt": 2, "error": null, "stopReason": null, "queueItemId": null}}))).await;
                     });
                 }
@@ -516,7 +638,10 @@ async fn main() {
             "session/compact" => {
                 let sid = params["sessionId"].as_str().unwrap_or("");
                 let data = sessions.lock().await.get(sid).cloned();
-                let state = data.map(|d| d.state.clone()).unwrap_or(Value::Null);
+                let state = match data {
+                    Some(d) => d.state().await,
+                    None => Value::Null,
+                };
                 respond(json!({"summary": "fixture summary", "state": state, "sessionLog": {"enabled": false}})).await;
             }
             "runtime/read" => {
