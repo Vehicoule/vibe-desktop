@@ -28,6 +28,9 @@ pub struct SessionView {
     pub autofocused: bool,
     /// Root view, for opening forked sessions in new tabs.
     pub app: Option<WeakEntity<VibeApp>>,
+    /// Session id last reported to `VibeApp::open_ids` — handoffs can
+    /// replace the session id under the same view.
+    reported_id: String,
     /// `user_input` callback selections, per callback id → per question.
     /// Accumulated until the user submits the whole request.
     pub question_selections: HashMap<String, Vec<Vec<String>>>,
@@ -50,9 +53,11 @@ impl SessionView {
         let events = conn.take_events();
         let conn = Arc::new(conn);
         let projection = Projection::new(state);
+        let reported_id = projection.state.session.id.clone();
         let mut view = Self {
             conn,
             projection,
+            reported_id,
             composer: String::new(),
             composer_focus,
             error: None,
@@ -103,8 +108,21 @@ impl SessionView {
                 self.on_server_request(id.clone(), method, params, cx);
             }
         }
+        self.sync_reported_id(cx);
         cx.notify();
         true
+    }
+
+    /// Keep `VibeApp::open_ids` pointing at this view when a handoff swaps
+    /// the underlying session id.
+    fn sync_reported_id(&mut self, cx: &mut Context<Self>) {
+        let current = self.projection.state.session.id.clone();
+        if current != self.reported_id {
+            let old = std::mem::replace(&mut self.reported_id, current.clone());
+            if let Some(app) = self.app.as_ref().and_then(|w| w.upgrade()) {
+                app.update(cx, |app, _| app.sync_session_id(&old, &current));
+            }
+        }
     }
 
     fn on_server_request(
@@ -190,7 +208,10 @@ impl SessionView {
                     })
                     .unwrap_or(true);
                 if done {
-                    let _ = this.update(cx, |_view, cx| cx.notify());
+                    let _ = this.update(cx, |view, cx| {
+                        view.sync_reported_id(cx);
+                        cx.notify();
+                    });
                     return;
                 }
             }
@@ -513,6 +534,11 @@ impl SessionView {
                         answer: other.trim().to_string(),
                         is_other: true,
                     });
+                }
+                if !q.multi_select && out.len() > 1 {
+                    // Single-select: a typed other answer supersedes the
+                    // picked option — one answer per question.
+                    out.retain(|a| a.is_other);
                 }
                 out
             })

@@ -11,6 +11,30 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_vibe-fixture"))
 }
 
+/// Fresh isolated session store per test — fixture processes persist
+/// sessions under `VIBE_FIXTURE_STORE` and share it across processes,
+/// so tests must not leak state into each other.
+fn store() -> (PathBuf, Vec<(String, String)>) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "vibe-fx-test-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let envs = vec![(
+        "VIBE_FIXTURE_STORE".to_string(),
+        dir.to_string_lossy().to_string(),
+    )];
+    (dir, envs)
+}
+
+async fn spawn_fixture(envs: &[(String, String)]) -> Connection {
+    Connection::spawn_with_env(&fixture(), envs)
+        .await
+        .expect("spawn fixture")
+}
+
 fn info() -> ClientInfo {
     ClientInfo {
         name: "test".into(),
@@ -55,7 +79,8 @@ async fn wait_for(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scripted_turn_with_approval() {
-    let mut conn = Connection::spawn(&fixture()).await.expect("spawn fixture");
+    let (_dir, envs) = store();
+    let mut conn = spawn_fixture(&envs).await;
     let init = conn.initialize(info(), caps()).await.expect("initialize");
     assert!(init.server_info.name.contains("vibe"));
 
@@ -152,7 +177,8 @@ async fn scripted_turn_with_approval() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupt_returns_accepted() {
-    let conn = Connection::spawn(&fixture()).await.expect("spawn");
+    let (_dir, envs) = store();
+    let conn = spawn_fixture(&envs).await;
     conn.initialize(info(), caps()).await.unwrap();
     let state = conn
         .session_start(SessionStartParams {
@@ -168,4 +194,58 @@ async fn interrupt_returns_accepted() {
     // interrupt is fire-and-forget correct: fixture accepts it.
     conn.turn_interrupt(&sid, "turn-1").await.unwrap();
     conn.session_stop(&sid).await.unwrap();
+}
+
+/// A fork made on one fixture process must be resumable from a different
+/// process — the real app-server persists sessions on disk, the fixture
+/// mirrors that with a shared file store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_resumes_across_processes() {
+    let (_dir, envs) = store();
+    let conn_a = spawn_fixture(&envs).await;
+    conn_a.initialize(info(), caps()).await.unwrap();
+    let state = conn_a
+        .session_start(SessionStartParams {
+            agent_config: AgentConfig {
+                cwd: Some("/tmp/demo".into()),
+                ..Default::default()
+            },
+            history_limit: 50,
+            idempotency_key: None,
+            kind: None,
+        })
+        .await
+        .expect("session/start");
+    let parent_id = state.session.id.clone();
+
+    let forked = conn_a
+        .session_fork(&parent_id, None, 50)
+        .await
+        .expect("session/fork");
+    assert_ne!(forked.session.id, parent_id);
+    assert_eq!(
+        forked.session.parent_session_id.as_deref(),
+        Some(parent_id.as_str())
+    );
+
+    // A second process (the fork tab's own server) sees the child via the
+    // shared store — previously it fabricated an empty session instead.
+    let conn_b = spawn_fixture(&envs).await;
+    conn_b.initialize(info(), caps()).await.unwrap();
+    let resumed = conn_b
+        .session_resume(&forked.session.id, AgentConfig::default(), 50)
+        .await
+        .expect("session/resume");
+    assert_eq!(resumed.session.id, forked.session.id);
+    assert_eq!(
+        resumed.session.parent_session_id.as_deref(),
+        Some(parent_id.as_str())
+    );
+
+    // The child also appears in a different process's catalog.
+    let list = conn_b
+        .session_list(SessionListParams::default())
+        .await
+        .expect("session/list");
+    assert!(list.items.iter().any(|s| s.id == forked.session.id));
 }

@@ -19,6 +19,10 @@ pub struct VibeApp {
     pub backend: Backend,
     pub sessions: Vec<PublicSession>,
     pub open: Vec<Entity<SessionView>>,
+    /// Session ids of `open` views, kept in parallel — reading view
+    /// entities in `open_session` would reenter a SessionView that is
+    /// mid-update (e.g. `request_fork` → `open_session` → panic).
+    pub open_ids: Vec<String>,
     pub selected: usize,
     pub new_session_open: bool,
     pub new_cwd: String,
@@ -41,6 +45,7 @@ impl VibeApp {
             backend,
             sessions: Vec::new(),
             open: Vec::new(),
+            open_ids: Vec::new(),
             selected: 0,
             new_session_open: false,
             new_cwd: std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
@@ -146,16 +151,19 @@ impl VibeApp {
     }
 
     pub fn open_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
-        if let Some(idx) = self
-            .open
-            .iter()
-            .position(|s| s.read(cx).session_id() == session_id)
-        {
+        if let Some(idx) = self.open_ids.iter().position(|s| s == session_id) {
             self.selected = idx;
             cx.notify();
             return;
         }
         self.attach(AttachKind::Resume(session_id.to_string()), cx);
+    }
+
+    /// A view's session id changed (compact/fork handoff replaces the session).
+    pub fn sync_session_id(&mut self, old: &str, new: &str) {
+        if let Some(idx) = self.open_ids.iter().position(|s| s == old) {
+            self.open_ids[idx] = new.to_string();
+        }
     }
 
     pub fn continue_session(&mut self, cx: &mut Context<Self>) {
@@ -227,16 +235,17 @@ impl VibeApp {
                     Ok((conn, state)) => {
                         let session_id = state.session.id.clone();
                         let title = state.session.display_title();
+                        let summary = state.session.clone();
                         let view =
                             cx.new(|cx| SessionView::attached(conn, state, cx.focus_handle(), cx));
                         let app_weak = cx.entity().downgrade();
                         view.update(cx, |v, _cx| v.app = Some(app_weak));
                         app.open.push(view);
+                        app.open_ids.push(session_id.clone());
                         app.selected = app.open.len() - 1;
                         app.status = format!("attached {title}");
                         if !app.sessions.iter().any(|s| s.id == session_id) {
-                            app.sessions
-                                .push(app.open[app.selected].read(cx).session().clone());
+                            app.sessions.push(summary);
                             app.sort_sessions();
                         }
                     }

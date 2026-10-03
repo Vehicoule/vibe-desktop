@@ -22,6 +22,7 @@ struct SessionData {
     session: Value,
     inner: tokio::sync::Mutex<SessionInner>,
     turn_seq: AtomicU64,
+    store: std::path::PathBuf,
 }
 
 struct SessionInner {
@@ -29,8 +30,17 @@ struct SessionInner {
     event_id: u64,
 }
 
+/// File-backed session store shared by every fixture process — the real
+/// app-server persists sessions on disk, so a fork made on one connection
+/// must be resumable from a different process.
+fn store_dir() -> std::path::PathBuf {
+    std::env::var("VIBE_FIXTURE_STORE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/vibe-fixture-store"))
+}
+
 impl SessionData {
-    fn new(session: Value) -> Self {
+    fn new(session: Value, store: std::path::PathBuf) -> Self {
         Self {
             session,
             inner: tokio::sync::Mutex::new(SessionInner {
@@ -38,6 +48,40 @@ impl SessionData {
                 event_id: 0,
             }),
             turn_seq: AtomicU64::new(0),
+            store,
+        }
+    }
+
+    /// Rebuild a session from the shared store (a different fixture
+    /// process may have created or forked it).
+    async fn load(store: &std::path::Path, sid: &str) -> Option<Arc<SessionData>> {
+        let path = store.join(format!("{sid}.json"));
+        let raw = tokio::fs::read_to_string(path).await.ok()?;
+        let v: Value = serde_json::from_str(&raw).ok()?;
+        Some(Arc::new(SessionData {
+            session: v["session"].clone(),
+            inner: tokio::sync::Mutex::new(SessionInner {
+                history: serde_json::from_value(v["history"].clone()).unwrap_or_default(),
+                event_id: v["event_id"].as_u64().unwrap_or(0),
+            }),
+            turn_seq: AtomicU64::new(v["turn_seq"].as_u64().unwrap_or(0)),
+            store: store.to_path_buf(),
+        }))
+    }
+
+    /// Snapshot current contents to the shared store (atomic write).
+    async fn persist(&self, inner: &SessionInner) {
+        let body = json!({
+            "session": self.session,
+            "history": inner.history,
+            "event_id": inner.event_id,
+            "turn_seq": self.turn_seq.load(Ordering::SeqCst),
+        });
+        let id = self.session["id"].as_str().unwrap_or("x");
+        let path = self.store.join(format!("{id}.json"));
+        let tmp = self.store.join(format!("{id}.json.tmp"));
+        if tokio::fs::write(&tmp, body.to_string()).await.is_ok() {
+            let _ = tokio::fs::rename(&tmp, &path).await;
         }
     }
 
@@ -45,7 +89,9 @@ impl SessionData {
     async fn bump(&self) -> u64 {
         let mut inner = self.inner.lock().await;
         inner.event_id += 1;
-        inner.event_id
+        let eid = inner.event_id;
+        self.persist(&inner).await;
+        eid
     }
 
     /// Append a history entry and claim its event id atomically.
@@ -53,7 +99,9 @@ impl SessionData {
         let mut inner = self.inner.lock().await;
         inner.event_id += 1;
         inner.history.push(entry);
-        inner.event_id
+        let eid = inner.event_id;
+        self.persist(&inner).await;
+        eid
     }
 
     /// Apply a patch to a stored entry and claim its event id atomically.
@@ -71,7 +119,9 @@ impl SessionData {
                 }
             }
         }
-        inner.event_id
+        let eid = inner.event_id;
+        self.persist(&inner).await;
+        eid
     }
 
     async fn state(&self) -> Value {
@@ -239,6 +289,8 @@ async fn main() {
         String,
         (Arc<SessionData>, u64),
     >::new()));
+    let store = store_dir();
+    let _ = tokio::fs::create_dir_all(&store).await;
 
     let mut lines = BufReader::new(stdin).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -321,6 +373,25 @@ async fn main() {
                         json!({"type": "archived"}),
                     ));
                 }
+                // Merge stored sessions (created/forked by any fixture
+                // process) into the demo catalog.
+                if let Ok(mut dir) = tokio::fs::read_dir(&store).await {
+                    while let Ok(Some(ent)) = dir.next_entry().await {
+                        let path = ent.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                            continue;
+                        }
+                        if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+                            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                                if let Some(sid) = v["session"]["id"].as_str() {
+                                    if !items.iter().any(|i| i["id"] == json!(sid)) {
+                                        items.push(v["session"].clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 respond(json!({
                     "items": items,
                     "nextCursor": null,
@@ -343,19 +414,31 @@ async fn main() {
                         .as_millis() as u64
                         & 0xffffffff
                 );
-                let data = Arc::new(SessionData::new(session_value(
-                    &sid,
-                    &cwd,
-                    json!({"type": "idle"}),
-                )));
+                let data = Arc::new(SessionData::new(
+                    session_value(&sid, &cwd, json!({"type": "idle"})),
+                    store.clone(),
+                ));
+                {
+                    let inner = data.inner.lock().await;
+                    data.persist(&inner).await;
+                }
                 sessions.lock().await.insert(sid.clone(), data.clone());
                 respond(json!({"state": data.state().await, "lastEventId": 0})).await;
             }
             "session/resume" | "session/read" => {
                 let sid = params["sessionId"].as_str().unwrap_or("saved-aaaa1111");
                 let data = sessions.lock().await.get(sid).cloned();
+                // Fall back to the shared store — the session may live in
+                // another fixture process (e.g. a forked child).
+                let data = match data {
+                    Some(d) => Some(d),
+                    None => SessionData::load(&store, sid).await,
+                };
                 let state = match data {
-                    Some(d) => d.state().await,
+                    Some(d) => {
+                        sessions.lock().await.insert(sid.to_string(), d.clone());
+                        d.state().await
+                    }
                     None => state_value(
                         session_value(sid, "/tmp", json!({"type": "idle"})),
                         0,
@@ -367,14 +450,28 @@ async fn main() {
             "session/fork" => {
                 let src = params["sourceSessionId"].as_str().unwrap_or("");
                 let data = sessions.lock().await.get(src).cloned();
+                let data = match data {
+                    Some(d) => Some(d),
+                    None => SessionData::load(&store, src).await,
+                };
                 let state = match data {
                     Some(d) => {
                         let fork_id = format!("{src}-fork");
                         let mut session = d.session.clone();
                         session["id"] = json!(fork_id);
                         session["parentSessionId"] = json!(src);
-                        let fork = Arc::new(SessionData::new(session));
-                        fork.inner.lock().await.history = d.clone_history().await;
+                        let fork = Arc::new(SessionData::new(session, store.clone()));
+                        {
+                            let mut inner = fork.inner.lock().await;
+                            inner.history = d.clone_history().await;
+                            inner.event_id = d.inner.lock().await.event_id;
+                            // Continue the parent's turn counter so the
+                            // child's entry ids can never collide with the
+                            // history it just inherited.
+                            fork.turn_seq
+                                .store(d.turn_seq.load(Ordering::SeqCst), Ordering::SeqCst);
+                            fork.persist(&inner).await;
+                        }
                         // Return the CHILD's state — the caller opens it.
                         let state = fork.state().await;
                         sessions.lock().await.insert(fork_id, fork);
@@ -392,6 +489,10 @@ async fn main() {
                     .unwrap_or("")
                     .to_string();
                 let data = sessions.lock().await.get(&sid).cloned();
+                let data = match data {
+                    Some(d) => Some(d),
+                    None => SessionData::load(&store, &sid).await,
+                };
                 let Some(data) = data else {
                     if let Some(id) = id {
                         let _ = tx.send(json!({"jsonrpc": "2.0", "id": id, "error": {"code": "not_found", "message": "session", "data": null}}).to_string()).await;

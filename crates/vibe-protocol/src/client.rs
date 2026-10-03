@@ -65,7 +65,7 @@ pub struct Connection {
 impl Connection {
     /// Spawn `vibe-app-server` (or any compatible binary) at `program`.
     pub async fn spawn(program: &Path) -> ClientResult<Self> {
-        Self::spawn_inner(program, &[], None).await
+        Self::spawn_inner(program, &[], None, &[]).await
     }
 
     pub async fn spawn_with_args(
@@ -73,16 +73,27 @@ impl Connection {
         args: &[&str],
         cwd: Option<&Path>,
     ) -> ClientResult<Self> {
-        Self::spawn_inner(program, args, cwd).await
+        Self::spawn_inner(program, args, cwd, &[]).await
     }
 
-    async fn spawn_inner(program: &Path, args: &[&str], cwd: Option<&Path>) -> ClientResult<Self> {
+    /// Spawn with extra environment variables (e.g. `VIBE_FIXTURE_STORE`).
+    pub async fn spawn_with_env(program: &Path, envs: &[(String, String)]) -> ClientResult<Self> {
+        Self::spawn_inner(program, &[], None, envs).await
+    }
+
+    async fn spawn_inner(
+        program: &Path,
+        args: &[&str],
+        cwd: Option<&Path>,
+        envs: &[(String, String)],
+    ) -> ClientResult<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .envs(envs.iter().map(|(k, v)| (k, v)));
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
