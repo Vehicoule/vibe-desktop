@@ -6,4 +6,24 @@ The app is a client of `vibe-app-server`, the official harness boundary inside `
 
 See [DESIGN.md](DESIGN.md) for the architecture and the feature-parity matrix against the CLI and Vibe Code Web.
 
-Status: design phase.
+## Build & run
+
+```sh
+cargo build --workspace        # build all crates
+cargo test  --workspace        # unit + fixture E2E tests
+cargo run  -p vibe-desktop -- --fixture   # run against the scripted fake server (no API key needed)
+cargo run  -p vibe-desktop                 # run against a real `vibe-app-server` on PATH
+```
+
+Requires Rust 1.85+ and (Linux) a working Vulkan driver for gpui — `mesa-vulkan-drivers` (llvmpipe) or a hardware driver. Rendering under old software-Mesa stacks (e.g. llvmpipe/LLVM 15 on Ubuntu 22.04 + KWin/X11) is a known-bad combination: windows open but presents never land. Real GPUs and current Mesa work.
+
+## Crates
+
+- `crates/vibe-protocol` — typed JSON-RPC client (`Connection`), wire models, JSON-Patch + session projection (watermark/gap-recovery semantics from the app-server ADR).
+- `crates/vibe-fixture` — scripted fake `vibe-app-server` for deterministic tests and credential-free development.
+- `crates/vibe-desktop` — the gpui app (session rail, timeline, approvals, composer, status bar).
+
+## Notes
+
+- `Cargo.lock` pins `libc = 0.2.189`: `xattr 0.2.3` (via `gpui_http_client`) still uses `libc::ENOATTR`, removed from libc on Linux in 0.2.190. Revisit when `xattr` releases a fix.
+- Status: M1 (local core) implemented — see DESIGN.md milestones.

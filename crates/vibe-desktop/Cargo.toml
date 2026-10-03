@@ -1,0 +1,21 @@
+[package]
+name = "vibe-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Desktop client for Mistral Vibe"
+
+[[bin]]
+name = "vibe-desktop"
+path = "src/main.rs"
+
+[dependencies]
+vibe-protocol = { path = "../vibe-protocol" }
+gpui = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+smol = "2"

@@ -1,0 +1,38 @@
+//! vibe-desktop — gpui client of `vibe-app-server`.
+//!
+//! Usage: `vibe-desktop` (real server) or `vibe-desktop --fixture` (scripted
+//! fake server for development without credentials).
+
+mod app;
+mod host;
+mod session;
+mod theme;
+mod views;
+
+use app::{Backend, VibeApp};
+use gpui::{px, size, AppContext as _, Application, Bounds, WindowBounds, WindowOptions};
+
+fn main() {
+    let backend = if std::env::args().any(|a| a == "--fixture") {
+        Backend::Fixture
+    } else {
+        Backend::Server
+    };
+
+    Application::new().run(move |cx| {
+        let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some("vibe desktop".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            move |_window, cx| cx.new(|cx| VibeApp::new(backend, cx)),
+        )
+        .expect("open window");
+        cx.activate(true);
+    });
+}
