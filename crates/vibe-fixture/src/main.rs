@@ -1767,9 +1767,54 @@ async fn main() {
                             "model": {"name": "voxtral-mini-transcribe-realtime-2602", "sampleRate": 16000, "encoding": "pcm_s16le", "language": "en", "targetStreamingDelayMs": 240},
                             "provider": {"apiBase": "https://transcribe.fixture.invalid", "apiKeyEnvVar": "VIBE_FIXTURE_TRANSCRIBE_KEY", "client": "mistral"},
                         },
+                        "activeModel": {"name": "mistral-large-latest", "alias": "large", "thinking": "medium", "supportsImages": true, "displayName": "Large"},
+                        "activeModelPinned": false,
+                        "defaultModelAlias": "large",
+                        "defaultAgent": "build",
+                        "models": [
+                            {"name": "mistral-large-latest", "alias": "large", "thinking": "medium", "supportsImages": true, "displayName": "Large"},
+                            {"name": "mistral-small-latest", "alias": "small", "thinking": "low", "supportsImages": false, "displayName": "Small"},
+                        ],
+                        "theme": "vibe",
+                        "worktreeLimit": 3,
+                        "enableNotifications": true,
+                        "transcribeModels": ["voxtral-mini-transcribe-realtime-2602"],
+                        "ttsModels": ["voxtral-mini-tts-latest"],
+                        "validationWarnings": [],
                     }
                 }))
                 .await;
+            }
+            "config/fields/read" => {
+                respond(json!({
+                    "fields": [
+                        {"name": "enable_notifications", "kind": "bool", "description": "Desktop notifications", "value": true, "path": "enable_notifications", "popular": true, "enumChoices": [], "valueLabels": {}, "layerValues": [{"layer": "user", "value": true}]},
+                        {"name": "theme", "kind": "enum", "description": "UI theme", "value": "vibe", "path": "theme", "popular": true, "enumChoices": ["vibe", "light", "dark"], "valueLabels": {}, "layerValues": [{"layer": "default", "value": "vibe"}]},
+                        {"name": "worktree_limit", "kind": "int", "description": "Max git worktrees", "value": 3, "path": "worktree_limit", "popular": false, "enumChoices": [], "valueLabels": {}, "layerValues": [{"layer": "default", "value": 3}]},
+                    ],
+                    "targets": ["user", "project"]
+                }))
+                .await;
+            }
+            "config/write" => {
+                respond(json!({"rejected": false, "failures": [], "status": "applied"})).await;
+            }
+            "config/model/write" => {
+                respond(json!({"status": "applied"})).await;
+            }
+            "agents/list" => {
+                respond(json!({
+                    "active": {"name": "build", "displayName": "Build", "description": "Edits code freely", "safety": "neutral", "agentType": "agent"},
+                    "agents": [
+                        {"name": "build", "displayName": "Build", "description": "Edits code freely", "safety": "neutral", "agentType": "agent"},
+                        {"name": "plan", "displayName": "Plan", "description": "Read-only planning", "safety": "safe", "agentType": "agent"},
+                        {"name": "accept-edits", "displayName": "Accept Edits", "description": "Auto-approves edits", "safety": "yolo", "agentType": "agent"},
+                    ]
+                }))
+                .await;
+            }
+            "session/agent/update" => {
+                respond(json!({"status": "applied"})).await;
             }
             "narration/summarize" => {
                 respond(json!({"summary": format!("Fixture narration: {}",

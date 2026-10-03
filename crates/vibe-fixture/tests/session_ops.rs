@@ -503,19 +503,16 @@ async fn config_read_returns_voice_views() {
     let conn = spawn_fixture(&envs).await;
     conn.initialize(info(), caps()).await.unwrap();
 
-    let voice = conn.config_read_voice().await.unwrap();
-    assert!(voice.voice_mode_enabled);
-    assert!(voice.narrator_enabled);
-    assert_eq!(voice.speech.model.name, "voxtral-mini-tts-latest");
+    let cfg = conn.config_read().await.unwrap();
+    assert!(cfg.voice_mode_enabled);
+    assert!(cfg.narrator_enabled);
+    assert_eq!(cfg.speech.model.name, "voxtral-mini-tts-latest");
+    assert_eq!(cfg.speech.provider.api_base, "https://tts.fixture.invalid");
     assert_eq!(
-        voice.speech.provider.api_base,
-        "https://tts.fixture.invalid"
-    );
-    assert_eq!(
-        voice.transcription.model.encoding, "pcm_s16le",
+        cfg.transcription.model.encoding, "pcm_s16le",
         "transcription model should mirror upstream realtime encoding"
     );
-    assert_eq!(voice.transcription.model.target_streaming_delay_ms, 240);
+    assert_eq!(cfg.transcription.model.target_streaming_delay_ms, 240);
 
     cleanup(conn, &dir).await;
 }
@@ -532,6 +529,55 @@ async fn narration_summarize_returns_summary() {
         .await
         .unwrap();
     assert_eq!(summary.as_deref(), Some("Fixture narration: fix the bug"));
+
+    cleanup(conn, &dir).await;
+}
+
+#[tokio::test]
+async fn settings_roundtrip_reads_and_writes() {
+    let (dir, envs) = store();
+    let mut conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    let (sid, _rx) = session_with_completed_turn(&mut conn).await;
+
+    let cfg = conn.config_read().await.unwrap();
+    assert_eq!(cfg.active_model.alias, "large");
+    assert_eq!(cfg.models.len(), 2);
+    assert!(cfg.enable_notifications);
+
+    let fields = conn.config_fields_read(&sid).await.unwrap();
+    assert_eq!(fields.fields.len(), 3);
+    let notif = fields
+        .fields
+        .iter()
+        .find(|f| f.path == "enable_notifications")
+        .unwrap();
+    assert_eq!(notif.kind, "bool");
+    assert_eq!(fields.targets, vec!["user", "project"]);
+
+    let write = conn
+        .config_write(
+            &sid,
+            vec![vibe_protocol::models::ConfigWriteOp {
+                op: "set".into(),
+                path: "enable_notifications".into(),
+                value: Some(serde_json::Value::Bool(false)),
+                target_layer: None,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(!write.rejected);
+
+    let model = conn.config_model_write(&sid, "small", None).await.unwrap();
+    assert_eq!(model.status.as_deref(), Some("applied"));
+
+    let agents = conn.agents_list(&sid).await.unwrap();
+    assert_eq!(agents.active.name, "build");
+    assert_eq!(agents.agents.len(), 3);
+
+    let status = conn.session_agent_update(&sid, "plan").await.unwrap();
+    assert_eq!(status, "applied");
 
     cleanup(conn, &dir).await;
 }

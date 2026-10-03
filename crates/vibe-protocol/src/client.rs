@@ -744,8 +744,8 @@ impl Connection {
         .await
     }
 
-    /// `config/read` → the voice-bearing subset of `ConfigView`.
-    pub async fn config_read_voice(&self) -> ClientResult<VoiceConfigView> {
+    /// `config/read` → the client-rendered subset of `ConfigView`.
+    pub async fn config_read(&self) -> ClientResult<ConfigView> {
         let resp: ConfigReadResponse = self.request_typed("config/read", json!({})).await?;
         Ok(resp.config)
     }
@@ -770,6 +770,70 @@ impl Connection {
             )
             .await?;
         Ok(resp.summary)
+    }
+
+    // ── M3a: settings & pickers ──────────────────────────────────────────
+
+    /// `config/fields/read` → editable config fields + write targets.
+    pub async fn config_fields_read(
+        &self,
+        session_id: &str,
+    ) -> ClientResult<ConfigFieldsReadResponse> {
+        self.request_typed("config/fields/read", json!({"sessionId": session_id}))
+            .await
+    }
+
+    /// `config/write` → apply set/remove ops against the config layers.
+    pub async fn config_write(
+        &self,
+        session_id: &str,
+        ops: Vec<ConfigWriteOp>,
+    ) -> ClientResult<ConfigWriteResponse> {
+        self.request_typed("config/write", json!({"sessionId": session_id, "ops": ops}))
+            .await
+    }
+
+    /// `config/model/write` → pick the active model (and thinking effort).
+    pub async fn config_model_write(
+        &self,
+        session_id: &str,
+        model_alias: &str,
+        reasoning_effort: Option<&str>,
+    ) -> ClientResult<ConfigWriteResponse> {
+        self.request_typed(
+            "config/model/write",
+            ModelConfigWriteParams {
+                session_id: session_id.to_string(),
+                model_alias: Some(model_alias.to_string()),
+                reasoning_effort: reasoning_effort.map(str::to_string),
+            },
+        )
+        .await
+    }
+
+    /// `agents/list` → the active agent and every choice.
+    pub async fn agents_list(&self, session_id: &str) -> ClientResult<AgentsListResponse> {
+        self.request_typed("agents/list", json!({"sessionId": session_id}))
+            .await
+    }
+
+    /// `session/agent/update` → switch the session's agent. Returns the
+    /// mutation status ("applied"/"pending") or a default when omitted.
+    pub async fn session_agent_update(
+        &self,
+        session_id: &str,
+        agent_name: &str,
+    ) -> ClientResult<String> {
+        let resp: ConfigWriteResponse = self
+            .request_typed(
+                "session/agent/update",
+                AgentSwitchParams {
+                    session_id: session_id.to_string(),
+                    agent_name: agent_name.to_string(),
+                },
+            )
+            .await?;
+        Ok(resp.status.unwrap_or_else(|| "applied".to_string()))
     }
 }
 

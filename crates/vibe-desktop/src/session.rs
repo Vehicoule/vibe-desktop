@@ -60,9 +60,17 @@ pub struct SessionView {
     pub trust_dismissed: bool,
     /// A `session/history/list` backward page is in flight.
     pub loading_earlier: bool,
-    /// `config/read` voice subset — `None` until the read lands (or fails:
-    /// voice UI stays hidden then).
-    pub voice: Option<VoiceConfigView>,
+    /// `config/read` client subset — `None` until the read lands (or
+    /// fails: voice + settings UI stay hidden then).
+    pub config: Option<ConfigView>,
+    /// `agents/list` snapshot for the settings sheet.
+    pub agents: Vec<AgentSummary>,
+    /// Name of the active agent (from `agents/list` or a session update).
+    pub active_agent: String,
+    /// `config/fields/read` snapshot for the settings sheet.
+    pub config_fields: Vec<ConfigFieldView>,
+    /// Settings sheet open/closed.
+    pub settings_open: bool,
     /// Dictation run in flight while the mic toggle is down.
     pub dictation: Option<DictationRun>,
     dictation_pump: Option<Task<()>>,
@@ -127,7 +135,11 @@ impl SessionView {
             trust: None,
             trust_dismissed: false,
             loading_earlier: false,
-            voice: None,
+            config: None,
+            agents: Vec::new(),
+            active_agent: String::new(),
+            config_fields: Vec::new(),
+            settings_open: false,
             dictation: None,
             dictation_pump: None,
             dictation_meter: None,
@@ -150,11 +162,149 @@ impl SessionView {
     fn load_voice_config(&mut self, cx: &mut Context<Self>) {
         let conn = self.conn.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let cfg = conn.config_read_voice().await;
+            let cfg = conn.config_read().await;
             let _ = this.update(cx, |view, cx| {
                 if let Ok(cfg) = cfg {
                     view.narrator_on = cfg.narrator_enabled && cfg.voice_mode_enabled;
-                    view.voice = Some(cfg);
+                    view.config = Some(cfg);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fetch `agents/list` + `config/fields/read` for the settings sheet.
+    fn load_settings(&mut self, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let agents = conn.agents_list(&sid).await;
+            let fields = conn.config_fields_read(&sid).await;
+            let _ = this.update(cx, |view, cx| {
+                if let Ok(list) = agents {
+                    view.active_agent = list.active.name.clone();
+                    view.agents = list.agents;
+                }
+                if let Ok(resp) = fields {
+                    view.config_fields = resp.fields;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Settings sheet toggle — loads pickers lazily the first time.
+    pub fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open && self.agents.is_empty() && self.config_fields.is_empty() {
+            self.load_settings(cx);
+        }
+        cx.notify();
+    }
+
+    /// `config/model/write` — pin a model (and keep its thinking effort).
+    pub fn pick_model(&mut self, alias: String, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn.config_model_write(&sid, &alias, None).await;
+            let _ = this.update(cx, |view, cx| {
+                match resp {
+                    Ok(r) if !r.rejected => {
+                        if let Some(cfg) = &mut view.config {
+                            cfg.active_model.alias = alias.clone();
+                            cfg.active_model.display_name = cfg
+                                .models
+                                .iter()
+                                .find(|m| m.alias == alias)
+                                .map(|m| m.display_name.clone())
+                                .unwrap_or_else(|| alias.clone());
+                            cfg.active_model_pinned = true;
+                        }
+                    }
+                    Ok(r) => {
+                        view.error = Some(format!("model pick rejected: {}", r.failures.join(", ")))
+                    }
+                    Err(e) => view.error = Some(format!("model pick failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `session/agent/update` — switch the session's agent.
+    pub fn pick_agent(&mut self, name: String, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn.session_agent_update(&sid, &name).await;
+            let _ = this.update(cx, |view, cx| {
+                match resp {
+                    Ok(_) => {
+                        view.active_agent = name.clone();
+                        if let Some(cfg) = &mut view.config {
+                            cfg.default_agent = name.clone();
+                        }
+                    }
+                    Err(e) => view.error = Some(format!("agent switch failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `config/write` — flip a bool field; enum fields cycle their
+    /// `enum_choices`.
+    pub fn toggle_config_field(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(field) = self.config_fields.iter().find(|f| f.path == path).cloned() else {
+            return;
+        };
+        let next = if field.kind == "bool" {
+            serde_json::Value::Bool(!field.value.as_bool().unwrap_or(false))
+        } else if field.kind == "enum" && !field.enum_choices.is_empty() {
+            let cur = field.value.as_str().unwrap_or_default();
+            let idx = field
+                .enum_choices
+                .iter()
+                .position(|c| c == cur)
+                .unwrap_or(0);
+            serde_json::Value::String(
+                field.enum_choices[(idx + 1) % field.enum_choices.len()].clone(),
+            )
+        } else {
+            return;
+        };
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn
+                .config_write(
+                    &sid,
+                    vec![ConfigWriteOp {
+                        op: "set".to_string(),
+                        path: field.path.clone(),
+                        value: Some(next.clone()),
+                        target_layer: None,
+                    }],
+                )
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match resp {
+                    Ok(r) if !r.rejected => {
+                        if let Some(f) =
+                            view.config_fields.iter_mut().find(|f| f.path == field.path)
+                        {
+                            f.value = next;
+                        }
+                    }
+                    Ok(r) => {
+                        view.error = Some(format!("config rejected: {}", r.failures.join(", ")))
+                    }
+                    Err(e) => view.error = Some(format!("config write failed: {e}")),
                 }
                 cx.notify();
             });
@@ -828,7 +978,7 @@ impl SessionView {
             cx.notify();
             return;
         }
-        let Some(cfg) = &self.voice else { return };
+        let Some(cfg) = &self.config else { return };
         if !cfg.voice_mode_enabled {
             return;
         }
@@ -943,7 +1093,7 @@ impl SessionView {
     /// `turn/completed` while the narrator is on: summarize → TTS → play,
     /// all on the host runtime; phases arrive back over the channel.
     fn narrate_turn(&mut self, turn_id: Option<String>, cx: &mut Context<Self>) {
-        let Some(cfg) = &self.voice else { return };
+        let Some(cfg) = &self.config else { return };
         if !cfg.voice_mode_enabled {
             return;
         }
