@@ -18,6 +18,16 @@ pub enum CallbackAnswer {
     UserInput(UserQuestionResult),
 }
 
+/// State of the rewind confirmation sheet. `has_changes == None` means the
+/// `session/rewind/read` preview is still in flight.
+pub struct RewindDialog {
+    pub entry_id: String,
+    pub preview: String,
+    pub has_changes: Option<bool>,
+    pub paths: Vec<String>,
+    pub restore_files: bool,
+}
+
 pub struct SessionView {
     pub conn: Arc<Connection>,
     pub projection: Projection,
@@ -38,6 +48,14 @@ pub struct SessionView {
     pub question_other: HashMap<(String, usize), String>,
     /// Focus handle per other-input, keyed "{callback id}:{question index}".
     pub other_focus: HashMap<String, FocusHandle>,
+    /// Rewind sheet — `Some` while the dialog is open.
+    pub rewind: Option<RewindDialog>,
+    /// Workspace trust details when the cwd is untrusted (banner).
+    pub trust: Option<WorkspaceTrustDetails>,
+    /// Banner hidden by the user for this view.
+    pub trust_dismissed: bool,
+    /// A `session/history/list` backward page is in flight.
+    pub loading_earlier: bool,
     events_task: Option<Task<()>>,
 }
 
@@ -66,12 +84,55 @@ impl SessionView {
             question_selections: HashMap::new(),
             question_other: HashMap::new(),
             other_focus: HashMap::new(),
+            rewind: None,
+            trust: None,
+            trust_dismissed: false,
+            loading_earlier: false,
             events_task: None,
         };
         if let Some(rx) = events {
             view.events_task = Some(Self::pump(rx, cx));
         }
         view
+    }
+
+    /// Called once right after attach: an untrusted workspace surfaces the
+    /// trust banner until the user decides or dismisses it.
+    pub fn check_trust(&mut self, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let cwd = self.projection.state.session.cwd.clone();
+        cx.spawn(async move |this, cx| {
+            let result = conn.workspace_trust_status(cwd.as_deref()).await;
+            let _ = this.update(cx, |view, cx| {
+                if let Ok(status) = result {
+                    if status.status == "untrusted" {
+                        view.trust = status.details;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn trust_decision(&mut self, decision: &str, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let cwd = self.projection.state.session.cwd.clone();
+        let sid = self.session_id().to_string();
+        let decision = decision.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = conn
+                .workspace_trust_decision(&decision, cwd.as_deref(), Some(&sid))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(()) => view.trust = None,
+                    Err(e) => view.error = Some(e.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn pump(
@@ -377,6 +438,172 @@ impl SessionView {
             });
         })
         .detach();
+    }
+
+    // -- turn queue -------------------------------------------------------------
+
+    pub fn queue_remove(&mut self, item_id: &str, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let session_id = self.session_id().to_string();
+        let item = item_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = conn.turn_queue_remove(&session_id, &item).await;
+            let _ = this.update(cx, |view, cx| {
+                if let Err(e) = result {
+                    view.error = Some(e.to_string());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Resume a paused queue — promotion continues server-side.
+    pub fn queue_resume(&mut self, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let session_id = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let result = conn.turn_queue_resume(&session_id).await;
+            let _ = this.update(cx, |view, cx| {
+                if let Err(e) = result {
+                    view.error = Some(e.to_string());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // -- rewind ------------------------------------------------------------------
+
+    /// Open the rewind sheet for a user-message entry and fetch the
+    /// file-change preview (`session/rewind/read`).
+    pub fn open_rewind(&mut self, entry: &PublicHistoryEntry, cx: &mut Context<Self>) {
+        let Some(entry_id) = entry.id().map(str::to_string) else {
+            return;
+        };
+        let preview = match entry {
+            PublicHistoryEntry::Message { content, .. } => content
+                .iter()
+                .filter_map(|b| b.as_text())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        self.rewind = Some(RewindDialog {
+            entry_id: entry_id.clone(),
+            preview,
+            has_changes: None,
+            paths: Vec::new(),
+            restore_files: false,
+        });
+        let conn = self.conn.clone();
+        let session_id = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let result = conn.session_rewind_read(&session_id, &entry_id).await;
+            let _ = this.update(cx, |view, cx| {
+                if let Some(dlg) = view.rewind.as_mut() {
+                    if dlg.entry_id == entry_id {
+                        match result {
+                            Ok(r) => {
+                                dlg.has_changes = Some(r.has_file_changes);
+                                dlg.paths = r.paths;
+                            }
+                            Err(e) => view.error = Some(e.to_string()),
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn close_rewind(&mut self, cx: &mut Context<Self>) {
+        self.rewind = None;
+        cx.notify();
+    }
+
+    /// Rewind to the sheet's entry. `inplace` truncates this session;
+    /// otherwise the server forks a child that opens in a new tab.
+    pub fn apply_rewind(&mut self, inplace: bool, cx: &mut Context<Self>) {
+        let Some(dlg) = self.rewind.take() else {
+            return;
+        };
+        let conn = self.conn.clone();
+        let session_id = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let result = conn
+                .session_rewind(&session_id, &dlg.entry_id, dlg.restore_files, inplace)
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(resp) => {
+                        if inplace {
+                            // Same-session truncation: the returned state
+                            // supersedes the projection wholesale.
+                            if !view.projection.adopt(resp.state) {
+                                view.resync(cx);
+                            }
+                        } else if let Some(app) = view.app.as_ref().and_then(|w| w.upgrade()) {
+                            let id = resp.state.session.id.clone();
+                            app.update(cx, |app, cx| app.open_session(&id, cx));
+                        }
+                        if !resp.restore_errors.is_empty() {
+                            view.error = Some(resp.restore_errors.join("; "));
+                        }
+                    }
+                    Err(e) => view.error = Some(e.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // -- history paging ------------------------------------------------------------
+
+    /// Fetch one older page (`history_before_cursor`) and prepend it.
+    pub fn load_earlier(&mut self, cx: &mut Context<Self>) {
+        let Some(cursor) = self.projection.state.history_before_cursor.clone() else {
+            return;
+        };
+        if self.loading_earlier {
+            return;
+        }
+        self.loading_earlier = true;
+        let conn = self.conn.clone();
+        let session_id = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let result = conn
+                .session_history_list(
+                    &session_id,
+                    None,
+                    PageRequest {
+                        cursor: Some(cursor),
+                        limit: 50,
+                        direction: "backward".into(),
+                    },
+                )
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.loading_earlier = false;
+                match result {
+                    Ok(page) => {
+                        let history = view.projection.state.history.get_or_insert_with(Vec::new);
+                        let mut merged = page.items;
+                        merged.append(history);
+                        *history = merged;
+                        view.projection.state.history_before_cursor = page.previous_cursor;
+                    }
+                    Err(e) => view.error = Some(e.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Fork this session server-side, then open the child in a new tab
