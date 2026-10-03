@@ -337,11 +337,17 @@ impl VibeApp {
                     }))
                     .child("rename…"),
             )
-            .child(if s.archived_at.is_some() {
-                row("unarchive", RailOp::Archive(false))
-            } else {
-                row("archive", RailOp::Archive(true))
-            })
+            .child(
+                // Servers disagree on which marker they fill: some stamp
+                // `archivedAt`, others only flip `status` to "archived".
+                if s.archived_at.is_some()
+                    || matches!(s.status, PublicSessionStatus::Archived)
+                {
+                    row("unarchive", RailOp::Archive(false))
+                } else {
+                    row("archive", RailOp::Archive(true))
+                },
+            )
             .child(row("delete", RailOp::Delete))
     }
 

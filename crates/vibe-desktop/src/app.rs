@@ -37,7 +37,10 @@ pub struct VibeApp {
     pub spawning: bool,
     /// Rail includes archived sessions (and offers unarchive) when set.
     pub show_archived: bool,
-    catalog_spawned: bool,
+    /// `include_archived` filter of the catalog request currently in
+    /// flight — also the re-entrancy guard. A toggle during the flight
+    /// re-runs the refresh once it lands.
+    catalog_inflight: Option<bool>,
 }
 
 enum AttachKind {
@@ -75,7 +78,7 @@ impl VibeApp {
             status: "starting…".into(),
             spawning: false,
             show_archived: false,
-            catalog_spawned: false,
+            catalog_inflight: None,
         };
         app.refresh_sessions(cx);
         app
@@ -107,15 +110,15 @@ impl VibeApp {
     }
 
     /// Catalog connection (never attaches a session): serves `session/list`.
-    /// Re-entrant-safe: refreshes after the first are fine — the rail's
-    /// refresh button and post-op resyncs rely on it.
+    /// Re-entrant-safe: one catalog request at a time; the completion
+    /// re-fires when `show_archived` changed under it.
     pub fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
-        if self.catalog_spawned && self.status.starts_with("connecting") {
+        if self.catalog_inflight.is_some() {
             return;
         }
-        self.catalog_spawned = true;
-        let program = self.program();
         let include_archived = self.show_archived;
+        self.catalog_inflight = Some(include_archived);
+        let program = self.program();
         self.status = format!("connecting to {}…", program.display());
         cx.notify();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -151,6 +154,7 @@ impl VibeApp {
                 .map_err(|_| vibe_protocol::client::ClientError::Closed)
                 .and_then(|r| r);
             let _ = this.update(cx, |app, cx| {
+                app.catalog_inflight = None;
                 match out {
                     Ok(items) => {
                         app.sessions = items;
@@ -160,6 +164,11 @@ impl VibeApp {
                     Err(e) => {
                         app.status = format!("catalog: {e}");
                     }
+                }
+                // The archived toggle flipped while this request was in
+                // flight — reload with the filter the user now expects.
+                if app.show_archived != include_archived {
+                    app.refresh_sessions(cx);
                 }
                 cx.notify();
             });
@@ -268,7 +277,14 @@ impl VibeApp {
         } else if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             match &op {
                 RailOp::Pin(p) => s.pinned_at = if *p { stamp } else { None },
-                RailOp::Archive(a) => s.archived_at = if *a { stamp } else { None },
+                RailOp::Archive(a) => {
+                    s.archived_at = if *a { stamp } else { None };
+                    s.status = if *a {
+                        PublicSessionStatus::Archived
+                    } else {
+                        PublicSessionStatus::Idle
+                    };
+                }
                 RailOp::Rename(t) => s.title = Some(t.clone()),
                 RailOp::Delete => {}
             }
@@ -281,7 +297,14 @@ impl VibeApp {
                         let s = &mut v.projection.state.session;
                         match &op {
                             RailOp::Pin(p) => s.pinned_at = if *p { stamp } else { None },
-                            RailOp::Archive(a) => s.archived_at = if *a { stamp } else { None },
+                            RailOp::Archive(a) => {
+                                s.archived_at = if *a { stamp } else { None };
+                                s.status = if *a {
+                                    PublicSessionStatus::Archived
+                                } else {
+                                    PublicSessionStatus::Idle
+                                };
+                            }
                             RailOp::Rename(t) => s.title = Some(t.clone()),
                             RailOp::Delete => {}
                         }

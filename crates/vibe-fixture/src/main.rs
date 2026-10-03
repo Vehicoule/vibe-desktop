@@ -906,7 +906,7 @@ async fn main() {
                         }
                     }
                 }
-                for demo in [
+                for mut demo in [
                     session_value("saved-aaaa1111", "/tmp/project-a", json!({"type": "idle"})),
                     session_value(
                         "saved-bbbb2222",
@@ -914,6 +914,13 @@ async fn main() {
                         json!({"type": "archived"}),
                     ),
                 ] {
+                    // An archived row carries `archivedAt` — the rail reads
+                    // the timestamp to decide archive vs unarchive.
+                    if demo["status"]["type"] == json!("archived")
+                        && demo["archivedAt"].is_null()
+                    {
+                        demo["archivedAt"] = json!(1_700_000_000);
+                    }
                     let archived = !demo["archivedAt"].is_null()
                         || demo["status"]["type"] == json!("archived");
                     if archived && !include_archived {
@@ -1250,19 +1257,29 @@ async fn main() {
                     _ => ("isUnseen", json!(false)),
                 };
                 data.set_session_field(field, value.clone()).await;
+                // `status.type` tracks archive state too (upstream keeps them
+                // consistent) — without this an unarchived stored row would
+                // still report status "archived".
+                let mut patch_ops =
+                    vec![json!({"op": "replace", "path": format!("/session/{field}"), "value": value})];
+                if field == "archivedAt" {
+                    let status = if params["archived"].as_bool().unwrap_or(false) {
+                        json!({"type": "archived"})
+                    } else {
+                        json!({"type": "idle"})
+                    };
+                    data.set_session_field("status", status.clone()).await;
+                    patch_ops.push(
+                        json!({"op": "replace", "path": "/session/status", "value": status}),
+                    );
+                }
                 let body = match field {
                     "pinnedAt" => json!({"pinnedAt": value}),
                     "archivedAt" => json!({"archivedAt": value}),
                     _ => json!({}),
                 };
                 respond(body).await;
-                emit_updated(
-                    &tx,
-                    &data,
-                    &sid,
-                    json!([{"op": "replace", "path": format!("/session/{field}"), "value": value}]),
-                )
-                .await;
+                emit_updated(&tx, &data, &sid, Value::Array(patch_ops)).await;
             }
             "session/rename" | "session/title/update" => {
                 let sid = params["sessionId"].as_str().unwrap_or("").to_string();
