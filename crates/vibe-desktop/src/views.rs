@@ -1222,6 +1222,7 @@ impl SessionView {
         };
         let mic = self.voice.as_ref().is_some_and(|v| v.voice_mode_enabled);
         let recording = self.dictation.is_some();
+        let stopping = self.dictation.as_ref().is_some_and(|d| d.stopping);
         let rec_level = self
             .dictation
             .as_ref()
@@ -1298,7 +1299,13 @@ impl SessionView {
                                         .items_center()
                                         .gap_1p5()
                                         .child(text(
-                                            if recording { "■ stop" } else { "● mic" },
+                                            if stopping {
+                                                "…"
+                                            } else if recording {
+                                                "■ stop"
+                                            } else {
+                                                "● mic"
+                                            },
                                             11.0,
                                             if recording {
                                                 c(theme::PAPER)
@@ -1306,7 +1313,7 @@ impl SessionView {
                                                 c(theme::INK)
                                             },
                                         ))
-                                        .when(recording, |d| {
+                                        .when(recording && !stopping, |d| {
                                             d.child(
                                                 div()
                                                     .h(px(8.0))

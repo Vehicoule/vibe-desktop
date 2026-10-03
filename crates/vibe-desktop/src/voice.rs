@@ -48,13 +48,18 @@ pub enum NarrationEvent {
 
 type DictationTx = futures::channel::mpsc::UnboundedSender<DictationEvent>;
 
-/// Latest user + assistant message text for `narration/summarize`.
-pub fn turn_text(history: &[PublicHistoryEntry]) -> Option<(String, String)> {
+/// User + assistant message text for `narration/summarize`, scoped to the
+/// completed turn — pairing messages across turns would narrate the wrong
+/// response. None when the turn has no assistant text.
+pub fn turn_text(history: &[PublicHistoryEntry], turn_id: &str) -> Option<(String, String)> {
     let last_text = |role: &str| -> Option<String> {
         history.iter().rev().find_map(|e| match e {
             PublicHistoryEntry::Message {
-                role: r, content, ..
-            } if r == role => Some(
+                base,
+                role: r,
+                content,
+                ..
+            } if r == role && base.turn_id.as_deref() == Some(turn_id) => Some(
                 content
                     .iter()
                     .filter_map(|b| b.as_text())
@@ -63,13 +68,12 @@ pub fn turn_text(history: &[PublicHistoryEntry]) -> Option<(String, String)> {
             _ => None,
         })
     };
-    let user = last_text("user")?;
     let asst = last_text("assistant")?;
-    if user.trim().is_empty() && asst.trim().is_empty() {
-        None
-    } else {
-        Some((user, asst))
+    if asst.trim().is_empty() {
+        return None;
     }
+    let user = last_text("user").unwrap_or_default();
+    Some((user, asst))
 }
 
 /// The server rejects a flush with no audio; that is a benign empty recording.
@@ -309,7 +313,6 @@ pub async fn transcribe(
     if !got_text {
         let _ = events.unbounded_send(DictationEvent::Notice("No speech detected".to_string()));
     }
-    let _ = events.unbounded_send(DictationEvent::Done);
     Ok(())
 }
 
@@ -382,6 +385,41 @@ pub async fn play(bytes: Vec<u8>, stop: Arc<AtomicBool>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vibe_protocol::models::{ContentBlock, HistoryEntryBase};
+
+    fn msg(id: &str, turn: &str, role: &str, text: &str) -> PublicHistoryEntry {
+        PublicHistoryEntry::Message {
+            base: HistoryEntryBase {
+                id: id.into(),
+                session_id: "s".into(),
+                turn_id: Some(turn.into()),
+                created_at: 0,
+                updated_at: 0,
+                generation_status: "completed".into(),
+                related_entry_id: None,
+            },
+            role: role.into(),
+            content: vec![ContentBlock::text(text)],
+            source: None,
+            user_display_content: None,
+        }
+    }
+
+    #[test]
+    fn turn_text_stays_within_the_completed_turn() {
+        let history = vec![
+            msg("u1", "t-a", "user", "fix tests"),
+            msg("a1", "t-a", "assistant", "fixed"),
+            msg("u2", "t-b", "user", "explain logs"),
+        ];
+        // Turn B completed with no assistant message — must not borrow
+        // turn A's answer.
+        assert_eq!(turn_text(&history, "t-b"), None);
+        assert_eq!(
+            turn_text(&history, "t-a"),
+            Some(("fix tests".to_string(), "fixed".to_string()))
+        );
+    }
 
     #[test]
     fn transcribe_url_forces_ws_scheme() {
