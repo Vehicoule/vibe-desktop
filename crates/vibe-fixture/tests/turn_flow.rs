@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use vibe_protocol::client::Connection;
+use vibe_protocol::client::{ClientError, Connection};
 use vibe_protocol::models::*;
 
 fn fixture() -> PathBuf {
@@ -173,6 +173,10 @@ async fn scripted_turn_with_approval() {
     // A state re-read is consistent (fixture serves the initial state).
     let state = conn.session_read(&session_id).await.expect("session/read");
     assert_eq!(state.session.id, session_id);
+    // Kill the fixture before deleting its store so no scripted task can
+    // persist into a directory that no longer exists.
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -195,6 +199,8 @@ async fn interrupt_returns_accepted() {
     // interrupt is fire-and-forget correct: fixture accepts it.
     conn.turn_interrupt(&sid, "turn-1").await.unwrap();
     conn.session_stop(&sid).await.unwrap();
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -250,5 +256,37 @@ async fn fork_resumes_across_processes() {
         .await
         .expect("session/list");
     assert!(list.items.iter().any(|s| s.id == forked.session.id));
+    drop(conn_a);
+    drop(conn_b);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `session/fork` must reject unsafe source ids with a JSON-RPC error,
+/// not a malformed null result — the wire client should surface it as
+/// `ClientError::Protocol`, not a decode failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_rejects_unsafe_source_id() {
+    let (dir, envs) = store();
+    let conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    for bad in ["../escape", "a/b", ".."] {
+        let err = conn
+            .session_fork(bad, None, 50)
+            .await
+            .expect_err("unsafe source id must be rejected");
+        assert!(
+            matches!(err, ClientError::Protocol { .. }),
+            "expected protocol error for {bad}, got {err}"
+        );
+    }
+    // Unknown (but safe) source ids reject the same way.
+    let err = conn
+        .session_fork("missing-1234", None, 50)
+        .await
+        .expect_err("unknown source id must be rejected");
+    assert!(matches!(err, ClientError::Protocol { .. }));
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let _ = std::fs::remove_dir_all(&dir);
 }

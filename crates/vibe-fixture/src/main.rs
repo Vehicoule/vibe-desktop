@@ -336,6 +336,20 @@ async fn main() {
                 }
             }
         };
+        let respond_err = |code: &'static str, message: &'static str| {
+            let tx = tx.clone();
+            let id = id.clone();
+            async move {
+                if let Some(id) = id {
+                    let _ = tx
+                        .send(
+                            json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": null}})
+                                .to_string(),
+                        )
+                        .await;
+                }
+            }
+        };
         let _notify = {
             let tx = tx.clone();
             move |method: &str, params: Value| {
@@ -466,7 +480,7 @@ async fn main() {
             "session/fork" => {
                 let src = params["sourceSessionId"].as_str().unwrap_or("");
                 if !store_safe_id(src) {
-                    respond(Value::Null).await;
+                    respond_err("invalid_params", "sourceSessionId").await;
                     continue;
                 }
                 let data = sessions.lock().await.get(src).cloned();
@@ -474,31 +488,29 @@ async fn main() {
                     Some(d) => Some(d),
                     None => SessionData::load(&store, src).await,
                 };
-                let state = match data {
-                    Some(d) => {
-                        let fork_id = format!("{src}-fork");
-                        let mut session = d.session.clone();
-                        session["id"] = json!(fork_id);
-                        session["parentSessionId"] = json!(src);
-                        let fork = Arc::new(SessionData::new(session, store.clone()));
-                        {
-                            let mut inner = fork.inner.lock().await;
-                            inner.history = d.clone_history().await;
-                            inner.event_id = d.inner.lock().await.event_id;
-                            // Continue the parent's turn counter so the
-                            // child's entry ids can never collide with the
-                            // history it just inherited.
-                            fork.turn_seq
-                                .store(d.turn_seq.load(Ordering::SeqCst), Ordering::SeqCst);
-                            fork.persist(&inner).await;
-                        }
-                        // Return the CHILD's state — the caller opens it.
-                        let state = fork.state().await;
-                        sessions.lock().await.insert(fork_id, fork);
-                        state
-                    }
-                    None => Value::Null,
+                let Some(d) = data else {
+                    respond_err("not_found", "session").await;
+                    continue;
                 };
+                let fork_id = format!("{src}-fork");
+                let mut session = d.session.clone();
+                session["id"] = json!(fork_id);
+                session["parentSessionId"] = json!(src);
+                let fork = Arc::new(SessionData::new(session, store.clone()));
+                {
+                    let mut inner = fork.inner.lock().await;
+                    inner.history = d.clone_history().await;
+                    inner.event_id = d.inner.lock().await.event_id;
+                    // Continue the parent's turn counter so the
+                    // child's entry ids can never collide with the
+                    // history it just inherited.
+                    fork.turn_seq
+                        .store(d.turn_seq.load(Ordering::SeqCst), Ordering::SeqCst);
+                    fork.persist(&inner).await;
+                }
+                // Return the CHILD's state — the caller opens it.
+                let state = fork.state().await;
+                sessions.lock().await.insert(fork_id, fork);
                 respond(json!({"state": state, "sourceSessionId": src, "lastEventId": 0})).await;
             }
             "turn/start" => {
@@ -514,9 +526,7 @@ async fn main() {
                     None => SessionData::load(&store, &sid).await,
                 };
                 let Some(data) = data else {
-                    if let Some(id) = id {
-                        let _ = tx.send(json!({"jsonrpc": "2.0", "id": id, "error": {"code": "not_found", "message": "session", "data": null}}).to_string()).await;
-                    }
+                    respond_err("not_found", "session").await;
                     continue;
                 };
                 let n = data.turn_seq.fetch_add(1, Ordering::SeqCst) + 1;
