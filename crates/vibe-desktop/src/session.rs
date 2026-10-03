@@ -235,6 +235,9 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let state = conn.review_state(&sid).await;
             let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
                 match state {
                     Ok(s) => view.review = Some(s),
                     Err(e) => view.error = Some(format!("review read failed: {e}")),
@@ -276,6 +279,9 @@ impl SessionView {
         cx.spawn(async move |this, cx| {
             let resp = conn.review_turn_diff(&sid, &path, &owner).await;
             let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
                 match resp {
                     Ok(d) => view.review_diff = Some((path.clone(), owner, d)),
                     Err(e) => view.error = Some(format!("diff read failed: {e}")),
@@ -304,6 +310,9 @@ impl SessionView {
                 conn.review_revert(&sid, &target).await
             };
             let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
                 match result {
                     Ok(()) => {
                         view.review_diff = None;
@@ -611,8 +620,13 @@ impl SessionView {
             self.pending_agent = None;
             self.config_fields.clear();
             self.cfg_inflight.clear();
+            self.review = None;
+            self.review_diff = None;
             if self.settings_open {
                 self.load_settings(cx);
+            }
+            if self.review_open {
+                self.load_review(cx);
             }
         }
     }
