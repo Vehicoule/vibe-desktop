@@ -460,6 +460,17 @@ async fn set_status(data: &Arc<SessionData>, tx: &Tx, sid: &str, status: Value) 
     .await;
 }
 
+/// Status a session lands on when its turn ends without another queued:
+/// archived if it was archived mid-turn, else idle. Also the right status
+/// for a forked child — it inherits the archive marker but not the turn.
+fn terminal_status(session: &Value) -> Value {
+    if session["archivedAt"].is_null() {
+        json!({"type": "idle"})
+    } else {
+        json!({"type": "archived"})
+    }
+}
+
 /// First text block of a queued turn's user entry (what the UI lists).
 fn queued_item_text(item: &Value) -> String {
     item.pointer("/entries/0/content/0/text")
@@ -803,12 +814,13 @@ async fn finish_turn(
         ),
     )
     .await;
-    {
+    let term = {
         let mut inner = data.inner.lock().await;
         inner.active_turn = None;
         inner.active_abort = None;
-    }
-    set_status(&data, &tx2, &sid, json!({"type": "idle"})).await;
+        terminal_status(&inner.session)
+    };
+    set_status(&data, &tx2, &sid, term).await;
     send(
         "turn/completed",
         evt(
@@ -1072,6 +1084,9 @@ async fn main() {
                 };
                 session["id"] = json!(fork_id);
                 session["parentSessionId"] = json!(src);
+                // The child has no turn — it inherits the archive marker,
+                // not the parent's live running/blocked status.
+                session["status"] = terminal_status(&session);
                 let fork = Arc::new(SessionData::new(session, store.clone()));
                 {
                     let mut inner = fork.inner.lock().await;
@@ -1240,7 +1255,7 @@ async fn main() {
                 // expectedTurnId"). Abort first and a stale id strands the
                 // queue: the script dies but active_turn stays set, so
                 // nothing can promote.
-                let (aborted, killed) = {
+                let (aborted, killed_status) = {
                     let mut inner = data.inner.lock().await;
                     match inner.active_turn.clone() {
                         Some(t) if expected.is_empty() || t == expected => {
@@ -1252,19 +1267,20 @@ async fn main() {
                             // Interrupting pauses the queue (upstream
                             // _after_turn_terminal).
                             inner.queue_paused = true;
+                            let term = terminal_status(&inner.session);
                             data.persist(&inner).await;
-                            (true, true)
+                            (true, Some(term))
                         }
-                        Some(_) => (false, false),
-                        None => (true, false),
+                        Some(_) => (false, None),
+                        None => (true, None),
                     }
                 };
                 if !aborted {
                     respond_err("invalid_params", "expectedTurnId").await;
                     continue;
                 }
-                if killed {
-                    set_status(&data, &tx, &sid, json!({"type": "idle"})).await;
+                if let Some(status) = killed_status {
+                    set_status(&data, &tx, &sid, status).await;
                 }
                 respond(json!({"accepted": true, "lastEventId": 0})).await;
                 emit_queue_updated(&tx, &data, &sid).await;
@@ -1432,7 +1448,7 @@ async fn main() {
                 // either way: kills the active turn and clears the queue, then
                 // emits turn/queueUpdated if anything changed. The new state
                 // travels in the RESPONSE (state), not a history patch.
-                let (queue_changed, killed_turn) = {
+                let (queue_changed, killed_status) = {
                     let mut inner = data.inner.lock().await;
                     let changed = !inner.queue_items.is_empty()
                         || inner.queue_paused
@@ -1442,15 +1458,18 @@ async fn main() {
                     if let Some(abort) = inner.active_abort.take() {
                         abort.abort();
                     }
-                    let killed = inner.active_turn.is_some();
+                    let term = inner
+                        .active_turn
+                        .is_some()
+                        .then(|| terminal_status(&inner.session));
                     if let Some(t) = inner.active_turn.take() {
                         pending_callbacks.lock().await.remove(&format!("cb-{t}"));
                     }
                     data.persist(&inner).await;
-                    (changed, killed)
+                    (changed, term)
                 };
-                if killed_turn {
-                    set_status(&data, &tx, &sid, json!({"type": "idle"})).await;
+                if let Some(status) = killed_status {
+                    set_status(&data, &tx, &sid, status).await;
                 }
                 if inplace {
                     // Drop the target message and everything after it.
@@ -1491,6 +1510,9 @@ async fn main() {
                     };
                     session["id"] = json!(rewind_id);
                     session["parentSessionId"] = json!(sid);
+                    // Same normalization: the child's own turn set is empty,
+                    // so it must not advertise the parent's activeTurnId.
+                    session["status"] = terminal_status(&session);
                     let child = Arc::new(SessionData::new(session, store.clone()));
                     {
                         let mut inner = child.inner.lock().await;
