@@ -1882,3 +1882,170 @@ pub struct ReviewTargetRegionRef {
     pub version_index: u32,
     pub ordinal: u32,
 }
+
+// ---------------------------------------------------------------------------
+// M3c: extensions — skills, MCP catalog, connectors, plugins
+// (models.py SkillSummary / MCPState / ConnectorCounts / PluginCatalog*,
+// protocol.py SkillsSetEnabledParams / MCPToggleParams / read responses)
+// ---------------------------------------------------------------------------
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSummary {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_true")]
+    pub user_invocable: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillsInstalledResponse {
+    #[serde(default)]
+    pub skills: Vec<SkillSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillsSetEnabledParams {
+    pub session_id: String,
+    pub name: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MCPToolSummary {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `kind`: "server" | "connector"; `status`: "disabled" | "connected" |
+/// "enabled" | "needs_auth" | "needs_setup" | "unavailable" (String per
+/// ADR-0014 skew).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MCPSourceSummary {
+    pub name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub tools: Vec<MCPToolSummary>,
+    pub error: Option<String>,
+    pub plugin_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MCPState {
+    #[serde(default)]
+    pub sources: Vec<MCPSourceSummary>,
+    #[serde(default)]
+    pub discovery_errors: std::collections::HashMap<String, String>,
+    pub connector_error: Option<String>,
+    pub manage_connectors_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MCPReadResponse {
+    pub mcp: MCPState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MCPToggleParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub name: String,
+    pub source: String,
+    pub disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+/// `mcp/toggle` answers `MCPCatalogMutationResponse{runtime}` — the fresh
+/// `MCPState` lives at `runtime.mcp`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MCPMutationResponse {
+    pub runtime: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectorCounts {
+    #[serde(default)]
+    pub connected: u32,
+    pub total: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectorsReadResponse {
+    pub counts: ConnectorCounts,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCatalogComponent {
+    #[serde(default)]
+    pub kind: String,
+    pub name: String,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCatalogEntry {
+    pub name: String,
+    pub version: Option<String>,
+    #[serde(default)]
+    pub source_format: String,
+    #[serde(default)]
+    pub description: String,
+    pub author: Option<String>,
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub components: Vec<PluginCatalogComponent>,
+    #[serde(default)]
+    pub drifted: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginCatalogDropped {
+    pub file: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginCatalogState {
+    #[serde(default)]
+    pub plugins: Vec<PluginCatalogEntry>,
+    #[serde(default)]
+    pub dropped: Vec<PluginCatalogDropped>,
+}
+
+/// `plugins/read` wraps the catalog state one level: `{plugins: {plugins,
+/// dropped}}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginsReadResponse {
+    pub plugins: PluginCatalogState,
+}

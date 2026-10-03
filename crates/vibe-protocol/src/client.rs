@@ -884,6 +884,77 @@ impl Connection {
         .await?;
         Ok(())
     }
+
+    // ── M3c: extensions ──────────────────────────────────────────────────
+
+    /// `skills/installed` → the session's installed skill set.
+    pub async fn skills_installed(
+        &self,
+        session_id: &str,
+    ) -> ClientResult<SkillsInstalledResponse> {
+        self.request_typed("skills/installed", json!({"sessionId": session_id}))
+            .await
+    }
+
+    /// `skills/setEnabled` → RuntimeMutationResponse-shaped reply.
+    pub async fn skills_set_enabled(
+        &self,
+        session_id: &str,
+        name: &str,
+        enabled: bool,
+    ) -> ClientResult<ConfigWriteResponse> {
+        self.request_typed(
+            "skills/setEnabled",
+            SkillsSetEnabledParams {
+                session_id: session_id.to_string(),
+                name: name.to_string(),
+                enabled,
+            },
+        )
+        .await
+    }
+
+    /// `mcp/read` → `MCPState` (sources, statuses, discovery errors).
+    pub async fn mcp_read(&self, session_id: &str) -> ClientResult<MCPReadResponse> {
+        self.request_typed("mcp/read", json!({"sessionId": session_id}))
+            .await
+    }
+
+    /// `mcp/toggle` → `{runtime}` whose `mcp` carries the fresh state.
+    pub async fn mcp_toggle(
+        &self,
+        session_id: &str,
+        name: &str,
+        source: &str,
+        disabled: bool,
+    ) -> ClientResult<MCPMutationResponse> {
+        self.request_typed(
+            "mcp/toggle",
+            MCPToggleParams {
+                session_id: Some(session_id.to_string()),
+                name: name.to_string(),
+                source: source.to_string(),
+                disabled,
+                tool_name: None,
+            },
+        )
+        .await
+    }
+
+    /// `connectors/read` → `{counts:{connected,total}}`.
+    pub async fn connectors_read(
+        &self,
+        session_id: &str,
+    ) -> ClientResult<ConnectorsReadResponse> {
+        self.request_typed("connectors/read", json!({"sessionId": session_id}))
+            .await
+    }
+
+    /// `plugins/read` → `{plugins:{plugins,dropped}}` catalog state.
+    pub async fn plugins_read(&self, session_id: &str) -> ClientResult<PluginsReadResponse> {
+        self.request_typed("plugins/read", json!({"sessionId": session_id}))
+            .await
+    }
 }
 
 impl Drop for Connection {

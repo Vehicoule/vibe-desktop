@@ -642,3 +642,54 @@ async fn review_state_diff_and_mutation() {
 
     cleanup(conn, &dir).await;
 }
+
+/// M3c: skills/mcp/connectors/plugins reads + toggles persist across reads.
+#[tokio::test]
+async fn extensions_roundtrip() {
+    let (dir, envs) = store();
+    let mut conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    let (sid, _rx) = session_with_completed_turn(&mut conn).await;
+
+    // skills: installed list → toggle → read-back reflects it.
+    let inst = conn.skills_installed(&sid).await.unwrap();
+    assert_eq!(inst.skills.len(), 3);
+    let deploy = inst.skills.iter().find(|s| s.name == "deploy-notes").unwrap();
+    assert!(!deploy.enabled);
+
+    let resp = conn.skills_set_enabled(&sid, "deploy-notes", true).await.unwrap();
+    assert!(!resp.rejected);
+    let after = conn.skills_installed(&sid).await.unwrap();
+    let deploy = after.skills.iter().find(|s| s.name == "deploy-notes").unwrap();
+    assert!(deploy.enabled);
+
+    // mcp: read → toggle → runtime.mcp and the next read both agree.
+    let mcp = conn.mcp_read(&sid).await.unwrap();
+    let fs = mcp.mcp.sources.iter().find(|s| s.name == "fs").unwrap();
+    assert_eq!(fs.status, "enabled");
+
+    let toggled = conn.mcp_toggle(&sid, "fs", "server", true).await.unwrap();
+    let fresh = toggled.runtime.expect("runtime").get("mcp").cloned().unwrap();
+    let state: vibe_protocol::models::MCPState = serde_json::from_value(fresh).unwrap();
+    assert_eq!(
+        state.sources.iter().find(|s| s.name == "fs").unwrap().status,
+        "disabled"
+    );
+    let reread = conn.mcp_read(&sid).await.unwrap();
+    assert_eq!(
+        reread.mcp.sources.iter().find(|s| s.name == "fs").unwrap().status,
+        "disabled"
+    );
+
+    // connectors + plugins are read-only surfaces here.
+    let conn_counts = conn.connectors_read(&sid).await.unwrap();
+    assert_eq!(conn_counts.counts.connected, 2);
+    assert_eq!(conn_counts.counts.total, Some(5));
+
+    let plugs = conn.plugins_read(&sid).await.unwrap();
+    assert_eq!(plugs.plugins.plugins.len(), 1);
+    assert_eq!(plugs.plugins.plugins[0].name, "acme-pack");
+    assert!(plugs.plugins.dropped.is_empty());
+
+    cleanup(conn, &dir).await;
+}

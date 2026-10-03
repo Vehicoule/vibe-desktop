@@ -1356,6 +1356,145 @@ impl SessionView {
                 .child(text("config", 10.5, c(theme::INK_FAINT)))
                 .child(rows);
         }
+
+        // ── skills (skills/installed + setEnabled) ──
+        if !self.ext_skills.is_empty() {
+            let mut rows = div().flex().flex_col().gap_1();
+            for s in &self.ext_skills {
+                let name = s.name.clone();
+                let mark = if self.skill_pending(&name) {
+                    "◐"
+                } else if s.enabled {
+                    "☑"
+                } else {
+                    "☐"
+                };
+                let suffix = if self.skill_pending(&name) {
+                    " (pending)"
+                } else {
+                    ""
+                };
+                let toggleable = !s.locked && !self.ext_busy(&format!("skill:{name}"));
+                let mut row = div()
+                    .id(SharedString::from(format!("skill-row-{name}")))
+                    .child(text(
+                        format!("{mark} {name}{suffix} · {}/{}", s.source, s.scope),
+                        11.5,
+                        c(if s.locked {
+                            theme::INK_FAINT
+                        } else {
+                            theme::INK_SOFT
+                        }),
+                    ));
+                if toggleable {
+                    row = row.cursor_pointer().on_click(
+                        cx.listener(move |v, _e, _w, cx| v.toggle_skill(name.clone(), cx)),
+                    );
+                }
+                rows = rows.child(row);
+            }
+            sheet = sheet
+                .child(text("skills", 10.5, c(theme::INK_FAINT)))
+                .child(rows);
+        }
+
+        // ── mcp sources (mcp/read + toggle) + connector counts ──
+        if let Some(mcp) = &self.mcp_state {
+            if !mcp.sources.is_empty() {
+                let mut rows = div().flex().flex_col().gap_1();
+                for src in &mcp.sources {
+                    let name = src.name.clone();
+                    let label = if src.display_name.is_empty() {
+                        name.clone()
+                    } else {
+                        src.display_name.clone()
+                    };
+                    let tools = if src.tools.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {} tool{}", src.tools.len(),
+                            if src.tools.len() == 1 { "" } else { "s" })
+                    };
+                    let color = match src.status.as_str() {
+                        "enabled" | "connected" => theme::INK_SOFT,
+                        "needs_auth" | "needs_setup" => theme::AMBER,
+                        "disabled" => theme::INK_FAINT,
+                        _ => theme::RED,
+                    };
+                    let mut row = div()
+                        .id(SharedString::from(format!("mcp-row-{name}")))
+                        .child(text(
+                            format!("{label} · {}/{}{tools} · {}", src.kind, src.transport, src.status),
+                            11.5,
+                            c(color),
+                        ));
+                    // Only enabled↔disabled transitions are wire-toggleable.
+                    if matches!(src.status.as_str(), "enabled" | "disabled")
+                        && !self.ext_busy(&format!("mcp:{name}"))
+                    {
+                        row = row.cursor_pointer().on_click(
+                            cx.listener(move |v, _e, _w, cx| v.toggle_mcp(name.clone(), cx)),
+                        );
+                    }
+                    rows = rows.child(row);
+                }
+                sheet = sheet
+                    .child(text("mcp", 10.5, c(theme::INK_FAINT)))
+                    .child(rows);
+            }
+        }
+        if let Some(counts) = &self.connector_counts {
+            let total = counts
+                .total
+                .map(|t| format!("/{t}"))
+                .unwrap_or_default();
+            sheet = sheet.child(text(
+                format!("connectors {} connected{}", counts.connected, total),
+                10.5,
+                c(theme::INK_FAINT),
+            ));
+        }
+
+        // ── plugins (plugins/read catalog) ──
+        if !self.plugins.is_empty() || !self.plugin_dropped.is_empty() {
+            let mut rows = div().flex().flex_col().gap_1();
+            for p in &self.plugins {
+                let version = p
+                    .version
+                    .as_deref()
+                    .map(|v| format!(" v{v}"))
+                    .unwrap_or_default();
+                let scope = p.scope.as_deref().unwrap_or("?");
+                let drift = if p.drifted > 0 {
+                    format!(" · {} drifted", p.drifted)
+                } else {
+                    String::new()
+                };
+                rows = rows.child(text(
+                    format!(
+                        "{}{} · {} · {} component{}{}",
+                        p.name,
+                        version,
+                        scope,
+                        p.components.len(),
+                        if p.components.len() == 1 { "" } else { "s" },
+                        drift
+                    ),
+                    11.5,
+                    c(theme::INK_SOFT),
+                ));
+            }
+            for d in &self.plugin_dropped {
+                rows = rows.child(text(
+                    format!("⚠ {}: {}", d.file, d.message),
+                    10.5,
+                    c(theme::RED),
+                ));
+            }
+            sheet = sheet
+                .child(text("plugins", 10.5, c(theme::INK_FAINT)))
+                .child(rows);
+        }
         Some(sheet)
     }
 
