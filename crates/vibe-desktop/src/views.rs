@@ -1396,6 +1396,9 @@ impl SessionView {
             let keep_owner = owner.clone();
             let revert_owner = owner.clone();
             let busy = self.review_busy(path);
+            // Ownerless files only show a borrowed-owner diff — keep and
+            // revert stay off rather than deciding unseen changes.
+            let decidable = self.review_decidable(path, owner);
             let mut lines = div().flex().flex_col();
             for change in
                 similar::TextDiff::from_lines(&diff.baseline, &diff.current).iter_all_changes()
@@ -1429,7 +1432,14 @@ impl SessionView {
                             .when(busy, |el| {
                                 el.child(text("applying…", 11.0, c(theme::INK_FAINT)))
                             })
-                            .when(!busy, |el| {
+                            .when(!busy && !decidable, |el| {
+                                el.child(text(
+                                    "no owning scope — read only",
+                                    11.0,
+                                    c(theme::INK_FAINT),
+                                ))
+                            })
+                            .when(!busy && decidable, |el| {
                                 el.child(
                                     ghost_button("review-keep", "keep").on_click(cx.listener(
                                         move |v, _e, _w, cx| {

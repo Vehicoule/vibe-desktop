@@ -425,7 +425,8 @@ impl SessionView {
     /// or a regioned file whose regions name it? The first-scope fallback
     /// in `review_owner_for` only exists so `turnDiff` can READ; deciding
     /// through a borrowed owner would target changes it doesn't own.
-    fn review_owner_authoritative(&self, path: &str, owner: &ReviewOwner) -> bool {
+    /// Views gate keep/revert on this.
+    pub fn review_decidable(&self, path: &str, owner: &ReviewOwner) -> bool {
         let Some(state) = self.review.as_ref() else {
             return false;
         };
@@ -448,11 +449,12 @@ impl SessionView {
     }
 
     /// `review/approve` (`keep`) or `review/revert`, then refresh state.
-    /// Target: `ScopeFile` when the owner genuinely claims the file (the
-    /// diff shows that scope's slice — the decision must hit the same
-    /// unit); `File` when the owner was only a read-fallback, where a
-    /// scoped target would miss the file's real changes. One decision
-    /// per file at a time — a second click while in flight is ignored.
+    /// The target is always `ScopeFile` on the displayed owner — the diff
+    /// shows that scope's slice, so the decision hits the same unit. A
+    /// file without an authoritative owner only showed a borrowed-owner
+    /// diff: deciding it could revert changes never displayed, so the
+    /// request is refused. One decision per file — a second click while
+    /// in flight is ignored.
     pub fn review_apply_file(
         &mut self,
         path: String,
@@ -460,25 +462,25 @@ impl SessionView {
         keep: bool,
         cx: &mut Context<Self>,
     ) {
+        // An ownerless file (unscoped + regionless) only ever showed a
+        // borrowed-owner diff — a decision here could revert changes the
+        // diff never displayed. No decision is safer than a blind one.
+        if !self.review_decidable(&path, &owner) {
+            self.error = Some(format!(
+                "review: {path} has no owning scope — decisions disabled"
+            ));
+            cx.notify();
+            return;
+        }
         if !self.review_inflight.insert(path.clone()) {
             return;
         }
-        // A scope-listed owner decides that scope's slice; a file with no
-        // authoritative owner (unscoped + regionless) decides file-wide —
-        // `ScopeFile` on a borrowed owner would miss its changes.
-        let scoped = self.review_owner_authoritative(&path, &owner);
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
-            let target = if scoped {
-                ReviewTarget::ScopeFile {
-                    owner: owner.clone(),
-                    path: path.clone(),
-                }
-            } else {
-                ReviewTarget::File {
-                    path: path.clone(),
-                }
+            let target = ReviewTarget::ScopeFile {
+                owner: owner.clone(),
+                path: path.clone(),
             };
             let result = if keep {
                 conn.review_approve(&sid, &target).await
@@ -493,11 +495,12 @@ impl SessionView {
                 match result {
                     Ok(()) => {
                         // Only close the diff that the decision applied
-                        // to — a file-wide decision closes its file's diff,
-                        // a scoped one only the matching (path, owner).
-                        let hit = view.review_diff_sel.as_ref().is_some_and(|(p, o)| {
-                            *p == path && (!scoped || *o == owner)
-                        });
+                        // to — the matching (path, owner); another owner's
+                        // diff on the same file stays open.
+                        let hit = view
+                            .review_diff_sel
+                            .as_ref()
+                            .is_some_and(|(p, o)| *p == path && *o == owner);
                         if hit {
                             view.review_diff = None;
                             view.review_diff_sel = None;
