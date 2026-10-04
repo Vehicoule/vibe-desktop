@@ -15,6 +15,13 @@ fn text(s: impl Into<String>, size: f32, color: gpui::Hsla) -> gpui::Div {
     div().text_color(color).text_size(px(size)).child(s.into())
 }
 
+fn review_owner_tag(owner: &ReviewOwner) -> String {
+    match owner {
+        ReviewOwner::Agent { turn_id } => format!("turn {turn_id}"),
+        ReviewOwner::Manual { index } => format!("manual {index}"),
+    }
+}
+
 fn badge(label: &str, color: u32) -> gpui::Div {
     div()
         .px_2()
@@ -1649,6 +1656,10 @@ impl SessionView {
             let keep_owner = owner.clone();
             let revert_owner = owner.clone();
             let busy = self.review_busy(path);
+            // Whole-file previews (owner None) always decide — the
+            // preview showed every pending change; a scoped sel only
+            // decides while its owner still claims the file.
+            let decidable = self.review_decidable(path, owner.as_ref());
             let mut lines = div().flex().flex_col();
             for change in
                 similar::TextDiff::from_lines(&diff.baseline, &diff.current).iter_all_changes()
@@ -1671,7 +1682,14 @@ impl SessionView {
                             .items_center()
                             .gap_2()
                             .child(text(
-                                format!("{path} · {}", diff.status),
+                                match owner {
+                                    Some(o) => format!(
+                                        "{path} · {} · {}",
+                                        diff.status,
+                                        review_owner_tag(o)
+                                    ),
+                                    None => format!("{path} · {} · whole file", diff.status),
+                                },
                                 11.5,
                                 c(theme::INK_SOFT),
                             ))
@@ -1682,7 +1700,14 @@ impl SessionView {
                             .when(busy, |el| {
                                 el.child(text("applying…", 11.0, c(theme::INK_FAINT)))
                             })
-                            .when(!busy, |el| {
+                            .when(!busy && !decidable, |el| {
+                                el.child(text(
+                                    "owner changed — re-open the diff",
+                                    11.0,
+                                    c(theme::INK_FAINT),
+                                ))
+                            })
+                            .when(!busy && decidable, |el| {
                                 el.child(
                                     ghost_button("review-keep", "keep").on_click(cx.listener(
                                         move |v, _e, _w, cx| {
@@ -1731,10 +1756,7 @@ impl SessionView {
         };
         let mut listed = Vec::new();
         for scope in &state.scopes {
-            let scope_label = match &scope.owner {
-                ReviewOwner::Agent { turn_id } => format!("turn {turn_id}"),
-                ReviewOwner::Manual { index } => format!("manual {index}"),
-            };
+            let scope_label = review_owner_tag(&scope.owner);
             sheet = sheet.child(text(scope_label, 10.5, c(theme::INK_FAINT)));
             let mut rows = div().flex().flex_col().gap_1();
             for f in &scope.files {
