@@ -26,9 +26,11 @@ pub fn server_binary() -> PathBuf {
     if let Ok(p) = std::env::var("VIBE_APP_SERVER") {
         return PathBuf::from(p);
     }
-    let managed = crate::vibe_dist::managed_binary(&crate::vibe_dist::dist_root());
-    if managed.exists() {
-        return managed;
+    if let Some(root) = crate::vibe_dist::dist_root() {
+        let managed = crate::vibe_dist::managed_binary(&root);
+        if managed.exists() {
+            return managed;
+        }
     }
     if let Some(home) = std::env::var_os("HOME") {
         let p = Path::new(&home).join(".local/bin/vibe-app-server");

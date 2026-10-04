@@ -102,7 +102,11 @@ impl VibeApp {
             window_active: false,
         };
         app.refresh_sessions(cx);
-        app.probe_dist(true, cx);
+        // The dist row manages the REAL server — meaningless under the
+        // fixture backend, which never resolves it.
+        if backend == Backend::Server {
+            app.probe_dist(true, cx);
+        }
         app
     }
 
@@ -140,14 +144,25 @@ impl VibeApp {
         }
         self.dist_inflight = true;
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let state = crate::vibe_dist::probe(check_latest).await;
+            // probe drives tokio child processes + reqwest — it must run
+            // on the host runtime, not gpui's executor (tokio::process
+            // panics without a reactor).
+            let state = host::runtime()
+                .spawn(async move { crate::vibe_dist::probe(check_latest).await })
+                .await
+                .unwrap_or_else(|_| crate::vibe_dist::VibeDist::Failed {
+                    upgrade: false,
+                    error: "dist probe failed".into(),
+                });
             let _ = this.update(cx, |app, cx| {
                 app.dist_inflight = false;
-                // An op in flight (install/update) owns the label — don't
-                // clobber it with a probe that started earlier.
+                // An op outcome (in-flight or failed) owns the label —
+                // don't clobber it with a probe that started earlier.
                 if !matches!(
                     app.vibe_dist,
-                    crate::vibe_dist::VibeDist::Installing | crate::vibe_dist::VibeDist::Updating
+                    crate::vibe_dist::VibeDist::Installing
+                        | crate::vibe_dist::VibeDist::Updating
+                        | crate::vibe_dist::VibeDist::Failed { .. }
                 ) {
                     app.vibe_dist = state;
                 }
@@ -176,7 +191,9 @@ impl VibeApp {
                     let Some(uv) = crate::vibe_dist::uv_binary() else {
                         return Err("uv not found — install it from astral.sh/uv".to_string());
                     };
-                    let root = crate::vibe_dist::dist_root();
+                    let Some(root) = crate::vibe_dist::dist_root() else {
+                        return Err("no data directory (HOME/XDG_DATA_HOME unset)".to_string());
+                    };
                     std::fs::create_dir_all(&root).map_err(|e| format!("{e}"))?;
                     if upgrade {
                         crate::vibe_dist::upgrade(&uv, &root).await
@@ -188,16 +205,32 @@ impl VibeApp {
                 .unwrap_or_else(|_| Err("dist task failed".into()));
             let _ = this.update(cx, |app, cx| {
                 app.dist_inflight = false;
-                app.vibe_dist = match out {
-                    Ok(version) => crate::vibe_dist::VibeDist::Installed {
-                        version,
-                        managed: true,
-                    },
-                    Err(e) => crate::vibe_dist::VibeDist::Failed(e),
-                };
-                cx.notify();
-                // Fresh probe so a post-install update badge appears.
-                app.probe_dist(true, cx);
+                match out {
+                    Ok(version) => {
+                        app.vibe_dist = crate::vibe_dist::VibeDist::Installed {
+                            version,
+                            managed: true,
+                        };
+                        cx.notify();
+                        if !upgrade {
+                            // The new binary may finally resolve
+                            // `server_binary` — retry the catalog so
+                            // existing sessions appear.
+                            app.refresh_sessions(cx);
+                        }
+                        // Fresh probe so a post-install update badge
+                        // appears. Only on success — a Failed state must
+                        // keep its error + retry action.
+                        app.probe_dist(true, cx);
+                    }
+                    Err(e) => {
+                        app.vibe_dist = crate::vibe_dist::VibeDist::Failed {
+                            upgrade,
+                            error: e,
+                        };
+                        cx.notify();
+                    }
+                }
             });
         })
         .detach();
@@ -205,27 +238,21 @@ impl VibeApp {
 
     /// OS notification for a session event the user probably missed —
     /// suppressed while the window is focused on that session, and by
-    /// `VIBE_DESKTOP_NO_NOTIFY` (CI/headless runs).
-    pub fn notify_attention(&mut self, sid: &str, what: &str, cx: &mut Context<Self>) {
+    /// `VIBE_DESKTOP_NO_NOTIFY` (CI/headless runs). Caller supplies the
+    /// id + title: this runs inside another view's update, so it must
+    /// not read any session entity (`open_ids` is the reentrancy-safe
+    /// cache for exactly this).
+    pub fn notify_attention(&mut self, sid: &str, title: &str, what: &str) {
         if std::env::var_os("VIBE_DESKTOP_NO_NOTIFY").is_some() {
             return;
         }
-        let on_selected = self
-            .open
-            .get(self.selected)
-            .is_some_and(|v| v.read(cx).session_id() == sid);
+        let on_selected = self.open_ids.get(self.selected).map(String::as_str) == Some(sid);
         if self.window_active && on_selected {
             return;
         }
-        let title = self
-            .open
-            .iter()
-            .find(|v| v.read(cx).session_id() == sid)
-            .map(|v| v.read(cx).projection.state.session.display_title())
-            .unwrap_or_else(|| "vibe session".to_string());
         let _ = notify_rust::Notification::new()
             .appname("vibe desktop")
-            .summary(&title)
+            .summary(title)
             .body(what)
             .show();
     }

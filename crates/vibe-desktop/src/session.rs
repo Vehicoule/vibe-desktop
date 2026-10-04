@@ -2013,22 +2013,21 @@ impl SessionView {
                     .status
                     .label()
                     .to_string();
-                let resync = matches!(
-                    self.projection.on_notification(method, params),
-                    Reduce::Resync { .. }
-                );
-                if resync {
+                let reduce = self.projection.on_notification(method, params);
+                if matches!(reduce, Reduce::Resync { .. }) {
                     self.resync(cx);
                 }
-                // Attention pings: a session going blocked (approval
-                // waiting) or finishing a turn while you're not looking
-                // at it.
-                if narrate_turn.is_some() {
-                    self.notify_attention("turn finished", cx);
-                } else {
-                    let now = self.projection.state.session.status.label();
-                    if now != prev_status && now == "blocked" {
-                        self.notify_attention("needs attention — approval waiting", cx);
+                // Attention pings — only for events the projection
+                // actually accepted (a stale-watermark duplicate or a
+                // resync-buffered event must not alert).
+                if matches!(reduce, Reduce::Applied) {
+                    if narrate_turn.is_some() {
+                        self.notify_attention("turn finished", cx);
+                    } else {
+                        let now = self.projection.state.session.status.label();
+                        if now != prev_status && now == "blocked" {
+                            self.notify_attention("needs attention — approval waiting", cx);
+                        }
                     }
                 }
                 if session_updated && self.pending_agent.is_some() {
@@ -2063,8 +2062,9 @@ impl SessionView {
     fn notify_attention(&self, what: &str, cx: &mut Context<Self>) {
         if let Some(app) = self.app.as_ref().and_then(|w| w.upgrade()) {
             let sid = self.session_id().to_string();
+            let title = self.projection.state.session.display_title();
             let what = what.to_string();
-            app.update(cx, |app, cx| app.notify_attention(&sid, &what, cx));
+            app.update(cx, |app, _| app.notify_attention(&sid, &title, &what));
         }
     }
 

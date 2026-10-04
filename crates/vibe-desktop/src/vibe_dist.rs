@@ -23,7 +23,9 @@ pub enum VibeDist {
     UpdateAvailable { installed: String, latest: String },
     Installing,
     Updating,
-    Failed(String),
+    /// `upgrade` remembers which op failed so retry re-runs it, not the
+    /// other one.
+    Failed { upgrade: bool, error: String },
 }
 
 impl VibeDist {
@@ -39,25 +41,25 @@ impl VibeDist {
             }
             Self::Installing => "vibe: installing…".into(),
             Self::Updating => "vibe: updating…".into(),
-            Self::Failed(e) => format!("vibe: {e}"),
+            Self::Failed { error, .. } => format!("vibe: {error}"),
         }
     }
 }
 
 /// Root of the managed distribution: `$XDG_DATA_HOME/vibe-desktop/vibe`
 /// or `~/.local/share/vibe-desktop/vibe`; `VIBE_DESKTOP_DIST` overrides
-/// (tests point it at a tempdir).
-pub fn dist_root() -> PathBuf {
+/// (tests point it at a tempdir). `None` when no per-user data dir
+/// resolves — deliberately never a shared `/tmp` path, where another
+/// local user could plant a server binary we'd then execute.
+pub fn dist_root() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("VIBE_DESKTOP_DIST") {
-        return PathBuf::from(p);
+        return Some(PathBuf::from(p));
     }
     if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
-        return Path::new(&x).join("vibe-desktop/vibe");
+        return Some(Path::new(&x).join("vibe-desktop/vibe"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return Path::new(&home).join(".local/share/vibe-desktop/vibe");
-    }
-    PathBuf::from("/tmp/vibe-desktop-vibe")
+    std::env::var_os("HOME")
+        .map(|h| Path::new(&h).join(".local/share/vibe-desktop/vibe"))
 }
 
 /// `vibe-app-server` inside the managed tool env.
@@ -165,8 +167,18 @@ pub async fn latest_version() -> Option<String> {
 }
 
 /// `uv tool install mistral-vibe` into the managed env.
+///
+/// Pins the release PyPI reports (the same one `probe` would offer) —
+/// installs resolve a named release instead of floating `latest`.
+/// `--force` repairs a tool entry whose binary went missing. uv itself
+/// verifies artifacts against index metadata; there is no
+/// per-artifact hash pinning for `uv tool install`.
 pub async fn install(uv: &Path, root: &Path) -> Result<String, String> {
-    run_uv(uv, root, &["tool", "install", "mistral-vibe"]).await?;
+    let spec = latest_version()
+        .await
+        .map(|v| format!("mistral-vibe=={v}"))
+        .unwrap_or_else(|| "mistral-vibe".to_string());
+    run_uv(uv, root, &["tool", "install", "--force", &spec]).await?;
     installed_version(uv, root)
         .await
         .ok_or_else(|| "install finished but mistral-vibe is not listed".to_string())
@@ -194,45 +206,61 @@ async fn run_uv(uv: &Path, root: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// Resolve the state in one pass: binary presence + managed version +
-/// PyPI latest (when `check_latest`).
+/// Resolve the state in one pass, mirroring `server_binary`'s order —
+/// the rail row describes the binary the app would actually run:
+/// env override → managed install → system → nothing.
 pub async fn probe(check_latest: bool) -> VibeDist {
-    let root = dist_root();
-    let managed_bin = managed_binary(&root);
-    let managed_present = managed_bin.is_file();
-    // A user-managed env override or system install still counts as
-    // "installed" — the managed layer only fills the gap.
-    let system_present = std::env::var("VIBE_APP_SERVER").is_ok()
-        || std::env::var_os("HOME")
-            .map(|h| Path::new(&h).join(".local/bin/vibe-app-server").exists())
-            .unwrap_or(false)
-        || which("vibe-app-server").is_some();
-    let Some(uv) = uv_binary() else {
-        return if system_present {
-            VibeDist::Installed {
-                version: "unknown".into(),
-                managed: false,
-            }
-        } else {
-            VibeDist::NoUv
+    // `VIBE_APP_SERVER` wins outright in `server_binary`: the app never
+    // runs the managed copy, so don't offer updates for it.
+    if std::env::var("VIBE_APP_SERVER").is_ok() {
+        return VibeDist::Installed {
+            version: "unknown".into(),
+            managed: false,
+        };
+    }
+    let Some(root) = dist_root() else {
+        return VibeDist::Failed {
+            upgrade: false,
+            error: "no data directory (HOME/XDG_DATA_HOME unset)".into(),
         };
     };
-    let version = installed_version(&uv, &root).await;
-    if !managed_present && !system_present && version.is_none() {
-        return VibeDist::Missing;
-    }
-    let installed = version.unwrap_or_else(|| "unknown".into());
-    if check_latest && installed != "unknown" {
-        if let Some(latest) = latest_version().await {
-            if newer_than(&latest, &installed) {
-                return VibeDist::UpdateAvailable { installed, latest };
+    let uv = uv_binary();
+    let managed_version = match &uv {
+        Some(u) => installed_version(u, &root).await,
+        None => None,
+    };
+    // A runnable managed binary reports installed even without uv — uv
+    // only gates install/update, not the probe. A `tool list` entry
+    // whose binary is gone does NOT count: that's a broken install the
+    // install CTA repairs via `--force`.
+    if managed_binary(&root).is_file() {
+        let installed = managed_version.unwrap_or_else(|| "unknown".into());
+        if check_latest && installed != "unknown" {
+            if let Some(latest) = latest_version().await {
+                if newer_than(&latest, &installed) {
+                    return VibeDist::UpdateAvailable { installed, latest };
+                }
             }
         }
+        return VibeDist::Installed {
+            version: installed,
+            managed: true,
+        };
     }
-    VibeDist::Installed {
-        version: installed,
-        managed: managed_present,
+    let system_present = std::env::var_os("HOME")
+        .map(|h| Path::new(&h).join(".local/bin/vibe-app-server").exists())
+        .unwrap_or(false)
+        || which("vibe-app-server").is_some();
+    if system_present {
+        return VibeDist::Installed {
+            version: "unknown".into(),
+            managed: false,
+        };
     }
+    if uv.is_none() {
+        return VibeDist::NoUv;
+    }
+    VibeDist::Missing
 }
 
 #[cfg(test)]
