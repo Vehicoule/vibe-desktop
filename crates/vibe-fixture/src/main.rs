@@ -1890,18 +1890,49 @@ async fn main() {
                 respond(json!({"status": "applied"})).await;
             }
             "agents/list" => {
-                respond(json!({
-                    "active": {"name": "build", "displayName": "Build", "description": "Edits code freely", "safety": "neutral", "agentType": "agent"},
-                    "agents": [
-                        {"name": "build", "displayName": "Build", "description": "Edits code freely", "safety": "neutral", "agentType": "agent"},
-                        {"name": "plan", "displayName": "Plan", "description": "Read-only planning", "safety": "safe", "agentType": "agent"},
-                        {"name": "accept-edits", "displayName": "Accept Edits", "description": "Auto-approves edits", "safety": "yolo", "agentType": "agent"},
-                    ]
-                }))
-                .await;
+                let agents = json!([
+                    {"name": "build", "displayName": "Build", "description": "Edits code freely", "safety": "neutral", "agentType": "agent"},
+                    {"name": "plan", "displayName": "Plan", "description": "Read-only planning", "safety": "safe", "agentType": "agent"},
+                    {"name": "accept-edits", "displayName": "Accept Edits", "description": "Auto-approves edits", "safety": "yolo", "agentType": "agent"},
+                ]);
+                // Applied switches persist per session — an unconditional
+                // "build" here would visually revert the user's pick.
+                let sid = params["sessionId"].as_str().unwrap_or("saved-aaaa1111");
+                let active_name = if store_safe_id(sid) {
+                    read_overlay(&store, &format!("agent_{sid}.json"))
+                        .get("active")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("build")
+                        .to_string()
+                } else {
+                    "build".to_string()
+                };
+                let active = agents.as_array().into_iter().flatten()
+                    .find(|a| a["name"].as_str() == Some(active_name.as_str()))
+                    .cloned().unwrap_or_else(|| agents[0].clone());
+                respond(json!({"active": active, "agents": agents})).await;
             }
             "session/agent/update" => {
-                respond(json!({"status": "applied"})).await;
+                let name = params["agentName"]
+                    .as_str()
+                    .or_else(|| params["name"].as_str())
+                    .or_else(|| params["agent"].as_str());
+                let known = ["build", "plan", "accept-edits"];
+                match name {
+                    Some(n) if known.contains(&n) => {
+                        let sid = params["sessionId"].as_str().unwrap_or("saved-aaaa1111");
+                        if store_safe_id(sid) {
+                            let mut ov = read_overlay(&store, &format!("agent_{sid}.json"));
+                            ov.insert("active".to_string(), json!(n));
+                            if !persist_overlay(&store, &format!("agent_{sid}.json"), &ov).await {
+                                respond_err("internal_error", "fixture: agent persist failed").await;
+                                continue;
+                            }
+                        }
+                        respond(json!({"status": "applied"})).await;
+                    }
+                    _ => respond_err("invalid_params", "fixture: unknown agent").await,
+                }
             }
             "narration/summarize" => {
                 respond(json!({"summary": format!("Fixture narration: {}",
