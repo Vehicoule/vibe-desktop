@@ -1073,7 +1073,7 @@ impl SessionView {
         let Some(root) = self.link_root() else {
             return;
         };
-        if !self.link_inflight.insert("link".to_string()) {
+        if !self.link_inflight.insert("mutate".to_string()) {
             return;
         }
         let conn = self.conn.clone();
@@ -1083,12 +1083,15 @@ impl SessionView {
                 .project_links_link(&root, &project_id, &project_name)
                 .await;
             let _ = this.update(cx, |view, cx| {
-                view.link_inflight.remove("link");
+                view.link_inflight.remove("mutate");
                 if view.session_id() != sid {
                     return;
                 }
                 match resp {
-                    Ok(_) => view.load_link(cx),
+                    Ok(_) => {
+                        view.mark_linked(&root, true, cx);
+                        view.load_link(cx);
+                    }
                     Err(e) => view.error = Some(format!("link failed: {e}")),
                 }
                 cx.notify();
@@ -1103,7 +1106,7 @@ impl SessionView {
         let Some(root) = self.link_root() else {
             return;
         };
-        if !self.link_inflight.insert("save".to_string()) {
+        if !self.link_inflight.insert("mutate".to_string()) {
             return;
         }
         let expected = self
@@ -1119,12 +1122,15 @@ impl SessionView {
                 .project_links_save(&root, &project_id, &project_name, expected.as_deref())
                 .await;
             let _ = this.update(cx, |view, cx| {
-                view.link_inflight.remove("save");
+                view.link_inflight.remove("mutate");
                 if view.session_id() != sid {
                     return;
                 }
                 match resp {
-                    Ok(_) => view.load_link(cx),
+                    Ok(_) => {
+                        view.mark_linked(&root, true, cx);
+                        view.load_link(cx);
+                    }
                     Err(e) => view.error = Some(format!("link save failed: {e}")),
                 }
                 cx.notify();
@@ -1140,7 +1146,7 @@ impl SessionView {
         let Some(root) = self.link_root() else {
             return;
         };
-        if name.is_empty() || !self.link_inflight.insert("create".to_string()) {
+        if name.is_empty() || !self.link_inflight.insert("mutate".to_string()) {
             return;
         }
         let branch = self
@@ -1155,13 +1161,14 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.project_links_create(&root, &name, &branch).await;
             let _ = this.update(cx, |view, cx| {
-                view.link_inflight.remove("create");
+                view.link_inflight.remove("mutate");
                 if view.session_id() != sid {
                     return;
                 }
                 match resp {
                     Ok(_) => {
                         view.link_name_input.clear();
+                        view.mark_linked(&root, true, cx);
                         view.load_link(cx);
                     }
                     Err(e) => view.error = Some(format!("link create failed: {e}")),
@@ -1177,7 +1184,7 @@ impl SessionView {
         let Some(root) = self.link_root() else {
             return;
         };
-        if !self.link_inflight.insert("unlink".to_string()) {
+        if !self.link_inflight.insert("mutate".to_string()) {
             return;
         }
         let conn = self.conn.clone();
@@ -1185,12 +1192,15 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.project_links_unlink(&root).await;
             let _ = this.update(cx, |view, cx| {
-                view.link_inflight.remove("unlink");
+                view.link_inflight.remove("mutate");
                 if view.session_id() != sid {
                     return;
                 }
                 match resp {
-                    Ok(_) => view.load_link(cx),
+                    Ok(_) => {
+                        view.mark_linked(&root, false, cx);
+                        view.load_link(cx);
+                    }
                     Err(e) => view.error = Some(format!("link unlink failed: {e}")),
                 }
                 cx.notify();
@@ -1210,7 +1220,25 @@ impl SessionView {
         cx.notify();
     }
 
-    /// A link op is in flight (`"inspect"`, `"load"`, `"link"`, ...).
+    /// Update the rail's linked-dir set after a mutation so the marker
+    /// appears/disappears without waiting for a catalog refresh.
+    fn mark_linked(&mut self, root: &str, linked: bool, cx: &mut Context<Self>) {
+        if let Some(app) = self.app.as_ref().and_then(|w| w.upgrade()) {
+            let root = root.to_string();
+            app.update(cx, |app, cx| {
+                if linked {
+                    app.linked_dirs.insert(root);
+                } else {
+                    app.linked_dirs.remove(&root);
+                }
+                cx.notify();
+            });
+        }
+    }
+
+    /// A link op is in flight. `"mutate"` covers link/save/create/unlink
+    /// — one guard for all of them so concurrent choices can't interleave
+    /// server-side writes for the same root.
     pub fn link_busy(&self, key: &str) -> bool {
         self.link_inflight.contains(key)
     }

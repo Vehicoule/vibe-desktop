@@ -516,17 +516,70 @@ async fn read_json_map(store: &std::path::Path, name: &str) -> serde_json::Map<S
         .unwrap_or_default()
 }
 
-/// Atomic write of an object-valued map (tmp + rename).
+/// Atomic write of an object-valued map (unique tmp + rename — two
+/// fixture processes can't collide on the temp path).
 async fn write_json_map(
     store: &std::path::Path,
     name: &str,
     map: &serde_json::Map<String, Value>,
 ) -> bool {
-    let tmp = store.join(format!("{name}.tmp"));
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = store.join(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     tokio::fs::write(&tmp, serde_json::to_string(map).unwrap_or_default())
         .await
         .is_ok()
         && tokio::fs::rename(&tmp, store.join(name)).await.is_ok()
+}
+
+/// Cross-process lock for stored-map mutation: catalog + attached
+/// session processes share the store, so a read-modify-write has to be
+/// serialized file-side, not by an in-process mutex. Uses an
+/// exclusive-create lockfile (released on drop).
+struct MapLock(std::path::PathBuf);
+
+async fn map_lock(store: &std::path::Path, name: &str) -> MapLock {
+    let path = store.join(format!("{name}.lock"));
+    for _ in 0..400 {
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .is_ok()
+        {
+            return MapLock(path);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // 10s of contention is a deadlock or a stale lock — proceed rather
+    // than wedge the fixture (the unique-tmp write stays atomic).
+    MapLock(path)
+}
+
+impl Drop for MapLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Lock + read + mutate + atomic write of a stored map; `None` when the
+/// persist step fails.
+async fn update_json_map<R>(
+    store: &std::path::Path,
+    name: &str,
+    f: impl FnOnce(&mut serde_json::Map<String, Value>) -> R,
+) -> Option<R> {
+    let _guard = map_lock(store, name).await;
+    let mut map = read_json_map(store, name).await;
+    let out = f(&mut map);
+    if write_json_map(store, name, &map).await {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Canned `VibeCodePickerView` — two cloud projects (+ one on loadMore),
@@ -2583,20 +2636,31 @@ async fn main() {
                     "projectId": pid, "projectName": pname, "directoryPath": root,
                     "hasCommits": true,
                 });
-                let mut links = read_json_map(&store, "project_links.json").await;
-                links.insert(root, link.clone());
-                if write_json_map(&store, "project_links.json", &links).await {
+                // Locked read-modify-write — two fixture processes share
+                // the store, so a plain read-then-write loses bindings.
+                if update_json_map(&store, "project_links.json", |links| {
+                    links.insert(root, link.clone());
+                })
+                .await
+                .is_some()
+                {
                     respond(json!({"link": link})).await;
                 } else {
                     respond_err("internal_error", "fixture: link persist failed").await;
                 }
             }
             "projectLinks/unlink" => {
-                let root = params["rootPath"].as_str().unwrap_or("/tmp");
-                let mut links = read_json_map(&store, "project_links.json").await;
-                links.remove(root);
-                let _ = write_json_map(&store, "project_links.json", &links).await;
-                respond(json!({"unlinked": true})).await;
+                let root = params["rootPath"].as_str().unwrap_or("/tmp").to_string();
+                if update_json_map(&store, "project_links.json", |links| {
+                    links.remove(&root);
+                })
+                .await
+                .is_some()
+                {
+                    respond(json!({"unlinked": true})).await;
+                } else {
+                    respond_err("internal_error", "fixture: unlink persist failed").await;
+                }
             }
             "runtime/read" => {
                 respond(json!({

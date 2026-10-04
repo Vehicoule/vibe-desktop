@@ -162,9 +162,12 @@ impl VibeApp {
             // Linked-dir marker: the session's cwd sits inside (or above)
             // a directory bound to a remote project (`projectLinks`).
             let linked = s.cwd.as_deref().is_some_and(|cwd| {
-                self.linked_dirs
-                    .iter()
-                    .any(|d| cwd.starts_with(d.as_str()) || d.starts_with(cwd))
+                self.linked_dirs.iter().any(|d| {
+                    // Path::starts_with compares components —
+                    // `/tmp/project-backup` is NOT inside `/tmp/project`.
+                    std::path::Path::new(cwd).starts_with(d)
+                        || std::path::Path::new(d).starts_with(cwd)
+                })
             });
             if self.renaming.as_deref() == Some(s.id.as_str()) {
                 // Inline rename field replaces the title row.
@@ -1904,7 +1907,7 @@ impl SessionView {
                         10.5,
                         c(theme::AMBER),
                     ));
-                if !self.link_busy("unlink") {
+                if !self.link_busy("mutate") {
                     row = row.child(
                         ghost_button("link-unlink", "unlink")
                             .on_click(cx.listener(|v, _e, _w, cx| v.link_remove(cx))),
@@ -1945,7 +1948,7 @@ impl SessionView {
                             .items_center()
                             .gap_2()
                             .child(text(name, 11.0, c(theme::INK)));
-                        if !self.link_busy("link") {
+                        if !self.link_busy("mutate") {
                             row = row.child(
                                 div()
                                     .id(SharedString::from(format!("link-{}", cand.project_id)))
@@ -1962,7 +1965,7 @@ impl SessionView {
                                     })),
                             );
                         }
-                        if !self.link_busy("save") {
+                        if !self.link_busy("mutate") {
                             row = row.child(
                                 div()
                                     .id(SharedString::from(format!(
@@ -2043,7 +2046,7 @@ impl SessionView {
                     .on_click(cx.listener(|v, _e, window, _cx| {
                         window.focus(&v.link_focus);
                     }));
-                if !self.link_busy("create") {
+                if !self.link_busy("mutate") {
                     create_row = create_row.child(
                         ghost_button("link-create-btn", "create + link")
                             .on_click(cx.listener(|v, _e, _w, cx| v.link_create(cx))),
