@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use gpui::{AsyncApp, Context, FocusHandle, Task, WeakEntity};
+use gpui::{AsyncApp, Context, FocusHandle, ScrollHandle, Task, WeakEntity};
 use vibe_protocol::client::{ClientError, ClientResult, Connection};
 use vibe_protocol::models::*;
 use vibe_protocol::projection::{Projection, Reduce};
@@ -183,6 +183,10 @@ pub struct SessionView {
     /// Cloud sheet — `vibeCode/projects` picker + teleport run +
     /// session relocate. Open/closed toggle.
     pub cloud_open: bool,
+    /// Timeline scroll position — per-view so session switches can't
+    /// bleed offset. Renders follow new entries only while the user is
+    /// at (or near) the bottom; a scrolled-up view is never dragged.
+    pub entries_scroll: ScrollHandle,
     /// Latest picker view (`vibeCode/projects/*` responses).
     pub picker: Option<VibeCodePickerView>,
     /// `pickerId` from `projects/open` — every picker call carries it.
@@ -337,6 +341,7 @@ impl SessionView {
             review_diff_gen: 0,
             review_inflight: HashSet::new(),
             cloud_open: false,
+            entries_scroll: ScrollHandle::new(),
             picker: None,
             picker_id: None,
             picker_selected: None,
@@ -462,27 +467,45 @@ impl SessionView {
         .detach();
     }
 
-    /// Close every pinned sheet except `keep`, running each surface's
-    /// real close path so nothing leaks: review's gens bump (pending
-    /// reads die), cloud's picker cancels server-side.
-    fn close_sheets_except(&mut self, keep: SheetSurface, cx: &mut Context<Self>) {
-        if keep != SheetSurface::Settings {
+    /// Close every pinned sheet except `keep` (`None` closes all of
+    /// them), running each surface's real close path so nothing leaks:
+    /// review's gens bump (pending reads die), cloud's picker cancels
+    /// server-side and drops the link snapshot.
+    fn close_sheets_except(&mut self, keep: Option<SheetSurface>, cx: &mut Context<Self>) {
+        if keep != Some(SheetSurface::Settings) {
             self.settings_open = false;
         }
-        if keep != SheetSurface::Review && self.review_open {
+        if keep != Some(SheetSurface::Review) && self.review_open {
             self.review_open = false;
             self.review_state_gen += 1;
             self.review_diff_gen += 1;
         }
-        if keep != SheetSurface::Cloud && self.cloud_open {
+        if keep != Some(SheetSurface::Cloud) && self.cloud_open {
             self.cloud_open = false;
             let sid = self.session_id().to_string();
             self.close_picker(&sid, cx);
             self.clear_link();
         }
-        if keep != SheetSurface::Rewind {
+        if keep != Some(SheetSurface::Rewind) {
             self.rewind = None;
         }
+    }
+
+    /// Key handling on the session root — Escape closes whichever sheet
+    /// is open (at most one is ever up). Never interrupts: the composer
+    /// owns Escape-to-interrupt, and a bubbled event reaches here after
+    /// the composer already decided.
+    pub fn on_session_key(&mut self, e: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if e.keystroke.key.as_str() == "escape" {
+            self.close_sheets_except(None, cx);
+            cx.notify();
+        }
+    }
+
+    /// Any pinned sheet currently on screen — Escape resolves to
+    /// sheet-dismiss before it resolves to turn-interrupt.
+    pub fn any_sheet_open(&self) -> bool {
+        self.settings_open || self.review_open || self.cloud_open || self.rewind.is_some()
     }
 
     /// Settings sheet toggle — refreshes every section on every open so
@@ -490,7 +513,7 @@ impl SessionView {
     pub fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
         if self.settings_open {
-            self.close_sheets_except(SheetSurface::Settings, cx);
+            self.close_sheets_except(Some(SheetSurface::Settings), cx);
             self.load_settings(cx);
             self.load_worktrees(cx);
         }
@@ -824,7 +847,7 @@ impl SessionView {
     pub fn toggle_review(&mut self, cx: &mut Context<Self>) {
         self.review_open = !self.review_open;
         if self.review_open {
-            self.close_sheets_except(SheetSurface::Review, cx);
+            self.close_sheets_except(Some(SheetSurface::Review), cx);
             self.load_review(cx);
         } else {
             // Pending reads must not land after the sheet closed.
@@ -1169,7 +1192,7 @@ impl SessionView {
     pub fn toggle_cloud(&mut self, cx: &mut Context<Self>) {
         self.cloud_open = !self.cloud_open;
         if self.cloud_open {
-            self.close_sheets_except(SheetSurface::Cloud, cx);
+            self.close_sheets_except(Some(SheetSurface::Cloud), cx);
             self.relocate_input = self
                 .projection
                 .state
@@ -2797,7 +2820,7 @@ impl SessionView {
             restore_files: false,
             read_error: None,
         });
-        self.close_sheets_except(SheetSurface::Rewind, cx);
+        self.close_sheets_except(Some(SheetSurface::Rewind), cx);
         let conn = self.conn.clone();
         let session_id = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
