@@ -67,6 +67,71 @@ fn inner_default() -> SessionInner {
 /// File-backed session store shared by every fixture process — the real
 /// app-server persists sessions on disk, so a fork made on one connection
 /// must be resumable from a different process.
+/// Read a `{key: value}` overlay file from the store — returns an empty
+/// map when absent or unparsable (same tolerance as config_values).
+fn read_overlay(store: &std::path::Path, file: &str) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(store.join(file))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Write an overlay atomically (tmp + rename), like config_values.
+async fn persist_overlay(
+    store: &std::path::Path,
+    file: &str,
+    overlay: &serde_json::Map<String, Value>,
+) -> bool {
+    let tmp = store.join(format!("{file}.tmp"));
+    tokio::fs::write(&tmp, serde_json::to_string(overlay).unwrap_or_default())
+        .await
+        .is_ok()
+        && tokio::fs::rename(&tmp, store.join(file)).await.is_ok()
+}
+
+/// `skills/installed` view — defaults overlaid with skill_states.json
+/// (`{name: bool}` enabled overrides), so setEnabled round-trips.
+fn skills_value(store: &std::path::Path) -> Value {
+    let states = read_overlay(store, "skill_states.json");
+    let mut skills = json!([
+        {"name": "rust-conventions", "description": "Rust style rules", "userInvocable": true, "source": "local", "scope": "project", "enabled": true, "locked": false},
+        {"name": "vibe-release", "description": "Release checklist", "userInvocable": true, "source": "builtin", "scope": "builtin", "enabled": true, "locked": true},
+        {"name": "deploy-notes", "description": "Deploy runbook", "userInvocable": true, "source": "local", "scope": "global", "enabled": false, "locked": false},
+    ]);
+    for s in skills.as_array_mut().into_iter().flatten() {
+        let name = s["name"].as_str().unwrap_or_default();
+        if let Some(v) = states.get(name) {
+            s["enabled"] = v.clone();
+        }
+    }
+    skills
+}
+
+/// `mcp/read` view — sources overlaid with mcp_states.json
+/// (`{name: bool}` disabled flags); shared by read + toggle replies.
+fn mcp_state_value(store: &std::path::Path) -> Value {
+    let states = read_overlay(store, "mcp_states.json");
+    let mut sources = json!([
+        {"name": "fs", "displayName": "fs", "kind": "server", "transport": "stdio", "status": "enabled", "tools": [{"name": "read_file", "description": "", "enabled": true}]},
+        {"name": "github", "displayName": "GitHub", "kind": "server", "transport": "streamable-http", "status": "disabled", "tools": []},
+        {"name": "slack", "displayName": "Slack", "kind": "connector", "transport": "streamable-http", "status": "connected", "tools": [{"name": "send", "description": "", "enabled": true}]},
+    ]);
+    for s in sources.as_array_mut().into_iter().flatten() {
+        let name = s["name"].as_str().unwrap_or_default();
+        if let Some(disabled) = states.get(name).and_then(Value::as_bool) {
+            if s["kind"].as_str() == Some("connector") {
+                // Connector sources toggle connected↔disabled via
+                // connector_catalog/toggle.
+                s["status"] = json!(if disabled { "disabled" } else { "connected" });
+            } else if matches!(s["status"].as_str(), Some("enabled" | "disabled")) {
+                s["status"] = json!(if disabled { "disabled" } else { "enabled" });
+            }
+        }
+    }
+    json!({"sources": sources, "discoveryErrors": {}, "connectorError": null, "manageConnectorsUrl": null})
+}
+
 fn store_dir() -> std::path::PathBuf {
     std::env::var("VIBE_FIXTURE_STORE")
         .map(std::path::PathBuf::from)
@@ -403,8 +468,18 @@ type Sessions = Arc<tokio::sync::Mutex<BTreeMap<String, Arc<SessionData>>>>;
 type PendingCallbacks = Arc<tokio::sync::Mutex<BTreeMap<String, (Arc<SessionData>, u64, String)>>>;
 type Tx = tokio::sync::mpsc::Sender<String>;
 
+/// The canned demo catalog rows: `(id, cwd, archived)`. `session/read`
+/// and `session/resume` serve these without a store record, so
+/// session-scoped handlers couldn't resolve them — the tombstone-aware
+/// materialization in `find_session` keeps them live until deleted.
+const CANNED_SESSIONS: &[(&str, &str, bool)] = &[
+    ("saved-aaaa1111", "/tmp/project-a", false),
+    ("saved-bbbb2222", "/tmp/project-b", true),
+];
+
 /// Session lookup: in-memory first, then the shared store — a session may
-/// live in a different fixture process (forks, earlier runs).
+/// live in a different fixture process (forks, earlier runs) — then a
+/// canned catalog row materializes while it isn't tombstoned.
 async fn find_session(
     sessions: &Sessions,
     store: &std::path::Path,
@@ -413,7 +488,32 @@ async fn find_session(
     if let Some(d) = sessions.lock().await.get(sid).cloned() {
         return Some(d);
     }
-    SessionData::load(store, sid).await
+    if let Some(d) = SessionData::load(store, sid).await {
+        return Some(d);
+    }
+    // A canned row's first session-scoped touch materializes it (same as
+    // pin/archive do for any safe id) — unless a tombstone says it's
+    // deleted, in which case it stays unresolvable.
+    let (_, cwd, archived) = CANNED_SESSIONS.iter().find(|(id, ..)| *id == sid)?;
+    let tombstoned = tokio::fs::read_to_string(store.join(format!("{sid}.json")))
+        .await
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|v| v["deleted"] == true);
+    if tombstoned {
+        return None;
+    }
+    let mut session = session_value(
+        sid,
+        cwd,
+        json!({"type": if *archived { "archived" } else { "idle" }}),
+    );
+    if *archived && session["archivedAt"].is_null() {
+        session["archivedAt"] = json!(1_700_000_000);
+    }
+    let d = Arc::new(SessionData::new(session, store.to_path_buf()));
+    sessions.lock().await.insert(sid.to_string(), d.clone());
+    Some(d)
 }
 
 /// Emit a `session/updated` JSON-patch notification (claiming its event id).
@@ -1005,14 +1105,13 @@ async fn main() {
                         }
                     }
                 }
-                for mut demo in [
-                    session_value("saved-aaaa1111", "/tmp/project-a", json!({"type": "idle"})),
+                for mut demo in CANNED_SESSIONS.iter().map(|(id, cwd, archived)| {
                     session_value(
-                        "saved-bbbb2222",
-                        "/tmp/project-b",
-                        json!({"type": "archived"}),
-                    ),
-                ] {
+                        id,
+                        cwd,
+                        json!({"type": if *archived { "archived" } else { "idle" }}),
+                    )
+                }) {
                     // An archived row carries `archivedAt` — the rail reads
                     // the timestamp to decide archive vs unarchive.
                     if demo["status"]["type"] == json!("archived") && demo["archivedAt"].is_null() {
@@ -1449,6 +1548,8 @@ async fn main() {
                         json!({"session": {"id": sid}, "deleted": true}).to_string(),
                     )
                     .await;
+                    // Session-scoped overlays die with their session.
+                    let _ = tokio::fs::remove_file(store.join(format!("agent_{sid}.json"))).await;
                 }
                 respond(json!({})).await;
             }
@@ -1788,13 +1889,7 @@ async fn main() {
             "config/fields/read" => {
                 // Writes persist to config_values.json so a later read
                 // reflects them — the round-trip must be observable.
-                let overlays: serde_json::Map<String, Value> = std::fs::read_to_string(
-                    store.join("config_values.json"),
-                )
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
+                let overlays = read_overlay(&store, "config_values.json");
                 let mut fields = json!([
                     {"name": "enable_notifications", "kind": "bool", "description": "Desktop notifications", "value": true, "path": "enable_notifications", "popular": true, "enumChoices": [], "valueLabels": {}, "layerValues": [{"layer": "user", "value": true}]},
                     {"name": "theme", "kind": "enum", "description": "UI theme", "value": "vibe", "path": "theme", "popular": true, "enumChoices": ["vibe", "light", "dark"], "valueLabels": {}, "layerValues": [{"layer": "default", "value": "vibe"}]},
@@ -1810,13 +1905,7 @@ async fn main() {
                     .await;
             }
             "config/write" => {
-                let mut overlays: serde_json::Map<String, Value> = std::fs::read_to_string(
-                    store.join("config_values.json"),
-                )
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
+                let mut overlays = read_overlay(&store, "config_values.json");
                 for op in params["ops"].as_array().into_iter().flatten() {
                     let path = op["path"].as_str().unwrap_or_default();
                     match op["op"].as_str() {
@@ -1829,13 +1918,7 @@ async fn main() {
                         _ => {}
                     }
                 }
-                let tmp = store.join("config_values.json.tmp");
-                let persisted = tokio::fs::write(&tmp, serde_json::to_string(&overlays).unwrap_or_default())
-                    .await
-                    .is_ok()
-                    && tokio::fs::rename(&tmp, store.join("config_values.json"))
-                        .await
-                        .is_ok();
+                let persisted = persist_overlay(&store, "config_values.json", &overlays).await;
                 if persisted {
                     respond(json!({"rejected": false, "failures": [], "status": "applied"})).await;
                 } else {
@@ -1846,18 +1929,63 @@ async fn main() {
                 respond(json!({"status": "applied"})).await;
             }
             "agents/list" => {
-                respond(json!({
-                    "active": {"name": "build", "displayName": "Build", "description": "Edits code freely", "safety": "neutral", "agentType": "agent"},
-                    "agents": [
-                        {"name": "build", "displayName": "Build", "description": "Edits code freely", "safety": "neutral", "agentType": "agent"},
-                        {"name": "plan", "displayName": "Plan", "description": "Read-only planning", "safety": "safe", "agentType": "agent"},
-                        {"name": "accept-edits", "displayName": "Accept Edits", "description": "Auto-approves edits", "safety": "yolo", "agentType": "agent"},
-                    ]
-                }))
-                .await;
+                let agents = json!([
+                    {"name": "build", "displayName": "Build", "description": "Edits code freely", "safety": "neutral", "agentType": "agent"},
+                    {"name": "plan", "displayName": "Plan", "description": "Read-only planning", "safety": "safe", "agentType": "agent"},
+                    {"name": "accept-edits", "displayName": "Accept Edits", "description": "Auto-approves edits", "safety": "yolo", "agentType": "agent"},
+                ]);
+                // Applied switches persist per session — an unconditional
+                // "build" here would visually revert the user's pick. The
+                // session must exist: unknown/deleted ids get not_found.
+                let Some(sid) = params["sessionId"].as_str() else {
+                    respond_err("invalid_params", "fixture: sessionId required").await;
+                    continue;
+                };
+                if find_session(&sessions, &store, sid).await.is_none() {
+                    respond_err("not_found", "session").await;
+                    continue;
+                }
+                let active_name = read_overlay(&store, &format!("agent_{sid}.json"))
+                    .get("active")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("build")
+                    .to_string();
+                let active = agents.as_array().into_iter().flatten()
+                    .find(|a| a["name"].as_str() == Some(active_name.as_str()))
+                    .cloned().unwrap_or_else(|| agents[0].clone());
+                respond(json!({"active": active, "agents": agents})).await;
             }
             "session/agent/update" => {
-                respond(json!({"status": "applied"})).await;
+                let name = params["agentName"]
+                    .as_str()
+                    .or_else(|| params["name"].as_str())
+                    .or_else(|| params["agent"].as_str());
+                let known = ["build", "plan", "accept-edits"];
+                let sid = params["sessionId"].as_str();
+                // `applied` is only honest after the choice is persisted
+                // for a session that actually exists — unsafe or unknown
+                // ids must fail, not silently report success.
+                match (name, sid) {
+                    (Some(n), Some(sid)) if known.contains(&n) => {
+                        if !store_safe_id(sid)
+                            || find_session(&sessions, &store, sid).await.is_none()
+                        {
+                            respond_err("not_found", "session").await;
+                            continue;
+                        }
+                        let mut ov = read_overlay(&store, &format!("agent_{sid}.json"));
+                        ov.insert("active".to_string(), json!(n));
+                        if !persist_overlay(&store, &format!("agent_{sid}.json"), &ov).await {
+                            respond_err("internal_error", "fixture: agent persist failed").await;
+                            continue;
+                        }
+                        respond(json!({"status": "applied"})).await;
+                    }
+                    (Some(_), Some(_)) => {
+                        respond_err("invalid_params", "fixture: unknown agent").await
+                    }
+                    _ => respond_err("invalid_params", "fixture: agentName/sessionId required").await,
+                }
             }
             "narration/summarize" => {
                 respond(json!({"summary": format!("Fixture narration: {}",
@@ -1869,13 +1997,7 @@ async fn main() {
                 // approve/revert on a file target resolves it off the
                 // pending list (all regions decided ⇒ nothing left to
                 // review), so the round-trip is observable.
-                let decisions: serde_json::Map<String, Value> = std::fs::read_to_string(
-                    store.join("review_decisions.json"),
-                )
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
+                let decisions = read_overlay(&store, "review_decisions.json");
                 let pending = |path: &str| !decisions.contains_key(path);
                 // Materialize the ownerless file under the session cwd —
                 // the app's whole-file preview reads its current side
@@ -1961,13 +2083,7 @@ async fn main() {
             }
             "review/approve" | "review/revert" => {
                 let decision = if method == "review/approve" { "keep" } else { "revert" };
-                let mut decisions: serde_json::Map<String, Value> = std::fs::read_to_string(
-                    store.join("review_decisions.json"),
-                )
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
+                let mut decisions = read_overlay(&store, "review_decisions.json");
                 // Resolve the target's paths — file/scopeFile name one,
                 // all covers the whole pending list; other kinds accept
                 // but decide nothing (unmodeled granularity).
@@ -1985,18 +2101,84 @@ async fn main() {
                 for p in paths {
                     decisions.insert(p, Value::String(decision.to_string()));
                 }
-                let tmp = store.join("review_decisions.json.tmp");
-                let persisted = tokio::fs::write(&tmp, serde_json::to_string(&decisions).unwrap_or_default())
-                    .await
-                    .is_ok()
-                    && tokio::fs::rename(&tmp, store.join("review_decisions.json"))
-                        .await
-                        .is_ok();
-                if persisted {
+                if persist_overlay(&store, "review_decisions.json", &decisions).await {
                     respond(json!({})).await;
                 } else {
                     respond_err("internal_error", "fixture: review persist failed").await;
                 }
+            }
+            "skills/installed" => {
+                respond(json!({"skills": skills_value(&store)})).await;
+            }
+            "skills/setEnabled" => {
+                // RuntimeMutationResponse-shaped; persists so installed
+                // reads reflect the toggle. Locked skills reject, same
+                // as upstream `_require_toggleable`.
+                let mut states = read_overlay(&store, "skill_states.json");
+                let name = params["name"].as_str().unwrap_or_default();
+                let skill = skills_value(&store).as_array().into_iter().flatten().find(|s| s["name"].as_str() == Some(name)).cloned();
+                match skill {
+                    None => {
+                        respond_err("invalid_params", "fixture: unknown skill").await;
+                        continue;
+                    }
+                    Some(s) if s["locked"].as_bool().unwrap_or(false) => {
+                        respond(json!({"rejected": true, "failures": [format!("fixture: skill `{name}` is locked")], "status": null})).await;
+                        continue;
+                    }
+                    _ => {}
+                }
+                states.insert(name.to_string(), params["enabled"].clone());
+                if persist_overlay(&store, "skill_states.json", &states).await {
+                    respond(json!({"status": "applied"})).await;
+                } else {
+                    respond_err("internal_error", "fixture: skill persist failed").await;
+                }
+            }
+            "mcp/read" => {
+                respond(json!({"mcp": mcp_state_value(&store)})).await;
+            }
+            "mcp/toggle" => {
+                let mut states = read_overlay(&store, "mcp_states.json");
+                let name = params["name"].as_str().unwrap_or_default();
+                states.insert(name.to_string(), params["disabled"].clone());
+                if persist_overlay(&store, "mcp_states.json", &states).await {
+                    respond(json!({"runtime": {"mcp": mcp_state_value(&store)}})).await;
+                } else {
+                    respond_err("internal_error", "fixture: mcp persist failed").await;
+                }
+            }
+            "connector_catalog/toggle" => {
+                // Connector sources share the mcp_states overlay, keyed
+                // by alias — upstream routes them off mcp/toggle.
+                let mut states = read_overlay(&store, "mcp_states.json");
+                let name = params["alias"].as_str().unwrap_or_default();
+                states.insert(name.to_string(), params["disabled"].clone());
+                if persist_overlay(&store, "mcp_states.json", &states).await {
+                    respond(json!({"runtime": {"mcp": mcp_state_value(&store)}})).await;
+                } else {
+                    respond_err("internal_error", "fixture: connector persist failed").await;
+                }
+            }
+            "connectors/read" => {
+                respond(json!({"counts": {"connected": 2, "total": 5}})).await;
+            }
+            "plugins/read" => {
+                respond(json!({"plugins": {
+                    "plugins": [{
+                        "name": "acme-pack",
+                        "version": "1.2.0",
+                        "sourceFormat": "claude_code",
+                        "manifestDigest": "d1",
+                        "description": "ACME tools pack",
+                        "author": null,
+                        "scope": "global",
+                        "components": [{"kind": "skill", "name": "acme-skill"}],
+                        "drifted": 0
+                    }],
+                    "dropped": []
+                }}))
+                .await;
             }
             "runtime/read" => {
                 respond(json!({

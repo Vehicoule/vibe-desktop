@@ -111,6 +111,26 @@ pub struct SessionView {
     /// Config paths with an in-flight `config/write` — repeat clicks
     /// during the write would send the same value again.
     cfg_inflight: HashSet<String>,
+    /// Installed skills (`skills/installed`).
+    pub ext_skills: Vec<SkillSummary>,
+    /// Skill names with a pending `skills/setEnabled`, mapped to the
+    /// requested enabled state — cleared once a refreshed list confirms it.
+    pending_skills: HashMap<String, bool>,
+    /// MCP catalog state (`mcp/read`).
+    pub mcp_state: Option<MCPState>,
+    /// Connector counts (`connectors/read`).
+    pub connector_counts: Option<ConnectorCounts>,
+    /// Plugin catalog (`plugins/read`) + dropped descriptors.
+    pub plugins: Vec<PluginCatalogEntry>,
+    pub plugin_dropped: Vec<PluginCatalogDropped>,
+    /// Extension entities with an in-flight mutation
+    /// (`"skill:{name}"` | `"mcp:{name}"`) — second clicks are ignored
+    /// while a toggle is unsettled.
+    ext_inflight: HashSet<String>,
+    /// Generation for settings reads — a stale `load_settings` batch
+    /// can't undo a newer mutation reply (e.g. `runtime.mcp` after
+    /// `mcp/toggle`).
+    settings_gen: u64,
     /// `review/state` snapshot for the review sheet.
     pub review: Option<ReviewStateResponse>,
     /// Review sheet open/closed.
@@ -206,6 +226,14 @@ impl SessionView {
             settings_open: false,
             pending_agent: None,
             cfg_inflight: HashSet::new(),
+            ext_skills: Vec::new(),
+            pending_skills: HashMap::new(),
+            mcp_state: None,
+            connector_counts: None,
+            plugins: Vec::new(),
+            plugin_dropped: Vec::new(),
+            ext_inflight: HashSet::new(),
+            settings_gen: 0,
             review: None,
             review_open: false,
             review_diff: None,
@@ -247,17 +275,26 @@ impl SessionView {
         .detach();
     }
 
-    /// Fetch `agents/list` + `config/fields/read` for the settings sheet.
+    /// Fetch `agents/list` + `config/fields/read` + extension reads for
+    /// the settings sheet. `settings_gen` drops a batch that loses the
+    /// race against a newer mutation reply.
     fn load_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_gen += 1;
+        let gen = self.settings_gen;
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let agents = conn.agents_list(&sid).await;
             let fields = conn.config_fields_read(&sid).await;
+            let skills = conn.skills_installed(&sid).await;
+            let mcp = conn.mcp_read(&sid).await;
+            let connectors = conn.connectors_read(&sid).await;
+            let plugins = conn.plugins_read(&sid).await;
             let _ = this.update(cx, |view, cx| {
                 // A handoff may have swapped the session while this was
-                // in flight — the response belongs to the old session.
-                if view.session_id() != sid {
+                // in flight — the response belongs to the old session; a
+                // newer mutation reply already beat this batch.
+                if view.session_id() != sid || view.settings_gen != gen {
                     return;
                 }
                 if let Ok(list) = agents {
@@ -267,19 +304,187 @@ impl SessionView {
                 if let Ok(resp) = fields {
                     view.config_fields = resp.fields;
                 }
+                if let Ok(inst) = skills {
+                    view.ext_skills = inst.skills;
+                    // A pending toggle resolves once the list confirms the
+                    // requested state — or the skill disappears; resolved
+                    // entries also release their inflight key so the row
+                    // becomes clickable again.
+                    view.pending_skills.retain(|name, target| {
+                        let unconfirmed = view
+                            .ext_skills
+                            .iter()
+                            .find(|s| &s.name == name)
+                            .map(|s| s.enabled != *target)
+                            .unwrap_or(false);
+                        if !unconfirmed {
+                            view.ext_inflight.remove(&format!("skill:{name}"));
+                        }
+                        unconfirmed
+                    });
+                }
+                if let Ok(resp) = mcp {
+                    view.mcp_state = Some(resp.mcp);
+                }
+                if let Ok(resp) = connectors {
+                    view.connector_counts = Some(resp.counts);
+                }
+                if let Ok(resp) = plugins {
+                    view.plugins = resp.plugins.plugins;
+                    view.plugin_dropped = resp.plugins.dropped;
+                }
                 cx.notify();
             });
         })
         .detach();
     }
 
-    /// Settings sheet toggle — loads pickers lazily the first time.
+    /// Settings sheet toggle — refreshes every section on every open so
+    /// a read that failed last time retries (gen-guarded).
     pub fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
-        if self.settings_open && self.agents.is_empty() && self.config_fields.is_empty() {
+        if self.settings_open {
             self.load_settings(cx);
         }
         cx.notify();
+    }
+
+    /// `skills/setEnabled` — flip a skill's enabled flag. Locked skills
+    /// can't be toggled; a pending switch clears when a refreshed list
+    /// confirms the requested state.
+    pub fn toggle_skill(&mut self, name: String, cx: &mut Context<Self>) {
+        let key = format!("skill:{name}");
+        if !self.ext_inflight.insert(key.clone()) {
+            return;
+        }
+        let Some(skill) = self.ext_skills.iter().find(|s| s.name == name) else {
+            self.ext_inflight.remove(&key);
+            return;
+        };
+        if skill.locked {
+            self.ext_inflight.remove(&key);
+            return;
+        }
+        let enabled = !skill.enabled;
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn.skills_set_enabled(&sid, &name, enabled).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
+                match resp {
+                    Ok(r) if r.rejected => {
+                        view.ext_inflight.remove(&key);
+                        view.error = Some(format!(
+                            "skill toggle rejected: {}",
+                            r.failures.join(", ")
+                        ));
+                    }
+                    Ok(r) if r.status.as_deref() == Some("pending") => {
+                        // Keep the inflight key — the row stays
+                        // non-clickable until a refreshed list confirms
+                        // the requested state (load_settings frees it).
+                        view.pending_skills.insert(name.clone(), enabled);
+                        view.load_settings(cx);
+                    }
+                    Ok(_) => {
+                        view.ext_inflight.remove(&key);
+                        if let Some(s) = view.ext_skills.iter_mut().find(|s| s.name == name) {
+                            s.enabled = enabled;
+                        }
+                        view.settle_settings_write(cx);
+                    }
+                    Err(e) => {
+                        view.ext_inflight.remove(&key);
+                        view.error = Some(format!("skill toggle failed: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// A settings write applied server-side: drop any in-flight read
+    /// batch (its snapshot predates the write) and start a replacement
+    /// so every section re-converges — same race the mcp arm handles.
+    fn settle_settings_write(&mut self, cx: &mut Context<Self>) {
+        self.settings_gen += 1;
+        self.load_settings(cx);
+    }
+
+    /// `mcp/toggle` — flip a source between enabled/disabled. Connector-
+    /// kind sources toggle `connected`↔`disabled` via
+    /// `connector_catalog/toggle` (upstream rejects them on `mcp/toggle`).
+    /// Other statuses (needs_auth, needs_setup, …) aren't toggleable.
+    pub fn toggle_mcp(&mut self, name: String, cx: &mut Context<Self>) {
+        let key = format!("mcp:{name}");
+        if !self.ext_inflight.insert(key.clone()) {
+            return;
+        }
+        let Some((kind, disabled)) = self
+            .mcp_state
+            .as_ref()
+            .and_then(|m| m.sources.iter().find(|s| s.name == name))
+            .and_then(|s| match (s.kind.as_str(), s.status.as_str()) {
+                ("connector", "connected") => Some((s.kind.clone(), true)),
+                ("connector", "disabled") => Some((s.kind.clone(), false)),
+                (_, "enabled") => Some((s.kind.clone(), true)),
+                (_, "disabled") => Some((s.kind.clone(), false)),
+                _ => None,
+            })
+        else {
+            self.ext_inflight.remove(&key);
+            return;
+        };
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = if kind == "connector" {
+                conn.connector_catalog_toggle(&sid, &name, disabled).await
+            } else {
+                conn.mcp_toggle(&sid, &name, &kind, disabled).await
+            };
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
+                view.ext_inflight.remove(&key);
+                match resp {
+                    Ok(r) => {
+                        // `runtime.mcp` carries the post-toggle state; a
+                        // sessionless/absent runtime falls back to a read.
+                        let fresh = r
+                            .runtime
+                            .and_then(|rt| serde_json::from_value::<MCPState>(rt["mcp"].clone()).ok());
+                        if let Some(mcp) = fresh {
+                            view.mcp_state = Some(mcp);
+                        }
+                        // Drop any in-flight batch (its snapshot predates
+                        // the write) and start a replacement read so every
+                        // section re-converges — same as other writes.
+                        view.settle_settings_write(cx);
+                    }
+                    Err(e) => view.error = Some(format!("mcp toggle failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// `skill:{name}` / `mcp:{name}` has an unsettled mutation.
+    pub fn ext_busy(&self, key: &str) -> bool {
+        self.ext_inflight.contains(key)
+    }
+
+    /// A pending `skills/setEnabled` hasn't been confirmed yet.
+    pub fn skill_pending(&self, name: &str) -> bool {
+        self.pending_skills.contains_key(name)
     }
 
     /// Fetch `review/state` for the review sheet. Refreshes every call —
@@ -749,6 +954,7 @@ impl SessionView {
                         if let Some(cfg) = &mut view.config {
                             cfg.default_agent = applied;
                         }
+                        view.settle_settings_write(cx);
                     }
                     Err(e) => view.error = Some(format!("agent switch failed: {e}")),
                 }
@@ -845,6 +1051,7 @@ impl SessionView {
                         {
                             f.value = next;
                         }
+                        view.settle_settings_write(cx);
                     }
                     Ok(r) => {
                         view.error = Some(format!("config rejected: {}", r.failures.join(", ")))
@@ -944,6 +1151,11 @@ impl SessionView {
                 if (session_updated || narrate_turn.is_some()) && self.review_open {
                     self.load_review(cx);
                 }
+                // A queued skill toggle settles via session/updated —
+                // refresh until the list confirms it.
+                if session_updated && !self.pending_skills.is_empty() {
+                    self.load_settings(cx);
+                }
                 if narrate_turn.is_some() && self.narrator_on {
                     self.narrate_turn(narrate_turn, cx);
                 }
@@ -979,6 +1191,13 @@ impl SessionView {
             self.review_state_gen += 1;
             self.review_diff_gen += 1;
             self.review_inflight.clear();
+            self.ext_skills.clear();
+            self.pending_skills.clear();
+            self.mcp_state = None;
+            self.connector_counts = None;
+            self.plugins.clear();
+            self.plugin_dropped.clear();
+            self.ext_inflight.clear();
             if self.settings_open {
                 self.load_settings(cx);
             }

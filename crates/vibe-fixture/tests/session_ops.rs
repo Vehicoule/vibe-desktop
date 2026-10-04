@@ -591,6 +591,189 @@ async fn settings_roundtrip_reads_and_writes() {
     assert!(!resp.rejected);
     assert_eq!(resp.status.as_deref(), Some("applied"));
 
+    // The applied switch persists — agents/list reports it instead of
+    // reverting to build; unknown agents reject.
+    let agents = conn.agents_list(&sid).await.unwrap();
+    assert_eq!(agents.active.name, "plan");
+    assert!(conn.session_agent_update(&sid, "bogus").await.is_err());
+
+    // Session ids that are unsafe or don't resolve must not silently
+    // "apply" — the mutation would write an orphaned overlay.
+    assert!(conn
+        .session_agent_update("missing-session", "plan")
+        .await
+        .is_err());
+    assert!(conn.agents_list("missing-session").await.is_err());
+    assert!(conn
+        .session_agent_update("../escape", "plan")
+        .await
+        .is_err());
+
+    // The canned demo rows open without a store record — they resolve
+    // for agent reads/writes until tombstoned by session/delete.
+    assert!(conn.agents_list("saved-aaaa1111").await.is_ok());
+    let resp = conn
+        .session_agent_update("saved-aaaa1111", "plan")
+        .await
+        .unwrap();
+    assert_eq!(resp.status.as_deref(), Some("applied"));
+    let agents = conn.agents_list("saved-aaaa1111").await.unwrap();
+    assert_eq!(agents.active.name, "plan");
+    conn.request(
+        "session/delete",
+        serde_json::json!({"sessionId": "saved-aaaa1111"}),
+    )
+    .await
+    .unwrap();
+    assert!(conn.agents_list("saved-aaaa1111").await.is_err());
+    assert!(conn
+        .session_agent_update("saved-aaaa1111", "plan")
+        .await
+        .is_err());
+
+    cleanup(conn, &dir).await;
+}
+
+/// review/state + turnDiff + approve/revert round-trip.
+#[tokio::test]
+async fn review_state_diff_and_mutation() {
+    let (dir, envs) = store();
+    let mut conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    let (sid, _rx) = session_with_completed_turn(&mut conn).await;
+
+    let state = conn.review_state(&sid).await.unwrap();
+    assert_eq!(state.files.len(), 3);
+    assert_eq!(state.scopes.len(), 1);
+    // notes.txt: unscoped + regionless — the whole-file preview path.
+    let notes = state
+        .files
+        .iter()
+        .find(|f| f.path == "notes.txt")
+        .expect("ownerless file listed");
+    assert!(notes.regions.is_empty());
+    assert!(!state
+        .scopes
+        .iter()
+        .any(|s| s.files.iter().any(|f| f.path == "notes.txt")));
+    let baseline = conn.review_baseline(&sid, "notes.txt").await.unwrap();
+    assert!(baseline.contains("notes.txt"));
+    let owner = state.scopes[0].owner.clone();
+    assert!(matches!(
+        owner,
+        vibe_protocol::models::ReviewOwner::Agent { turn_id: 1 }
+    ));
+
+    let diff = conn
+        .review_turn_diff(&sid, "src/main.rs", &owner)
+        .await
+        .unwrap();
+    assert_eq!(diff.status, "modified");
+    assert!(diff.baseline.contains("old_call"));
+    assert!(diff.current.contains("new_call"));
+
+    conn.review_approve(&sid, &vibe_protocol::models::ReviewTarget::File {
+        path: "src/main.rs".into(),
+    })
+    .await
+    .unwrap();
+    // A decided file resolves off the pending list — the mutation is
+    // observable on the next read.
+    let after_keep = conn.review_state(&sid).await.unwrap();
+    assert_eq!(after_keep.files.len(), 2);
+    assert_eq!(after_keep.scopes[0].files.len(), 1);
+
+    // A file-wide decision resolves an ownerless file too.
+    conn.review_approve(&sid, &vibe_protocol::models::ReviewTarget::File {
+        path: "notes.txt".into(),
+    })
+    .await
+    .unwrap();
+
+    conn.review_revert(&sid, &vibe_protocol::models::ReviewTarget::File {
+        path: "src/lib.rs".into(),
+    })
+    .await
+    .unwrap();
+    let after_all = conn.review_state(&sid).await.unwrap();
+    assert!(after_all.files.is_empty());
+    assert!(after_all.scopes[0].files.is_empty());
+
+    cleanup(conn, &dir).await;
+}
+
+/// M3c: skills/mcp/connectors/plugins reads + toggles persist across reads.
+#[tokio::test]
+async fn extensions_roundtrip() {
+    let (dir, envs) = store();
+    let mut conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    let (sid, _rx) = session_with_completed_turn(&mut conn).await;
+
+    // skills: installed list → toggle → read-back reflects it.
+    let inst = conn.skills_installed(&sid).await.unwrap();
+    assert_eq!(inst.skills.len(), 3);
+    let deploy = inst.skills.iter().find(|s| s.name == "deploy-notes").unwrap();
+    assert!(!deploy.enabled);
+
+    let resp = conn.skills_set_enabled(&sid, "deploy-notes", true).await.unwrap();
+    assert!(!resp.rejected);
+    let after = conn.skills_installed(&sid).await.unwrap();
+    let deploy = after.skills.iter().find(|s| s.name == "deploy-notes").unwrap();
+    assert!(deploy.enabled);
+
+    // Locked skills reject and stay unchanged.
+    let locked = conn.skills_set_enabled(&sid, "vibe-release", false).await.unwrap();
+    assert!(locked.rejected);
+    assert!(!locked.failures.is_empty());
+    let still = conn.skills_installed(&sid).await.unwrap();
+    assert!(still.skills.iter().find(|s| s.name == "vibe-release").unwrap().enabled);
+
+    // mcp: read → toggle → runtime.mcp and the next read both agree.
+    let mcp = conn.mcp_read(&sid).await.unwrap();
+    let fs = mcp.mcp.sources.iter().find(|s| s.name == "fs").unwrap();
+    assert_eq!(fs.status, "enabled");
+
+    let toggled = conn.mcp_toggle(&sid, "fs", "server", true).await.unwrap();
+    let fresh = toggled.runtime.expect("runtime").get("mcp").cloned().unwrap();
+    let state: vibe_protocol::models::MCPState = serde_json::from_value(fresh).unwrap();
+    assert_eq!(
+        state.sources.iter().find(|s| s.name == "fs").unwrap().status,
+        "disabled"
+    );
+    let reread = conn.mcp_read(&sid).await.unwrap();
+    assert_eq!(
+        reread.mcp.sources.iter().find(|s| s.name == "fs").unwrap().status,
+        "disabled"
+    );
+
+    // Connector sources route through connector_catalog/toggle —
+    // connected↔disabled, persisted in the same overlay.
+    let slack = reread.mcp.sources.iter().find(|s| s.name == "slack").unwrap();
+    assert_eq!(slack.status, "connected");
+    let toggled = conn.connector_catalog_toggle(&sid, "slack", true).await.unwrap();
+    let fresh = toggled.runtime.expect("runtime").get("mcp").cloned().unwrap();
+    let state: vibe_protocol::models::MCPState = serde_json::from_value(fresh).unwrap();
+    assert_eq!(
+        state.sources.iter().find(|s| s.name == "slack").unwrap().status,
+        "disabled"
+    );
+    let reread = conn.mcp_read(&sid).await.unwrap();
+    assert_eq!(
+        reread.mcp.sources.iter().find(|s| s.name == "slack").unwrap().status,
+        "disabled"
+    );
+
+    // connectors + plugins are read-only surfaces here.
+    let conn_counts = conn.connectors_read(&sid).await.unwrap();
+    assert_eq!(conn_counts.counts.connected, 2);
+    assert_eq!(conn_counts.counts.total, Some(5));
+
+    let plugs = conn.plugins_read(&sid).await.unwrap();
+    assert_eq!(plugs.plugins.plugins.len(), 1);
+    assert_eq!(plugs.plugins.plugins[0].name, "acme-pack");
+    assert!(plugs.plugins.dropped.is_empty());
+
     cleanup(conn, &dir).await;
 }
 
