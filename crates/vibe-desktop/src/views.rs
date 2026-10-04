@@ -292,6 +292,7 @@ impl VibeApp {
                     ),
             )
             .child(list)
+            .child(self.render_dist_row(cx))
             .child(
                 div()
                     .px_3()
@@ -300,6 +301,46 @@ impl VibeApp {
                     .border_color(c(theme::EDGE))
                     .child(text(self.status.clone(), 10.5, c(theme::INK_FAINT))),
             )
+    }
+
+    /// Managed-vibe runtime row: state label + install/update action.
+    fn render_dist_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::vibe_dist::VibeDist;
+        let (label, action): (String, Option<(&'static str, bool)>) = match &self.vibe_dist {
+            VibeDist::Missing => ("vibe: not installed".into(), Some(("install vibe", false))),
+            VibeDist::NoUv => ("vibe: uv required (astral.sh/uv)".into(), None),
+            VibeDist::UpdateAvailable { .. } => {
+                (self.vibe_dist.label(), Some(("update", true)))
+            }
+            VibeDist::Failed(_) => (self.vibe_dist.label(), Some(("retry", false))),
+            other => (other.label(), None),
+        };
+        let mut row = div()
+            .px_3()
+            .py_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_t_1()
+            .border_color(c(theme::EDGE))
+            .child(text(
+                label,
+                10.0,
+                c(match &self.vibe_dist {
+                    VibeDist::Missing | VibeDist::NoUv | VibeDist::Failed(_) => theme::AMBER,
+                    VibeDist::UpdateAvailable { .. } => theme::SUNSET,
+                    _ => theme::INK_FAINT,
+                }),
+            ))
+            .child(div().flex_1());
+        if let Some((name, upgrade)) = action {
+            row = row.child(
+                ghost_button("vibe-dist-op", name).on_click(
+                    cx.listener(move |app, _e, _w, cx| app.vibe_dist_op(upgrade, cx)),
+                ),
+            );
+        }
+        row
     }
 
     /// Action rows under a rail item: pin/unpin, rename, archive, delete.

@@ -7,6 +7,7 @@ mod app;
 mod host;
 mod session;
 mod theme;
+mod vibe_dist;
 mod views;
 mod voice;
 

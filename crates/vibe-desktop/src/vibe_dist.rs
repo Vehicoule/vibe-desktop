@@ -1,0 +1,314 @@
+//! Managed `vibe-app-server` distribution (DESIGN.md M5): the app owns a
+//! private `uv tool install mistral-vibe` under its data dir so the server
+//! can install and update independently of app releases.
+//!
+//! Resolution order for the server binary:
+//! `VIBE_APP_SERVER` env → managed install → `~/.local/bin` → PATH.
+//!
+//! `uv` itself comes from `VIBE_DESKTOP_UV` env → PATH. The tool dir is
+//! isolated (`UV_TOOL_DIR`/`UV_TOOL_BIN_DIR` under the dist root) so the
+//! managed copy never collides with the user's own uv tools.
+
+use std::path::{Path, PathBuf};
+
+/// Distribution lifecycle — `Missing` prompts the managed-install CTA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VibeDist {
+    /// No server binary resolved anywhere.
+    Missing,
+    /// uv isn't available to perform an install/upgrade.
+    NoUv,
+    Installed { version: String, managed: bool },
+    /// Latest version on PyPI is newer than the installed one.
+    UpdateAvailable { installed: String, latest: String },
+    Installing,
+    Updating,
+    Failed(String),
+}
+
+impl VibeDist {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Missing => "vibe: not installed".into(),
+            Self::NoUv => "vibe: uv required".into(),
+            Self::Installed { version, managed } => {
+                format!("vibe {version}{}", if *managed { "" } else { " (system)" })
+            }
+            Self::UpdateAvailable { installed, latest } => {
+                format!("vibe {installed} → {latest}")
+            }
+            Self::Installing => "vibe: installing…".into(),
+            Self::Updating => "vibe: updating…".into(),
+            Self::Failed(e) => format!("vibe: {e}"),
+        }
+    }
+}
+
+/// Root of the managed distribution: `$XDG_DATA_HOME/vibe-desktop/vibe`
+/// or `~/.local/share/vibe-desktop/vibe`; `VIBE_DESKTOP_DIST` overrides
+/// (tests point it at a tempdir).
+pub fn dist_root() -> PathBuf {
+    if let Ok(p) = std::env::var("VIBE_DESKTOP_DIST") {
+        return PathBuf::from(p);
+    }
+    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+        return Path::new(&x).join("vibe-desktop/vibe");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Path::new(&home).join(".local/share/vibe-desktop/vibe");
+    }
+    PathBuf::from("/tmp/vibe-desktop-vibe")
+}
+
+/// `vibe-app-server` inside the managed tool env.
+/// uv lays tools out as `<UV_TOOL_DIR>/<name>/bin/<exe>`.
+pub fn managed_binary(root: &Path) -> PathBuf {
+    root.join("tool/mistral-vibe/bin/vibe-app-server")
+}
+
+/// uv binary: `VIBE_DESKTOP_UV` env → PATH. `None` when uv is absent.
+pub fn uv_binary() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("VIBE_DESKTOP_UV") {
+        return Some(PathBuf::from(p));
+    }
+    which("uv")
+}
+
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Parse `mistral-vibe 1.2.3` (uv tool list output line) → `1.2.3`.
+pub fn parse_tool_version(list_output: &str) -> Option<String> {
+    for line in list_output.lines() {
+        let mut it = line.split_whitespace();
+        if it.next() == Some("mistral-vibe") {
+            if let Some(v) = it.next() {
+                return Some(v.trim_start_matches('v').to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parse PyPI JSON → `info.version`.
+pub fn parse_pypi_latest(body: &serde_json::Value) -> Option<String> {
+    body["info"]["version"].as_str().map(str::to_string)
+}
+
+/// One version bump: `a` newer than `b`? Semver-ish compare on
+/// dot-separated numerics — pre-release suffixes compare equal to the
+/// bare number (a managed pin only tracks released versions).
+pub fn newer_than(a: &str, b: &str) -> bool {
+    fn parts(v: &str) -> Vec<u64> {
+        v.split('.')
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+    let (x, y) = (parts(a), parts(b));
+    for i in 0..x.len().max(y.len()) {
+        match x.get(i).copied().unwrap_or(0).cmp(&y.get(i).copied().unwrap_or(0)) {
+            std::cmp::Ordering::Greater => return true,
+            std::cmp::Ordering::Less => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// env for every managed-uv call — isolates the tool env + bin dir.
+fn managed_env(root: &Path) -> Vec<(String, String)> {
+    vec![
+        ("UV_TOOL_DIR".into(), root.join("tool").display().to_string()),
+        ("UV_TOOL_BIN_DIR".into(), root.join("bin").display().to_string()),
+        // Deterministic builds: managed installs resolve against PyPI only.
+        ("UV_NO_CONFIG".into(), "1".into()),
+    ]
+}
+
+/// Installed managed version, if the managed tool env exists.
+pub async fn installed_version(uv: &Path, root: &Path) -> Option<String> {
+    let out = tokio::process::Command::new(uv)
+        .args(["tool", "list"])
+        .envs(managed_env(root))
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_tool_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Latest published version — PyPI JSON API.
+pub async fn latest_version() -> Option<String> {
+    let body = reqwest::get("https://pypi.org/pypi/mistral-vibe/json")
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    parse_pypi_latest(&body)
+}
+
+/// `uv tool install mistral-vibe` into the managed env.
+pub async fn install(uv: &Path, root: &Path) -> Result<String, String> {
+    run_uv(uv, root, &["tool", "install", "mistral-vibe"]).await?;
+    installed_version(uv, root)
+        .await
+        .ok_or_else(|| "install finished but mistral-vibe is not listed".to_string())
+}
+
+/// `uv tool upgrade mistral-vibe` inside the managed env.
+pub async fn upgrade(uv: &Path, root: &Path) -> Result<String, String> {
+    run_uv(uv, root, &["tool", "upgrade", "mistral-vibe"]).await?;
+    installed_version(uv, root)
+        .await
+        .ok_or_else(|| "upgrade finished but mistral-vibe is not listed".to_string())
+}
+
+async fn run_uv(uv: &Path, root: &Path, args: &[&str]) -> Result<(), String> {
+    let out = tokio::process::Command::new(uv)
+        .args(args)
+        .envs(managed_env(root))
+        .output()
+        .await
+        .map_err(|e| format!("{e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Resolve the state in one pass: binary presence + managed version +
+/// PyPI latest (when `check_latest`).
+pub async fn probe(check_latest: bool) -> VibeDist {
+    let root = dist_root();
+    let managed_bin = managed_binary(&root);
+    let managed_present = managed_bin.is_file();
+    // A user-managed env override or system install still counts as
+    // "installed" — the managed layer only fills the gap.
+    let system_present = std::env::var("VIBE_APP_SERVER").is_ok()
+        || std::env::var_os("HOME")
+            .map(|h| Path::new(&h).join(".local/bin/vibe-app-server").exists())
+            .unwrap_or(false)
+        || which("vibe-app-server").is_some();
+    let Some(uv) = uv_binary() else {
+        return if system_present {
+            VibeDist::Installed {
+                version: "unknown".into(),
+                managed: false,
+            }
+        } else {
+            VibeDist::NoUv
+        };
+    };
+    let version = installed_version(&uv, &root).await;
+    if !managed_present && !system_present && version.is_none() {
+        return VibeDist::Missing;
+    }
+    let installed = version.unwrap_or_else(|| "unknown".into());
+    if check_latest && installed != "unknown" {
+        if let Some(latest) = latest_version().await {
+            if newer_than(&latest, &installed) {
+                return VibeDist::UpdateAvailable { installed, latest };
+            }
+        }
+    }
+    VibeDist::Installed {
+        version: installed,
+        managed: managed_present,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tool_version_finds_mistral_vibe() {
+        assert_eq!(
+            parse_tool_version("mistral-vibe 0.4.2\nruff 0.6.1\n"),
+            Some("0.4.2".to_string())
+        );
+        assert_eq!(parse_tool_version("ruff 0.6.1\n"), None);
+    }
+
+    #[test]
+    fn parse_pypi_latest_reads_info_version() {
+        let body = serde_json::json!({"info": {"version": "0.4.3"}, "releases": {}});
+        assert_eq!(parse_pypi_latest(&body), Some("0.4.3".to_string()));
+    }
+
+    #[test]
+    fn newer_than_compares_dotted_numerics() {
+        assert!(newer_than("0.5.0", "0.4.9"));
+        assert!(newer_than("1.0.0", "0.99.9"));
+        assert!(!newer_than("0.4.2", "0.4.2"));
+        assert!(!newer_than("0.4.2", "0.4.3"));
+        assert!(newer_than("0.4.10", "0.4.9"));
+    }
+
+    /// A scripted `uv` stand-in: `tool install/upgrade` create the managed
+    /// binary + version file; `tool list` echoes it back. Exercises the
+    /// real command/env path (`install` → `upgrade` → `installed_version`)
+    /// without network or a real uv.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_install_and_upgrade_via_fake_uv() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vibe-dist-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let uv = dir.join("fake-uv");
+        std::fs::write(
+            &uv,
+            r#"#!/bin/sh
+# $UV_TOOL_DIR/mistral-vibe/VER holds the installed version (bumped on upgrade).
+tool="$UV_TOOL_DIR/mistral-vibe"
+ver_file="$tool/VER"
+case "$1 $2" in
+  "tool install")
+    mkdir -p "$tool/bin"; echo 0.4.0 > "$ver_file"; touch "$tool/bin/vibe-app-server" ;;
+  "tool upgrade")
+    cur=$(cat "$ver_file" 2>/dev/null || echo 0.0.0)
+    echo "${cur%.*}.9" > "$ver_file" ;;
+  "tool list")
+    [ -f "$ver_file" ] && echo "mistral-vibe $(cat "$ver_file")" || true ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let root = dir.join("dist");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // install → managed binary + version land.
+        let v = install(&uv, &root).await.unwrap();
+        assert_eq!(v, "0.4.0");
+        assert!(managed_binary(&root).is_file());
+        assert_eq!(installed_version(&uv, &root).await.as_deref(), Some("0.4.0"));
+
+        // upgrade moves the version marker.
+        let v = upgrade(&uv, &root).await.unwrap();
+        assert_eq!(v, "0.4.9");
+        assert_eq!(installed_version(&uv, &root).await.as_deref(), Some("0.4.9"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

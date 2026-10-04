@@ -49,6 +49,11 @@ pub struct VibeApp {
     /// gen it started under is still current — otherwise its older
     /// snapshot would erase the mutation's marker.
     pub linked_gen: u64,
+    /// Managed `vibe-app-server` state — probed at boot and after
+    /// install/update ops.
+    pub vibe_dist: crate::vibe_dist::VibeDist,
+    /// Serializes dist ops (probe/install/update) — one at a time.
+    dist_inflight: bool,
 }
 
 enum AttachKind {
@@ -89,8 +94,11 @@ impl VibeApp {
             catalog_inflight: None,
             linked_dirs: std::collections::HashSet::new(),
             linked_gen: 0,
+            vibe_dist: crate::vibe_dist::VibeDist::Missing,
+            dist_inflight: false,
         };
         app.refresh_sessions(cx);
+        app.probe_dist(true, cx);
         app
     }
 
@@ -117,6 +125,78 @@ impl VibeApp {
             client_tools: vec![],
             disabled_notifications: vec![],
         }
+    }
+
+    /// Re-probe the managed vibe distribution (`check_latest` adds the
+    /// PyPI version check — cheap but network-bound, so only callers that
+    /// want the update badge set it).
+    pub fn probe_dist(&mut self, check_latest: bool, cx: &mut Context<Self>) {
+        if self.dist_inflight {
+            return;
+        }
+        self.dist_inflight = true;
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let state = crate::vibe_dist::probe(check_latest).await;
+            let _ = this.update(cx, |app, cx| {
+                app.dist_inflight = false;
+                // An op in flight (install/update) owns the label — don't
+                // clobber it with a probe that started earlier.
+                if !matches!(
+                    app.vibe_dist,
+                    crate::vibe_dist::VibeDist::Installing | crate::vibe_dist::VibeDist::Updating
+                ) {
+                    app.vibe_dist = state;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Managed install or upgrade — uv on the host runtime; the dist label
+    /// shows progress until the post-probe lands.
+    pub fn vibe_dist_op(&mut self, upgrade: bool, cx: &mut Context<Self>) {
+        if self.dist_inflight {
+            return;
+        }
+        self.dist_inflight = true;
+        self.vibe_dist = if upgrade {
+            crate::vibe_dist::VibeDist::Updating
+        } else {
+            crate::vibe_dist::VibeDist::Installing
+        };
+        cx.notify();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let out = host::runtime()
+                .spawn(async move {
+                    let Some(uv) = crate::vibe_dist::uv_binary() else {
+                        return Err("uv not found — install it from astral.sh/uv".to_string());
+                    };
+                    let root = crate::vibe_dist::dist_root();
+                    std::fs::create_dir_all(&root).map_err(|e| format!("{e}"))?;
+                    if upgrade {
+                        crate::vibe_dist::upgrade(&uv, &root).await
+                    } else {
+                        crate::vibe_dist::install(&uv, &root).await
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| Err("dist task failed".into()));
+            let _ = this.update(cx, |app, cx| {
+                app.dist_inflight = false;
+                app.vibe_dist = match out {
+                    Ok(version) => crate::vibe_dist::VibeDist::Installed {
+                        version,
+                        managed: true,
+                    },
+                    Err(e) => crate::vibe_dist::VibeDist::Failed(e),
+                };
+                cx.notify();
+                // Fresh probe so a post-install update badge appears.
+                app.probe_dist(true, cx);
+            });
+        })
+        .detach();
     }
 
     /// Catalog connection (never attaches a session): serves `session/list`.
