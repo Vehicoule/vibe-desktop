@@ -596,6 +596,19 @@ async fn settings_roundtrip_reads_and_writes() {
     let agents = conn.agents_list(&sid).await.unwrap();
     assert_eq!(agents.active.name, "plan");
     assert!(conn.session_agent_update(&sid, "bogus").await.is_err());
+
+    // Session ids that are unsafe or don't resolve must not silently
+    // "apply" — the mutation would write an orphaned overlay.
+    assert!(conn
+        .session_agent_update("missing-session", "plan")
+        .await
+        .is_err());
+    assert!(conn.agents_list("missing-session").await.is_err());
+    assert!(conn
+        .session_agent_update("../escape", "plan")
+        .await
+        .is_err());
+
     cleanup(conn, &dir).await;
 }
 

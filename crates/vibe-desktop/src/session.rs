@@ -117,6 +117,11 @@ pub struct SessionView {
     /// Open per-file diff — (path, owner, response). `None` until
     /// `review/turnDiff` lands.
     pub review_diff: Option<(String, ReviewOwner, ReviewTurnDiffResponse)>,
+    /// Latest diff selection the reviewer asked for — independent of what
+    /// `review_diff` currently displays. State refreshes revalidate THIS,
+    /// so a refresh can neither reopen a superseded file nor lose a click
+    /// whose response is still in flight.
+    review_diff_sel: Option<(String, ReviewOwner)>,
     /// Generation guarding `review/state` reads — a stale response must
     /// not overwrite a newer refresh.
     review_state_gen: u64,
@@ -217,6 +222,7 @@ impl SessionView {
             review: None,
             review_open: false,
             review_diff: None,
+            review_diff_sel: None,
             review_state_gen: 0,
             review_diff_gen: 0,
             review_inflight: HashSet::new(),
@@ -623,20 +629,30 @@ impl SessionView {
                 }
                 match state {
                     Ok(s) => {
-                        let open = view.review_diff.as_ref().map(|(p, o, _)| (p.clone(), o.clone()));
-                        let still_present = open.as_ref().is_some_and(|(path, _)| {
+                        let sel = view.review_diff_sel.clone();
+                        let still_present = sel.as_ref().is_some_and(|(path, _)| {
                             s.files.iter().any(|f| f.path == *path)
                                 || s.scopes.iter().any(|sc| sc.files.iter().any(|f| f.path == *path))
                         });
                         view.review = Some(s);
-                        if let Some((path, _)) = open {
-                            if still_present && view.review_owner_for(&path).is_some() {
-                                // Re-read under a freshly resolved owner —
-                                // the file may have moved scopes.
-                                view.open_review_diff(path, None, cx);
+                        if let Some((path, owner)) = sel {
+                            // Keep the reviewer's owner while it still
+                            // applies — only a file that outlived its
+                            // owner gets re-resolved (or closed).
+                            let owner = if view.review_owner_valid(&path, &owner) {
+                                Some(owner)
                             } else {
-                                view.review_diff = None;
-                                view.review_diff_gen += 1;
+                                view.review_owner_for(&path)
+                            };
+                            match (still_present, owner) {
+                                (true, Some(owner)) => {
+                                    view.open_review_diff(path, Some(owner), cx)
+                                }
+                                _ => {
+                                    view.review_diff = None;
+                                    view.review_diff_sel = None;
+                                    view.review_diff_gen += 1;
+                                }
                             }
                         }
                     }
@@ -696,6 +712,7 @@ impl SessionView {
         let Some(owner) = owner.or_else(|| self.review_owner_for(&path)) else {
             return;
         };
+        self.review_diff_sel = Some((path.clone(), owner.clone()));
         self.review_diff_gen += 1;
         let gen = self.review_diff_gen;
         let conn = self.conn.clone();
@@ -716,6 +733,40 @@ impl SessionView {
         .detach();
     }
 
+    /// Does `owner` still author `path` in the current state? Used when
+    /// revalidating an open selection after a refresh — a scope naming
+    /// the pair counts, and so does an unscoped file whose regions name
+    /// the owner — or a regionless file no scope claims (the
+    /// derived-owner case).
+    fn review_owner_valid(&self, path: &str, owner: &ReviewOwner) -> bool {
+        let Some(state) = self.review.as_ref() else {
+            return false;
+        };
+        if state
+            .scopes
+            .iter()
+            .any(|s| s.owner == *owner && s.files.iter().any(|f| f.path == path))
+        {
+            return true;
+        }
+        let Some(file) = state.files.iter().find(|f| f.path == path) else {
+            return false;
+        };
+        if !file.regions.is_empty() {
+            // A regioned file's owner must still come from its regions —
+            // the no-scope-claims fallback is for regionless files only,
+            // otherwise an obsolete owner survives a region handoff.
+            return file
+                .regions
+                .iter()
+                .any(|r| r.owner().as_ref() == Some(owner));
+        }
+        !state
+            .scopes
+            .iter()
+            .any(|s| s.files.iter().any(|f| f.path == path))
+    }
+
     /// True when `path` has a resolvable owner — rows without one render
     /// non-clickable instead of silently doing nothing.
     pub fn review_file_openable(&self, path: &str) -> bool {
@@ -724,6 +775,7 @@ impl SessionView {
 
     pub fn close_review_diff(&mut self, cx: &mut Context<Self>) {
         self.review_diff = None;
+        self.review_diff_sel = None;
         self.review_diff_gen += 1;
         cx.notify();
     }
@@ -752,6 +804,7 @@ impl SessionView {
                 match result {
                     Ok(()) => {
                         view.review_diff = None;
+                        view.review_diff_sel = None;
                         view.review_diff_gen += 1;
                         view.load_review(cx);
                     }
@@ -1078,6 +1131,7 @@ impl SessionView {
             self.cfg_inflight.clear();
             self.review = None;
             self.review_diff = None;
+            self.review_diff_sel = None;
             self.review_state_gen += 1;
             self.review_diff_gen += 1;
             self.review_inflight.clear();

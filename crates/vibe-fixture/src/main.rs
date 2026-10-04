@@ -1519,6 +1519,9 @@ async fn main() {
                         json!({"session": {"id": sid}, "deleted": true}).to_string(),
                     )
                     .await;
+                    // Session-scoped overlays die with their session.
+                    let _ = tokio::fs::remove_file(store.join(format!("agent_{sid}.json"))).await;
+                    let _ = tokio::fs::remove_file(store.join(format!("loops_{sid}.json"))).await;
                 }
                 respond(json!({})).await;
             }
@@ -1904,17 +1907,21 @@ async fn main() {
                     {"name": "accept-edits", "displayName": "Accept Edits", "description": "Auto-approves edits", "safety": "yolo", "agentType": "agent"},
                 ]);
                 // Applied switches persist per session — an unconditional
-                // "build" here would visually revert the user's pick.
-                let sid = params["sessionId"].as_str().unwrap_or("saved-aaaa1111");
-                let active_name = if store_safe_id(sid) {
-                    read_overlay(&store, &format!("agent_{sid}.json"))
-                        .get("active")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("build")
-                        .to_string()
-                } else {
-                    "build".to_string()
+                // "build" here would visually revert the user's pick. The
+                // session must exist: unknown/deleted ids get not_found.
+                let Some(sid) = params["sessionId"].as_str() else {
+                    respond_err("invalid_params", "fixture: sessionId required").await;
+                    continue;
                 };
+                if find_session(&sessions, &store, sid).await.is_none() {
+                    respond_err("not_found", "session").await;
+                    continue;
+                }
+                let active_name = read_overlay(&store, &format!("agent_{sid}.json"))
+                    .get("active")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("build")
+                    .to_string();
                 let active = agents.as_array().into_iter().flatten()
                     .find(|a| a["name"].as_str() == Some(active_name.as_str()))
                     .cloned().unwrap_or_else(|| agents[0].clone());
@@ -1926,20 +1933,30 @@ async fn main() {
                     .or_else(|| params["name"].as_str())
                     .or_else(|| params["agent"].as_str());
                 let known = ["build", "plan", "accept-edits"];
-                match name {
-                    Some(n) if known.contains(&n) => {
-                        let sid = params["sessionId"].as_str().unwrap_or("saved-aaaa1111");
-                        if store_safe_id(sid) {
-                            let mut ov = read_overlay(&store, &format!("agent_{sid}.json"));
-                            ov.insert("active".to_string(), json!(n));
-                            if !persist_overlay(&store, &format!("agent_{sid}.json"), &ov).await {
-                                respond_err("internal_error", "fixture: agent persist failed").await;
-                                continue;
-                            }
+                let sid = params["sessionId"].as_str();
+                // `applied` is only honest after the choice is persisted
+                // for a session that actually exists — unsafe or unknown
+                // ids must fail, not silently report success.
+                match (name, sid) {
+                    (Some(n), Some(sid)) if known.contains(&n) => {
+                        if !store_safe_id(sid)
+                            || find_session(&sessions, &store, sid).await.is_none()
+                        {
+                            respond_err("not_found", "session").await;
+                            continue;
+                        }
+                        let mut ov = read_overlay(&store, &format!("agent_{sid}.json"));
+                        ov.insert("active".to_string(), json!(n));
+                        if !persist_overlay(&store, &format!("agent_{sid}.json"), &ov).await {
+                            respond_err("internal_error", "fixture: agent persist failed").await;
+                            continue;
                         }
                         respond(json!({"status": "applied"})).await;
                     }
-                    _ => respond_err("invalid_params", "fixture: unknown agent").await,
+                    (Some(_), Some(_)) => {
+                        respond_err("invalid_params", "fixture: unknown agent").await
+                    }
+                    _ => respond_err("invalid_params", "fixture: agentName/sessionId required").await,
                 }
             }
             "narration/summarize" => {
