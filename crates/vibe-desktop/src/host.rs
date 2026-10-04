@@ -21,10 +21,16 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 /// Resolve the `vibe-app-server` binary:
-/// `VIBE_APP_SERVER` env → `~/.local/bin/vibe-app-server` → PATH lookup.
+/// `VIBE_APP_SERVER` env → managed install → `~/.local/bin` → PATH.
 pub fn server_binary() -> PathBuf {
     if let Ok(p) = std::env::var("VIBE_APP_SERVER") {
         return PathBuf::from(p);
+    }
+    if let Some(root) = crate::vibe_dist::dist_root() {
+        let managed = crate::vibe_dist::managed_binary(&root);
+        if managed.exists() {
+            return managed;
+        }
     }
     if let Some(home) = std::env::var_os("HOME") {
         let p = Path::new(&home).join(".local/bin/vibe-app-server");

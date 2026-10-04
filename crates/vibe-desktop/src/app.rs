@@ -41,6 +41,10 @@ pub struct VibeApp {
     /// flight — also the re-entrancy guard. A toggle during the flight
     /// re-runs the refresh once it lands.
     catalog_inflight: Option<bool>,
+    /// A refresh requested while `catalog_inflight` was occupied —
+    /// replayed when that request lands (e.g. post-install retry while
+    /// the startup request is still running).
+    catalog_retry_pending: bool,
     /// Directory paths bound to remote projects (`projectLinks/list`) —
     /// rail rows inside one get a link marker.
     pub linked_dirs: std::collections::HashSet<String>,
@@ -49,6 +53,14 @@ pub struct VibeApp {
     /// gen it started under is still current — otherwise its older
     /// snapshot would erase the mutation's marker.
     pub linked_gen: u64,
+    /// Managed `vibe-app-server` state — probed at boot and after
+    /// install/update ops.
+    pub vibe_dist: crate::vibe_dist::VibeDist,
+    /// Serializes dist ops (probe/install/update) — one at a time.
+    dist_inflight: bool,
+    /// Window focus — notifications only fire for sessions you're not
+    /// looking at (background tab, or window unfocused entirely).
+    pub window_active: bool,
     /// Bumped when a relocate updates a rail row's cwd locally. A
     /// refresh that started before the bump fetched the old cwd — it
     /// re-fires after applying so the stale row can't stick.
@@ -91,11 +103,20 @@ impl VibeApp {
             spawning: false,
             show_archived: false,
             catalog_inflight: None,
+            catalog_retry_pending: false,
             linked_dirs: std::collections::HashSet::new(),
             linked_gen: 0,
+            vibe_dist: crate::vibe_dist::VibeDist::Missing,
+            dist_inflight: false,
+            window_active: false,
             cwd_gen: 0,
         };
         app.refresh_sessions(cx);
+        // The dist row manages the REAL server — meaningless under the
+        // fixture backend, which never resolves it.
+        if backend == Backend::Server {
+            app.probe_dist(true, cx);
+        }
         app
     }
 
@@ -124,11 +145,136 @@ impl VibeApp {
         }
     }
 
+    /// Re-probe the managed vibe distribution (`check_latest` adds the
+    /// PyPI version check — cheap but network-bound, so only callers that
+    /// want the update badge set it).
+    pub fn probe_dist(&mut self, check_latest: bool, cx: &mut Context<Self>) {
+        if self.dist_inflight {
+            return;
+        }
+        self.dist_inflight = true;
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            // probe drives tokio child processes + reqwest — it must run
+            // on the host runtime, not gpui's executor (tokio::process
+            // panics without a reactor).
+            let state = host::runtime()
+                .spawn(async move { crate::vibe_dist::probe(check_latest).await })
+                .await
+                .unwrap_or_else(|_| crate::vibe_dist::VibeDist::Failed {
+                    upgrade: false,
+                    error: "dist probe failed".into(),
+                });
+            let _ = this.update(cx, |app, cx| {
+                app.dist_inflight = false;
+                // An op outcome (in-flight or failed) owns the label —
+                // don't clobber it with a probe that started earlier.
+                if !matches!(
+                    app.vibe_dist,
+                    crate::vibe_dist::VibeDist::Installing
+                        | crate::vibe_dist::VibeDist::Updating
+                        | crate::vibe_dist::VibeDist::Failed { .. }
+                ) {
+                    app.vibe_dist = state;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Managed install or upgrade — uv on the host runtime; the dist label
+    /// shows progress until the post-probe lands.
+    pub fn vibe_dist_op(&mut self, upgrade: bool, cx: &mut Context<Self>) {
+        if self.dist_inflight {
+            return;
+        }
+        self.dist_inflight = true;
+        self.vibe_dist = if upgrade {
+            crate::vibe_dist::VibeDist::Updating
+        } else {
+            crate::vibe_dist::VibeDist::Installing
+        };
+        cx.notify();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let out = host::runtime()
+                .spawn(async move {
+                    let Some(uv) = crate::vibe_dist::uv_binary() else {
+                        return Err("uv not found — install it from astral.sh/uv".to_string());
+                    };
+                    let Some(root) = crate::vibe_dist::dist_root() else {
+                        return Err("no data directory (HOME/XDG_DATA_HOME unset)".to_string());
+                    };
+                    std::fs::create_dir_all(&root).map_err(|e| format!("{e}"))?;
+                    if upgrade {
+                        crate::vibe_dist::upgrade(&uv, &root, None).await
+                    } else {
+                        crate::vibe_dist::install(&uv, &root, None).await
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| Err("dist task failed".into()));
+            let _ = this.update(cx, |app, cx| {
+                app.dist_inflight = false;
+                match out {
+                    Ok(version) => {
+                        app.vibe_dist = crate::vibe_dist::VibeDist::Installed {
+                            version,
+                            managed: true,
+                        };
+                        cx.notify();
+                        if !upgrade {
+                            // The new binary may finally resolve
+                            // `server_binary` — retry the catalog so
+                            // existing sessions appear.
+                            app.refresh_sessions(cx);
+                        }
+                        // Fresh probe so a post-install update badge
+                        // appears. Only on success — a Failed state must
+                        // keep its error + retry action.
+                        app.probe_dist(true, cx);
+                    }
+                    Err(e) => {
+                        app.vibe_dist = crate::vibe_dist::VibeDist::Failed {
+                            upgrade,
+                            error: e,
+                        };
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// OS notification for a session event the user probably missed —
+    /// suppressed while the window is focused on that session, and by
+    /// `VIBE_DESKTOP_NO_NOTIFY` (CI/headless runs). Caller supplies the
+    /// id + title: this runs inside another view's update, so it must
+    /// not read any session entity (`open_ids` is the reentrancy-safe
+    /// cache for exactly this).
+    pub fn notify_attention(&mut self, sid: &str, title: &str, what: &str) {
+        if std::env::var_os("VIBE_DESKTOP_NO_NOTIFY").is_some() {
+            return;
+        }
+        let on_selected = self.open_ids.get(self.selected).map(String::as_str) == Some(sid);
+        if self.window_active && on_selected {
+            return;
+        }
+        let _ = notify_rust::Notification::new()
+            .appname("vibe desktop")
+            .summary(title)
+            .body(what)
+            .show();
+    }
+
     /// Catalog connection (never attaches a session): serves `session/list`.
     /// Re-entrant-safe: one catalog request at a time; the completion
     /// re-fires when `show_archived` changed under it.
     pub fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
         if self.catalog_inflight.is_some() {
+            // Don't drop the request — the in-flight call may carry a
+            // stale server path (e.g. pre-install), so queue a replay.
+            self.catalog_retry_pending = true;
             return;
         }
         let include_archived = self.show_archived;
@@ -203,7 +349,10 @@ impl VibeApp {
                 }
                 // The archived toggle flipped while this request was in
                 // flight — reload with the filter the user now expects.
-                if app.show_archived != include_archived {
+                // A retry queued mid-flight (post-install catalog
+                // recovery) replays too.
+                if app.show_archived != include_archived || app.catalog_retry_pending {
+                    app.catalog_retry_pending = false;
                     app.refresh_sessions(cx);
                 } else if app.cwd_gen != cwd_gen_at_start {
                     // A relocate landed mid-refresh — the fetched rows
