@@ -84,3 +84,5 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # Semver prerelease suffix in the tag (v0.1.0-alpha) → prerelease.
+          prerelease: ${{ contains(github.ref_name, '-') }}
