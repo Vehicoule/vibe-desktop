@@ -172,24 +172,28 @@ pub async fn latest_version() -> Option<String> {
 /// installs resolve a named release instead of floating `latest`.
 /// `--force` repairs a tool entry whose binary went missing. uv itself
 /// verifies artifacts against index metadata; there is no
-/// per-artifact hash pinning for `uv tool install`.
-pub async fn install(uv: &Path, root: &Path) -> Result<String, String> {
-    let spec = latest_version()
-        .await
-        .map(|v| format!("mistral-vibe=={v}"))
-        .unwrap_or_else(|| "mistral-vibe".to_string());
+/// per-artifact hash pinning for `uv tool install`. `pin` overrides
+/// the resolved version (tests inject it to stay offline).
+pub async fn install(uv: &Path, root: &Path, pin: Option<&str>) -> Result<String, String> {
+    let spec = match pin {
+        Some(v) => format!("mistral-vibe=={v}"),
+        None => latest_version()
+            .await
+            .map(|v| format!("mistral-vibe=={v}"))
+            .unwrap_or_else(|| "mistral-vibe".to_string()),
+    };
     run_uv(uv, root, &["tool", "install", "--force", &spec]).await?;
     installed_version(uv, root)
         .await
         .ok_or_else(|| "install finished but mistral-vibe is not listed".to_string())
 }
 
-/// `uv tool upgrade mistral-vibe` inside the managed env.
-pub async fn upgrade(uv: &Path, root: &Path) -> Result<String, String> {
-    run_uv(uv, root, &["tool", "upgrade", "mistral-vibe"]).await?;
-    installed_version(uv, root)
-        .await
-        .ok_or_else(|| "upgrade finished but mistral-vibe is not listed".to_string())
+/// Update to the newest pinned release — a pinned `install --force`,
+/// NOT `uv tool upgrade`: the install's stored `==` requirement would
+/// pin the upgrade resolution to the installed version forever. The
+/// force-install replaces both the env and the stored requirement.
+pub async fn upgrade(uv: &Path, root: &Path, pin: Option<&str>) -> Result<String, String> {
+    install(uv, root, pin).await
 }
 
 async fn run_uv(uv: &Path, root: &Path, args: &[&str]) -> Result<(), String> {
@@ -218,35 +222,34 @@ pub async fn probe(check_latest: bool) -> VibeDist {
             managed: false,
         };
     }
-    let Some(root) = dist_root() else {
-        return VibeDist::Failed {
-            upgrade: false,
-            error: "no data directory (HOME/XDG_DATA_HOME unset)".into(),
-        };
-    };
+    let root = dist_root();
     let uv = uv_binary();
-    let managed_version = match &uv {
-        Some(u) => installed_version(u, &root).await,
-        None => None,
+    let managed_version = match (&uv, &root) {
+        (Some(u), Some(r)) => installed_version(u, r).await,
+        _ => None,
     };
     // A runnable managed binary reports installed even without uv — uv
     // only gates install/update, not the probe. A `tool list` entry
     // whose binary is gone does NOT count: that's a broken install the
     // install CTA repairs via `--force`.
-    if managed_binary(&root).is_file() {
-        let installed = managed_version.unwrap_or_else(|| "unknown".into());
-        if check_latest && installed != "unknown" {
-            if let Some(latest) = latest_version().await {
-                if newer_than(&latest, &installed) {
-                    return VibeDist::UpdateAvailable { installed, latest };
+    if let Some(root) = &root {
+        if managed_binary(root).is_file() {
+            let installed = managed_version.unwrap_or_else(|| "unknown".into());
+            if check_latest && installed != "unknown" {
+                if let Some(latest) = latest_version().await {
+                    if newer_than(&latest, &installed) {
+                        return VibeDist::UpdateAvailable { installed, latest };
+                    }
                 }
             }
+            return VibeDist::Installed {
+                version: installed,
+                managed: true,
+            };
         }
-        return VibeDist::Installed {
-            version: installed,
-            managed: true,
-        };
     }
+    // A system/PATH server needs no per-user data dir — check it before
+    // the managed-root failure so the row describes a runnable server.
     let system_present = std::env::var_os("HOME")
         .map(|h| Path::new(&h).join(".local/bin/vibe-app-server").exists())
         .unwrap_or(false)
@@ -255,6 +258,12 @@ pub async fn probe(check_latest: bool) -> VibeDist {
         return VibeDist::Installed {
             version: "unknown".into(),
             managed: false,
+        };
+    }
+    if root.is_none() {
+        return VibeDist::Failed {
+            upgrade: false,
+            error: "no data directory (HOME/XDG_DATA_HOME unset)".into(),
         };
     }
     if uv.is_none() {
@@ -311,10 +320,11 @@ tool="$UV_TOOL_DIR/mistral-vibe"
 ver_file="$tool/VER"
 case "$1 $2" in
   "tool install")
-    mkdir -p "$tool/bin"; echo 0.4.0 > "$ver_file"; touch "$tool/bin/vibe-app-server" ;;
-  "tool upgrade")
-    cur=$(cat "$ver_file" 2>/dev/null || echo 0.0.0)
-    echo "${cur%.*}.9" > "$ver_file" ;;
+    # install --force mistral-vibe==<v> → the pinned version lands;
+    # an unpinned spec installs the fake's default.
+    mkdir -p "$tool/bin"
+    v="${4##*==}"; [ "$v" = "$4" ] && v="0.4.0"
+    echo "$v" > "$ver_file"; touch "$tool/bin/vibe-app-server" ;;
   "tool list")
     [ -f "$ver_file" ] && echo "mistral-vibe $(cat "$ver_file")" || true ;;
 esac
@@ -326,14 +336,17 @@ esac
         let root = dir.join("dist");
         std::fs::create_dir_all(&root).unwrap();
 
-        // install → managed binary + version land.
-        let v = install(&uv, &root).await.unwrap();
+        // install → managed binary + version land (pinned spec, no
+        // network).
+        let v = install(&uv, &root, Some("0.4.0")).await.unwrap();
         assert_eq!(v, "0.4.0");
         assert!(managed_binary(&root).is_file());
         assert_eq!(installed_version(&uv, &root).await.as_deref(), Some("0.4.0"));
 
-        // upgrade moves the version marker.
-        let v = upgrade(&uv, &root).await.unwrap();
+        // upgrade = pinned reinstall at the newer pin (not
+        // `uv tool upgrade`, which would stay pinned to the stored
+        // `==` requirement).
+        let v = upgrade(&uv, &root, Some("0.4.9")).await.unwrap();
         assert_eq!(v, "0.4.9");
         assert_eq!(installed_version(&uv, &root).await.as_deref(), Some("0.4.9"));
 

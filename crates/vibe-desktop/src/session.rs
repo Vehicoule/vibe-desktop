@@ -2057,6 +2057,21 @@ impl SessionView {
         true
     }
 
+    /// Status-edge alerts: `prev` was the label before the state change
+    /// (live event or adopt-replayed one), the projection holds `now`.
+    fn alert_transition(&self, prev: &str, cx: &mut Context<Self>) {
+        let now = self.projection.state.session.status.label();
+        if now == "blocked" && prev != "blocked" {
+            self.notify_attention("needs attention — approval waiting", cx);
+        } else if prev == "running" {
+            match now {
+                "idle" => self.notify_attention("turn finished", cx),
+                "failed" => self.notify_attention("turn failed", cx),
+                _ => {}
+            }
+        }
+    }
+
     /// Ping the app-level notifier — the app decides whether this
     /// session is visible enough to skip it.
     fn notify_attention(&self, what: &str, cx: &mut Context<Self>) {
@@ -2202,8 +2217,26 @@ impl SessionView {
                     return;
                 };
                 let done = this
-                    .update(cx, |view, _cx| {
-                        view.projection.adopt(state) && !view.projection.needs_resync()
+                    .update(cx, |view, cx| {
+                        // adopt() replays buffered stream events
+                        // internally — they never re-enter
+                        // on_server_message, so a buffered
+                        // turn/completed or blocked transition would
+                        // otherwise lose its attention ping. Compare
+                        // status across adoption and alert on the edge.
+                        let prev = view
+                            .projection
+                            .state
+                            .session
+                            .status
+                            .label()
+                            .to_string();
+                        let adopted =
+                            view.projection.adopt(state) && !view.projection.needs_resync();
+                        if adopted {
+                            view.alert_transition(&prev, cx);
+                        }
+                        adopted
                     })
                     .unwrap_or(true);
                 if done {

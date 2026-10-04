@@ -41,6 +41,10 @@ pub struct VibeApp {
     /// flight — also the re-entrancy guard. A toggle during the flight
     /// re-runs the refresh once it lands.
     catalog_inflight: Option<bool>,
+    /// A refresh requested while `catalog_inflight` was occupied —
+    /// replayed when that request lands (e.g. post-install retry while
+    /// the startup request is still running).
+    catalog_retry_pending: bool,
     /// Directory paths bound to remote projects (`projectLinks/list`) —
     /// rail rows inside one get a link marker.
     pub linked_dirs: std::collections::HashSet<String>,
@@ -95,6 +99,7 @@ impl VibeApp {
             spawning: false,
             show_archived: false,
             catalog_inflight: None,
+            catalog_retry_pending: false,
             linked_dirs: std::collections::HashSet::new(),
             linked_gen: 0,
             vibe_dist: crate::vibe_dist::VibeDist::Missing,
@@ -196,9 +201,9 @@ impl VibeApp {
                     };
                     std::fs::create_dir_all(&root).map_err(|e| format!("{e}"))?;
                     if upgrade {
-                        crate::vibe_dist::upgrade(&uv, &root).await
+                        crate::vibe_dist::upgrade(&uv, &root, None).await
                     } else {
-                        crate::vibe_dist::install(&uv, &root).await
+                        crate::vibe_dist::install(&uv, &root, None).await
                     }
                 })
                 .await
@@ -262,6 +267,9 @@ impl VibeApp {
     /// re-fires when `show_archived` changed under it.
     pub fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
         if self.catalog_inflight.is_some() {
+            // Don't drop the request — the in-flight call may carry a
+            // stale server path (e.g. pre-install), so queue a replay.
+            self.catalog_retry_pending = true;
             return;
         }
         let include_archived = self.show_archived;
@@ -335,7 +343,10 @@ impl VibeApp {
                 }
                 // The archived toggle flipped while this request was in
                 // flight — reload with the filter the user now expects.
-                if app.show_archived != include_archived {
+                // A retry queued mid-flight (post-install catalog
+                // recovery) replays too.
+                if app.show_archived != include_archived || app.catalog_retry_pending {
+                    app.catalog_retry_pending = false;
                     app.refresh_sessions(cx);
                 }
                 cx.notify();
