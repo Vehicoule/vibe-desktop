@@ -1449,9 +1449,15 @@ impl SessionView {
                             11.5,
                             c(color),
                         ));
-                    // Only enabled↔disabled transitions are wire-toggleable.
-                    if matches!(src.status.as_str(), "enabled" | "disabled")
-                        && !self.ext_busy(&format!("mcp:{name}"))
+                    // enabled↔disabled; connector sources toggle
+                    // connected↔disabled through their own catalog.
+                    if matches!(
+                        (src.kind.as_str(), src.status.as_str()),
+                        ("connector", "connected")
+                            | ("connector", "disabled")
+                            | (_, "enabled")
+                            | (_, "disabled")
+                    ) && !self.ext_busy(&format!("mcp:{name}"))
                     {
                         row = row.cursor_pointer().on_click(
                             cx.listener(move |v, _e, _w, cx| v.toggle_mcp(name.clone(), cx)),
