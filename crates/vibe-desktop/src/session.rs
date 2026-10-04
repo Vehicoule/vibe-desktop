@@ -105,6 +105,11 @@ pub struct SessionView {
     pub loops: Vec<ScheduledLoop>,
     pub loop_input: String,
     pub loop_focus: FocusHandle,
+    /// Ordering guards — `refresh_loops`/`load_worktrees` bump on issue;
+    /// a response that loses the race against a newer read (or a
+    /// mutation's replacement read) is dropped.
+    loops_gen: u64,
+    worktrees_gen: u64,
     /// `review/state` snapshot for the review sheet.
     pub review: Option<ReviewStateResponse>,
     /// Review sheet open/closed.
@@ -203,6 +208,8 @@ impl SessionView {
             loops: Vec::new(),
             loop_input: String::new(),
             loop_focus: cx.focus_handle(),
+            loops_gen: 0,
+            worktrees_gen: 0,
             review: None,
             review_open: false,
             review_diff: None,
@@ -248,6 +255,10 @@ impl SessionView {
     fn load_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_gen += 1;
         let gen = self.settings_gen;
+        // Loops mutate through their own channel — capture its epoch so
+        // this batch can't restore a list a newer refresh already
+        // replaced.
+        let loops_gen = self.loops_gen;
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -301,8 +312,10 @@ impl SessionView {
                     view.plugins = resp.plugins.plugins;
                     view.plugin_dropped = resp.plugins.dropped;
                 }
-                if let Ok(resp) = loops {
-                    view.loops = resp.loops;
+                if view.loops_gen == loops_gen {
+                    if let Ok(resp) = loops {
+                        view.loops = resp.loops;
+                    }
                 }
                 cx.notify();
             });
@@ -452,17 +465,20 @@ impl SessionView {
     }
 
     /// `workspace/git/worktrees/list` — workspace-scoped, keyed by the
-    /// session's project root rather than a session id.
+    /// session's project root rather than a session id. `worktrees_gen`
+    /// drops a response that loses to a newer read.
     fn load_worktrees(&mut self, cx: &mut Context<Self>) {
         let Some(cwd) = self.projection.state.session.cwd.clone() else {
             return;
         };
+        self.worktrees_gen += 1;
+        let gen = self.worktrees_gen;
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
             let resp = conn.workspace_worktrees(&cwd).await;
             let _ = this.update(cx, |view, cx| {
-                if view.session_id() != sid {
+                if view.session_id() != sid || view.worktrees_gen != gen {
                     return;
                 }
                 if let Ok(resp) = resp {
@@ -475,14 +491,18 @@ impl SessionView {
         .detach();
     }
 
-    /// `loops/list` refresh after a create/delete mutation.
+    /// `loops/list` refresh after a create/delete mutation. Bumping
+    /// `loops_gen` also invalidates an in-flight settings batch's loops
+    /// arm — it captured the pre-mutation generation.
     fn refresh_loops(&mut self, cx: &mut Context<Self>) {
+        self.loops_gen += 1;
+        let gen = self.loops_gen;
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
             let resp = conn.loops_list(&sid).await;
             let _ = this.update(cx, |view, cx| {
-                if view.session_id() != sid {
+                if view.session_id() != sid || view.loops_gen != gen {
                     return;
                 }
                 if let Ok(resp) = resp {
@@ -530,7 +550,12 @@ impl SessionView {
                 view.ext_inflight.remove("loop:create");
                 match resp {
                     Ok(_) => {
-                        view.loop_input.clear();
+                        // Only clear if the editor still holds the
+                        // submitted text — a draft typed while the
+                        // create was in flight must survive.
+                        if view.loop_input.trim() == text {
+                            view.loop_input.clear();
+                        }
                         view.refresh_loops(cx);
                     }
                     Err(e) => view.error = Some(format!("loop create failed: {e}")),
@@ -1033,10 +1058,10 @@ impl SessionView {
             self.worktrees.clear();
             self.repo_branch = None;
             self.loops.clear();
+            self.loops_gen += 1;
+            self.worktrees_gen += 1;
             if self.settings_open {
                 self.load_worktrees(cx);
-            }
-            if self.settings_open {
                 self.load_settings(cx);
             }
             if self.review_open {

@@ -596,7 +596,6 @@ async fn settings_roundtrip_reads_and_writes() {
     let agents = conn.agents_list(&sid).await.unwrap();
     assert_eq!(agents.active.name, "plan");
     assert!(conn.session_agent_update(&sid, "bogus").await.is_err());
-
     cleanup(conn, &dir).await;
 }
 
@@ -746,5 +745,34 @@ async fn worktrees_and_loops() {
     assert!(conn.loops_list(&sid).await.unwrap().loops.is_empty());
     assert!(conn.loops_delete(&sid, "loop-9").await.is_err());
 
+    // Ids are monotonic — create,create,delete-first,create must not
+    // overwrite the surviving loop.
+    let a = conn.loops_create(&sid, "1m", "first").await.unwrap();
+    let b = conn.loops_create(&sid, "2m", "second").await.unwrap();
+    conn.loops_delete(&sid, &a.scheduled_loop.id).await.unwrap();
+    let c = conn.loops_create(&sid, "3m", "third").await.unwrap();
+    let remaining = conn.loops_list(&sid).await.unwrap().loops;
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().any(|l| l.prompt == "second"));
+    assert!(remaining.iter().any(|l| l.prompt == "third"));
+    assert_ne!(b.scheduled_loop.id, c.scheduled_loop.id);
+
+    // Bad intervals reject instead of defaulting to 60s.
+    assert!(conn.loops_create(&sid, "5x", "bad").await.is_err());
+    assert!(conn.loops_create(&sid, "mé", "bad").await.is_err());
+
+    // Loops are session-scoped — a second fixture process on the same
+    // store sees none of these (one connection = one session).
+    let mut conn2 = spawn_fixture(&envs).await;
+    conn2.initialize(info(), caps()).await.unwrap();
+    let (sid2, _rx2) = session_with_completed_turn(&mut conn2).await;
+    assert_ne!(sid, sid2);
+    assert!(conn2.loops_list(&sid2).await.unwrap().loops.is_empty());
+    assert!(conn2
+        .loops_delete(&sid2, &b.scheduled_loop.id)
+        .await
+        .is_err());
+
+    drop(conn2);
     cleanup(conn, &dir).await;
 }
