@@ -1657,9 +1657,11 @@ impl SessionView {
             );
 
         // ── open diff view ──
-        if let Some((path, _owner, diff)) = &self.review_diff {
+        if let Some((path, owner, diff)) = &self.review_diff {
             let keep_path = path.clone();
             let revert_path = path.clone();
+            let keep_owner = owner.clone();
+            let revert_owner = owner.clone();
             let busy = self.review_busy(path);
             let mut lines = div().flex().flex_col();
             for change in
@@ -1698,14 +1700,24 @@ impl SessionView {
                                 el.child(
                                     ghost_button("review-keep", "keep").on_click(cx.listener(
                                         move |v, _e, _w, cx| {
-                                            v.review_apply_file(keep_path.clone(), true, cx)
+                                            v.review_apply_file(
+                                                keep_path.clone(),
+                                                keep_owner.clone(),
+                                                true,
+                                                cx,
+                                            )
                                         },
                                     )),
                                 )
                                 .child(
                                     ghost_button("review-revert", "revert").on_click(
                                         cx.listener(move |v, _e, _w, cx| {
-                                            v.review_apply_file(revert_path.clone(), false, cx)
+                                            v.review_apply_file(
+                                                revert_path.clone(),
+                                                revert_owner.clone(),
+                                                false,
+                                                cx,
+                                            )
                                         }),
                                     ),
                                 )

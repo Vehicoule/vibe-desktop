@@ -2199,10 +2199,20 @@ async fn main() {
                 .await;
             }
             "review/turnDiff" => {
+                // Echo the request's path + owner into the content — a
+                // fixed diff would mask a client asking for the wrong
+                // file or scope, so every target gets its own bytes.
+                let req_path = params["path"].as_str().unwrap_or("?").to_string();
+                let owner = params["owner"].clone();
+                let owner_tag = match owner["kind"].as_str() {
+                    Some("agent") => format!("agent:{}", owner["turnId"]),
+                    Some("manual") => format!("manual:{}", owner["index"]),
+                    other => format!("{:?}", other.unwrap_or("none")),
+                };
                 respond(json!({
                     "status": "modified",
-                    "baseline": "fn main() {\n    old_call();\n}\n",
-                    "current": "fn main() {\n    old_call();\n    new_call();\n}\n"
+                    "baseline": format!("// {req_path} [{owner_tag}] baseline\nfn main() {{\n    old_call();\n}}\n"),
+                    "current": format!("// {req_path} [{owner_tag}] current\nfn main() {{\n    old_call();\n    new_call();\n}}\n")
                 }))
                 .await;
             }

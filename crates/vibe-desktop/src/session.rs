@@ -793,6 +793,10 @@ impl SessionView {
         let Some(owner) = owner.or_else(|| self.review_owner_for(&path)) else {
             return;
         };
+        // Drop the displayed diff at once — keep/revert must not stay
+        // actionable on the previous file while this read is in flight.
+        self.review_diff = None;
+        cx.notify();
         self.review_diff_sel = Some((path.clone(), owner.clone()));
         self.review_diff_gen += 1;
         let gen = self.review_diff_gen;
@@ -861,17 +865,65 @@ impl SessionView {
         cx.notify();
     }
 
-    /// `review/approve` (`keep`) or `review/revert` for a whole file, then
-    /// refresh the state and close the diff. One decision per file at a
-    /// time — a second click while the first is in flight is ignored.
-    pub fn review_apply_file(&mut self, path: String, keep: bool, cx: &mut Context<Self>) {
+    /// Is `owner` genuinely attached to `path` — a scope naming the pair
+    /// or a regioned file whose regions name it? The first-scope fallback
+    /// in `review_owner_for` only exists so `turnDiff` can READ; deciding
+    /// through a borrowed owner would target changes it doesn't own.
+    fn review_owner_authoritative(&self, path: &str, owner: &ReviewOwner) -> bool {
+        let Some(state) = self.review.as_ref() else {
+            return false;
+        };
+        if state
+            .scopes
+            .iter()
+            .any(|s| s.owner == *owner && s.files.iter().any(|f| f.path == path))
+        {
+            return true;
+        }
+        state
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| {
+                !f.regions.is_empty()
+                    && f.regions.iter().any(|r| r.owner().as_ref() == Some(owner))
+            })
+            .unwrap_or(false)
+    }
+
+    /// `review/approve` (`keep`) or `review/revert`, then refresh state.
+    /// Target: `ScopeFile` when the owner genuinely claims the file (the
+    /// diff shows that scope's slice — the decision must hit the same
+    /// unit); `File` when the owner was only a read-fallback, where a
+    /// scoped target would miss the file's real changes. One decision
+    /// per file at a time — a second click while in flight is ignored.
+    pub fn review_apply_file(
+        &mut self,
+        path: String,
+        owner: ReviewOwner,
+        keep: bool,
+        cx: &mut Context<Self>,
+    ) {
         if !self.review_inflight.insert(path.clone()) {
             return;
         }
+        // A scope-listed owner decides that scope's slice; a file with no
+        // authoritative owner (unscoped + regionless) decides file-wide —
+        // `ScopeFile` on a borrowed owner would miss its changes.
+        let scoped = self.review_owner_authoritative(&path, &owner);
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
-            let target = ReviewTarget::File { path: path.clone() };
+            let target = if scoped {
+                ReviewTarget::ScopeFile {
+                    owner: owner.clone(),
+                    path: path.clone(),
+                }
+            } else {
+                ReviewTarget::File {
+                    path: path.clone(),
+                }
+            };
             let result = if keep {
                 conn.review_approve(&sid, &target).await
             } else {
@@ -884,9 +936,17 @@ impl SessionView {
                 view.review_inflight.remove(&path);
                 match result {
                     Ok(()) => {
-                        view.review_diff = None;
-                        view.review_diff_sel = None;
-                        view.review_diff_gen += 1;
+                        // Only close the diff that the decision applied
+                        // to — a file-wide decision closes its file's diff,
+                        // a scoped one only the matching (path, owner).
+                        let hit = view.review_diff_sel.as_ref().is_some_and(|(p, o)| {
+                            *p == path && (!scoped || *o == owner)
+                        });
+                        if hit {
+                            view.review_diff = None;
+                            view.review_diff_sel = None;
+                            view.review_diff_gen += 1;
+                        }
                         view.load_review(cx);
                     }
                     Err(e) => view.error = Some(format!("review write failed: {e}")),
@@ -1659,10 +1719,12 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.session_relocate(&sid, &cwd).await;
             let _ = this.update(cx, |view, cx| {
-                view.relocate_inflight = false;
+                // A reply that outlived a handoff must not clear a NEW
+                // relocate's busy flag — check ownership first.
                 if view.session_id() != sid {
                     return;
                 }
+                view.relocate_inflight = false;
                 match resp {
                     Ok(r) => {
                         // adopt() refuses a stale snapshot — resync then.
@@ -1676,6 +1738,7 @@ impl SessionView {
                         let sid2 = view.session_id().to_string();
                         view.close_picker(&sid2, cx);
                         view.worktrees.clear();
+                        view.repo_branch = None;
                         view.config_fields.clear();
                         view.trust_dismissed = false;
                         view.check_trust(cx);
@@ -1930,6 +1993,11 @@ impl SessionView {
         cx.spawn(async move |this, cx| {
             let result = conn.workspace_trust_status(cwd.as_deref()).await;
             let _ = this.update(cx, |view, cx| {
+                // The read raced a relocate — it describes the OLD cwd
+                // and must not overwrite the new workspace's status.
+                if view.projection.state.session.cwd != cwd {
+                    return;
+                }
                 if let Ok(status) = result {
                     // Clear a stale banner too — after a relocate the
                     // new cwd may be trusted where the old one wasn't.
@@ -2453,9 +2521,20 @@ impl SessionView {
                     Ok(resp) => {
                         if inplace {
                             // Same-session truncation: the returned state
-                            // supersedes the projection wholesale.
+                            // supersedes the projection wholesale — and
+                            // rewound-away edits must leave the review
+                            // sheet, which a same-session replace can't
+                            // reach through the notification refresh.
                             if !view.projection.adopt(resp.state) {
                                 view.resync(cx);
+                            }
+                            view.review = None;
+                            view.review_diff = None;
+                            view.review_diff_sel = None;
+                            view.review_state_gen += 1;
+                            view.review_diff_gen += 1;
+                            if view.review_open {
+                                view.load_review(cx);
                             }
                         } else if let Some(app) = view.app.as_ref().and_then(|w| w.upgrade()) {
                             let id = resp.state.session.id.clone();
