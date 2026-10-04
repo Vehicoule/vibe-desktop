@@ -1768,35 +1768,6 @@ impl ReviewRegion {
             }
         }
     }
-
-    /// Region ref for depends_on/mutation targeting.
-    pub fn region_ref(&self) -> ReviewRegionRef {
-        let (version_index, ordinal) = match self {
-            ReviewRegion::Text {
-                version_index,
-                ordinal,
-                ..
-            }
-            | ReviewRegion::Opaque {
-                version_index,
-                ordinal,
-                ..
-            } => (*version_index, *ordinal),
-        };
-        ReviewRegionRef {
-            version_index,
-            ordinal,
-        }
-    }
-
-    /// `pending` | `keep` | `revert`
-    pub fn decision(&self) -> &str {
-        match self {
-            ReviewRegion::Text { decision, .. } | ReviewRegion::Opaque { decision, .. } => {
-                decision
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
