@@ -1495,6 +1495,120 @@ impl SessionView {
                 .child(text("plugins", 10.5, c(theme::INK_FAINT)))
                 .child(rows);
         }
+
+        // ── worktrees (workspace/git/worktrees/list) ──
+        if !self.worktrees.is_empty() || self.repo_branch.is_some() {
+            let mut rows = div().flex().flex_col().gap_1();
+            if let Some(branch) = &self.repo_branch {
+                rows = rows.child(text(
+                    format!("main checkout · {branch}"),
+                    11.5,
+                    c(theme::INK_FAINT),
+                ));
+            }
+            for w in &self.worktrees {
+                let changes = w
+                    .branch_changes
+                    .as_ref()
+                    .map(|c| format!(" +{} −{}", c.additions, c.deletions))
+                    .unwrap_or_default();
+                rows = rows.child(text(
+                    format!("{} · {}{}", w.name, w.branch, changes),
+                    11.5,
+                    c(theme::INK_SOFT),
+                ));
+            }
+            sheet = sheet
+                .child(text("worktrees", 10.5, c(theme::INK_FAINT)))
+                .child(rows);
+        }
+
+        // ── scheduled loops (loops/list|create|delete) ──
+        {
+            let mut rows = div().flex().flex_col().gap_1();
+            for l in &self.loops {
+                let id = l.id.clone();
+                let deleting = self.ext_busy(&format!("loop:{id}"));
+                let mut row = div()
+                    .id(SharedString::from(format!("loop-row-{id}")))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(text(
+                        format!("every {}s · {}", l.interval_seconds, l.prompt),
+                        11.5,
+                        c(theme::INK_SOFT),
+                    ));
+                if !deleting {
+                    row = row.child(
+                        div()
+                            .id(SharedString::from(format!("loop-del-{id}")))
+                            .cursor_pointer()
+                            .child(text("✕", 10.5, c(theme::INK_FAINT)))
+                            .on_click(cx.listener(
+                                move |v, _e, _w, cx| v.delete_loop(id.clone(), cx),
+                            )),
+                    );
+                }
+                rows = rows.child(row);
+            }
+            // create input: `{interval} {prompt}` — e.g. `5m summarize the diff`
+            let input_text = if self.loop_input.is_empty() {
+                "5m prompt…".to_string()
+            } else {
+                format!("{}▏", self.loop_input)
+            };
+            let creating = self.ext_busy("loop:create");
+            let mut create_row = div()
+                .id("loop-create")
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .track_focus(&self.loop_focus)
+                        .flex_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(c(theme::IVORY))
+                        .border_1()
+                        .border_color(c(theme::EDGE))
+                        .on_key_down(cx.listener(|v, e: &gpui::KeyDownEvent, _w, cx| {
+                            match e.keystroke.key.as_str() {
+                                "backspace" => v.edit_loop_input(None, cx),
+                                "enter" => v.create_loop(cx),
+                                _ => {
+                                    if let Some(ch) = &e.keystroke.key_char {
+                                        v.edit_loop_input(Some(ch), cx);
+                                    }
+                                }
+                            }
+                        }))
+                        .child(text(
+                            input_text,
+                            11.0,
+                            c(if self.loop_input.is_empty() {
+                                theme::INK_FAINT
+                            } else {
+                                theme::INK
+                            }),
+                        )),
+                )
+                .on_click(cx.listener(|v, _e, window, _cx| {
+                    window.focus(&v.loop_focus);
+                }));
+            if !creating {
+                create_row = create_row.child(
+                    ghost_button("loop-create-btn", "create")
+                        .on_click(cx.listener(|v, _e, _w, cx| v.create_loop(cx))),
+                );
+            }
+            rows = rows.child(create_row);
+            sheet = sheet
+                .child(text("loops", 10.5, c(theme::INK_FAINT)))
+                .child(rows);
+        }
         Some(sheet)
     }
 

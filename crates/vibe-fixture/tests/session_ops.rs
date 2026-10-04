@@ -700,3 +700,45 @@ async fn extensions_roundtrip() {
 
     cleanup(conn, &dir).await;
 }
+
+/// M3d: workspace worktrees + scheduled loops.
+#[tokio::test]
+async fn worktrees_and_loops() {
+    let (dir, envs) = store();
+    let mut conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    let (sid, _rx) = session_with_completed_turn(&mut conn).await;
+
+    let wt = conn.workspace_worktrees("/repo").await.unwrap();
+    assert_eq!(wt.worktrees.len(), 1);
+    assert_eq!(wt.worktrees[0].branch, "feature-x");
+    assert_eq!(
+        wt.worktrees[0]
+            .branch_changes
+            .as_ref()
+            .map(|c| (c.additions, c.deletions)),
+        Some((12, 3))
+    );
+    assert_eq!(wt.repository_branch.as_deref(), Some("main"));
+
+    // loops: empty → create (interval parses 5m → 300s) → list → delete.
+    assert!(conn.loops_list(&sid).await.unwrap().loops.is_empty());
+    let created = conn
+        .loops_create(&sid, "5m", "summarize the diff")
+        .await
+        .unwrap();
+    assert_eq!(created.scheduled_loop.interval_seconds, 300);
+    let listed = conn.loops_list(&sid).await.unwrap();
+    assert_eq!(listed.loops.len(), 1);
+    assert_eq!(listed.loops[0].prompt, "summarize the diff");
+
+    let removed = conn
+        .loops_delete(&sid, &created.scheduled_loop.id)
+        .await
+        .unwrap();
+    assert_eq!(removed.scheduled_loop.id, created.scheduled_loop.id);
+    assert!(conn.loops_list(&sid).await.unwrap().loops.is_empty());
+    assert!(conn.loops_delete(&sid, "loop-9").await.is_err());
+
+    cleanup(conn, &dir).await;
+}

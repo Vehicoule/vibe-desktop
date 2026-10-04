@@ -2049,3 +2049,98 @@ pub struct PluginCatalogState {
 pub struct PluginsReadResponse {
     pub plugins: PluginCatalogState,
 }
+
+// ---------------------------------------------------------------------------
+// M3d: workspace — worktrees + scheduled loops
+// (protocol.py Workspace*Worktree* / Loops*; models.py ScheduledLoop)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGitBranchChanges {
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceLinkedWorktree {
+    pub name: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub root: String,
+    #[serde(default)]
+    pub repo_root: String,
+    pub branch_changes: Option<WorkspaceGitBranchChanges>,
+}
+
+/// `workspace/git/worktrees/list` — workspace-scoped (keyed by `cwd`, not
+/// `sessionId`); `includeDetails` gates `branchChanges` + repository fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceWorktreeListResponse {
+    #[serde(default)]
+    pub worktrees: Vec<WorkspaceLinkedWorktree>,
+    pub repository_branch: Option<String>,
+    pub repository_cwd: Option<String>,
+    pub repository_mapped_cwd: Option<String>,
+    pub repository_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceWorktreeListParams {
+    pub cwd: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub include_details: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledLoop {
+    pub id: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub interval_seconds: u64,
+    #[serde(default)]
+    pub next_fire_at: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoopsListResponse {
+    #[serde(default)]
+    pub loops: Vec<ScheduledLoop>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopsCreateParams {
+    pub session_id: String,
+    pub interval: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoopsCreateResponse {
+    #[serde(rename = "loop")]
+    pub scheduled_loop: ScheduledLoop,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopsDeleteParams {
+    pub session_id: String,
+    pub loop_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoopsDeleteResponse {
+    #[serde(rename = "loop")]
+    pub scheduled_loop: ScheduledLoop,
+}

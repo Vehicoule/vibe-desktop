@@ -2037,6 +2037,70 @@ async fn main() {
                 }}))
                 .await;
             }
+            "workspace/git/worktrees/list" => {
+                respond(json!({
+                    "worktrees": [
+                        {"name": "feature-x", "branch": "feature-x",
+                         "cwd": "/repo/.worktrees/feature-x", "root": "/repo",
+                         "repoRoot": "/repo",
+                         "branchChanges": {"additions": 12, "deletions": 3}}
+                    ],
+                    "repositoryBranch": "main",
+                    "repositoryCwd": "",
+                    "repositoryMappedCwd": "",
+                    "repositoryRoot": "/repo"
+                }))
+                .await;
+            }
+            "loops/list" => {
+                let loops = read_overlay(&store, "loops.json");
+                respond(json!({"loops": loops.values().cloned().collect::<Vec<_>>()}))
+                    .await;
+            }
+            "loops/create" => {
+                let mut loops = read_overlay(&store, "loops.json");
+                let id = format!("loop-{}", loops.len() + 1);
+                let interval: u64 = params["interval"]
+                    .as_str()
+                    .and_then(|s| {
+                        // parse `<n><unit>` like upstream parse_interval
+                        let (n, u) = s.split_at(s.len().saturating_sub(1));
+                        let mult = match u {
+                            "s" => 1u64,
+                            "m" => 60,
+                            "h" => 3600,
+                            "d" => 86400,
+                            _ => return None,
+                        };
+                        n.parse::<u64>().ok().map(|v| v * mult)
+                    })
+                    .unwrap_or(60);
+                let entry = json!({
+                    "id": id,
+                    "prompt": params["prompt"],
+                    "intervalSeconds": interval,
+                    "nextFireAt": 0.0
+                });
+                loops.insert(id, entry.clone());
+                if persist_overlay(&store, "loops.json", &loops).await {
+                    respond(json!({"loop": entry})).await;
+                } else {
+                    respond_err("internal_error", "fixture: loop persist failed").await;
+                }
+            }
+            "loops/delete" => {
+                let mut loops = read_overlay(&store, "loops.json");
+                let id = params["loopId"].as_str().unwrap_or_default();
+                let Some(entry) = loops.remove(id) else {
+                    respond_err("not_found", "fixture: unknown loop").await;
+                    continue;
+                };
+                if persist_overlay(&store, "loops.json", &loops).await {
+                    respond(json!({"loop": entry})).await;
+                } else {
+                    respond_err("internal_error", "fixture: loop persist failed").await;
+                }
+            }
             "runtime/read" => {
                 respond(json!({
                     "runtime": {

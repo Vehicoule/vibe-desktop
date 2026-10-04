@@ -91,13 +91,20 @@ pub struct SessionView {
     pub plugins: Vec<PluginCatalogEntry>,
     pub plugin_dropped: Vec<PluginCatalogDropped>,
     /// Extension entities with an in-flight mutation
-    /// (`"skill:{name}"` | `"mcp:{name}"`) — second clicks are ignored
-    /// while a toggle is unsettled.
+    /// (`"skill:{name}"` | `"mcp:{name}"` | `"loop:{id}"` |
+    /// `"loop:create"`) — second clicks are ignored while unsettled.
     ext_inflight: HashSet<String>,
     /// Generation for settings reads — a stale `load_settings` batch
     /// can't undo a newer mutation reply (e.g. `runtime.mcp` after
     /// `mcp/toggle`).
     settings_gen: u64,
+    /// Linked worktrees (`workspace/git/worktrees/list`) + main branch.
+    pub worktrees: Vec<WorkspaceLinkedWorktree>,
+    pub repo_branch: Option<String>,
+    /// Scheduled loops (`loops/list`) + the create-input state.
+    pub loops: Vec<ScheduledLoop>,
+    pub loop_input: String,
+    pub loop_focus: FocusHandle,
     /// `review/state` snapshot for the review sheet.
     pub review: Option<ReviewStateResponse>,
     /// Review sheet open/closed.
@@ -191,6 +198,11 @@ impl SessionView {
             plugin_dropped: Vec::new(),
             ext_inflight: HashSet::new(),
             settings_gen: 0,
+            worktrees: Vec::new(),
+            repo_branch: None,
+            loops: Vec::new(),
+            loop_input: String::new(),
+            loop_focus: cx.focus_handle(),
             review: None,
             review_open: false,
             review_diff: None,
@@ -245,6 +257,7 @@ impl SessionView {
             let mcp = conn.mcp_read(&sid).await;
             let connectors = conn.connectors_read(&sid).await;
             let plugins = conn.plugins_read(&sid).await;
+            let loops = conn.loops_list(&sid).await;
             let _ = this.update(cx, |view, cx| {
                 // A handoff may have swapped the session while this was
                 // in flight — the response belongs to the old session; a
@@ -288,6 +301,9 @@ impl SessionView {
                     view.plugins = resp.plugins.plugins;
                     view.plugin_dropped = resp.plugins.dropped;
                 }
+                if let Ok(resp) = loops {
+                    view.loops = resp.loops;
+                }
                 cx.notify();
             });
         })
@@ -300,6 +316,7 @@ impl SessionView {
         self.settings_open = !self.settings_open;
         if self.settings_open {
             self.load_settings(cx);
+            self.load_worktrees(cx);
         }
         cx.notify();
     }
@@ -425,6 +442,123 @@ impl SessionView {
     /// A pending `skills/setEnabled` hasn't been confirmed yet.
     pub fn skill_pending(&self, name: &str) -> bool {
         self.pending_skills.contains_key(name)
+    }
+
+    /// `workspace/git/worktrees/list` — workspace-scoped, keyed by the
+    /// session's project root rather than a session id.
+    fn load_worktrees(&mut self, cx: &mut Context<Self>) {
+        let Some(cwd) = self.projection.state.session.cwd.clone() else {
+            return;
+        };
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn.workspace_worktrees(&cwd).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
+                if let Ok(resp) = resp {
+                    view.worktrees = resp.worktrees;
+                    view.repo_branch = resp.repository_branch;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `loops/list` refresh after a create/delete mutation.
+    fn refresh_loops(&mut self, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn.loops_list(&sid).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
+                if let Ok(resp) = resp {
+                    view.loops = resp.loops;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Loop-create input editing (same pattern as the composer).
+    pub fn edit_loop_input(&mut self, ch: Option<&str>, cx: &mut Context<Self>) {
+        match ch {
+            Some(c) => self.loop_input.push_str(c),
+            None => {
+                self.loop_input.pop();
+            }
+        }
+        cx.notify();
+    }
+
+    /// `loops/create` — input is `{interval} {prompt}` (e.g. `5m check the
+    /// build`); the first token is the interval string upstream parses.
+    pub fn create_loop(&mut self, cx: &mut Context<Self>) {
+        let text = self.loop_input.trim().to_string();
+        let Some((interval, prompt)) = text.split_once(char::is_whitespace) else {
+            return;
+        };
+        let prompt = prompt.trim();
+        if interval.is_empty() || prompt.is_empty() || !self.ext_inflight.insert("loop:create".into())
+        {
+            return;
+        }
+        let interval = interval.to_string();
+        let prompt = prompt.to_string();
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn.loops_create(&sid, &interval, &prompt).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
+                view.ext_inflight.remove("loop:create");
+                match resp {
+                    Ok(_) => {
+                        view.loop_input.clear();
+                        view.refresh_loops(cx);
+                    }
+                    Err(e) => view.error = Some(format!("loop create failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// `loops/delete` — one delete per loop at a time.
+    pub fn delete_loop(&mut self, id: String, cx: &mut Context<Self>) {
+        let key = format!("loop:{id}");
+        if !self.ext_inflight.insert(key.clone()) {
+            return;
+        }
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn.loops_delete(&sid, &id).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
+                view.ext_inflight.remove(&key);
+                match resp {
+                    Ok(_) => view.refresh_loops(cx),
+                    Err(e) => view.error = Some(format!("loop delete failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Fetch `review/state` for the review sheet. Refreshes every call —
@@ -887,6 +1021,12 @@ impl SessionView {
             self.plugins.clear();
             self.plugin_dropped.clear();
             self.ext_inflight.clear();
+            self.worktrees.clear();
+            self.repo_branch = None;
+            self.loops.clear();
+            if self.settings_open {
+                self.load_worktrees(cx);
+            }
             if self.settings_open {
                 self.load_settings(cx);
             }

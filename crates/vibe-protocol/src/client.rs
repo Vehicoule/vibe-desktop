@@ -955,6 +955,64 @@ impl Connection {
         self.request_typed("plugins/read", json!({"sessionId": session_id}))
             .await
     }
+
+    // ── M3d: workspace — worktrees + loops ──────────────────────────────
+
+    /// `workspace/git/worktrees/list` — workspace-scoped; `cwd` names the
+    /// checkout (the session's project root).
+    pub async fn workspace_worktrees(
+        &self,
+        cwd: &str,
+    ) -> ClientResult<WorkspaceWorktreeListResponse> {
+        self.request_typed(
+            "workspace/git/worktrees/list",
+            WorkspaceWorktreeListParams {
+                cwd: cwd.to_string(),
+                include_details: true,
+            },
+        )
+        .await
+    }
+
+    /// `loops/list` → the session's scheduled loops.
+    pub async fn loops_list(&self, session_id: &str) -> ClientResult<LoopsListResponse> {
+        self.request_typed("loops/list", json!({"sessionId": session_id}))
+            .await
+    }
+
+    /// `loops/create` — `interval` is `<n><unit>` (30s/5m/2h/1d).
+    pub async fn loops_create(
+        &self,
+        session_id: &str,
+        interval: &str,
+        prompt: &str,
+    ) -> ClientResult<LoopsCreateResponse> {
+        self.request_typed(
+            "loops/create",
+            LoopsCreateParams {
+                session_id: session_id.to_string(),
+                interval: interval.to_string(),
+                prompt: prompt.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `loops/delete` — removes and returns the deleted loop.
+    pub async fn loops_delete(
+        &self,
+        session_id: &str,
+        loop_id: &str,
+    ) -> ClientResult<LoopsDeleteResponse> {
+        self.request_typed(
+            "loops/delete",
+            LoopsDeleteParams {
+                session_id: session_id.to_string(),
+                loop_id: loop_id.to_string(),
+            },
+        )
+        .await
+    }
 }
 
 impl Drop for Connection {
