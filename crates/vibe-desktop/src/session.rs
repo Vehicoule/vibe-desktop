@@ -33,7 +33,7 @@ async fn read_current_file(cwd: &str, path: &str, deleted: bool) -> std::io::Res
     {
         Ok(Err(e)) if deleted && e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Ok(r) => r,
-        Err(join) => Err(std::io::Error::new(std::io::ErrorKind::Other, join)),
+        Err(join) => Err(std::io::Error::other(join)),
     }
 }
 
@@ -1233,12 +1233,20 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.projects_load_more(&sid, &picker_id).await;
             let _ = this.update(cx, |view, cx| {
-                // A stale reply must not release a NEWER picker's
-                // inflight key — check currency first, then remove.
-                if view.session_id() != sid || view.picker_gen != gen {
+                if view.session_id() != sid {
                     return;
                 }
-                view.picker_inflight.remove("load_more");
+                // Release the key when the same picker still owns it —
+                // a reply that lost the gen race to a mutation still
+                // finished this picker's page request. A mismatched id
+                // means close_picker already cleared the keys and a new
+                // picker may reuse "load_more".
+                if view.picker_id.as_deref() == Some(picker_id.as_str()) {
+                    view.picker_inflight.remove("load_more");
+                }
+                if view.picker_gen != gen {
+                    return;
+                }
                 match resp {
                     Ok(r) => view.picker = Some(r.view),
                     Err(e) => view.error = Some(format!("projects page failed: {e}")),
