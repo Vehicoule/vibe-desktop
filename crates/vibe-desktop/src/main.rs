@@ -32,7 +32,17 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            move |_window, cx| cx.new(|cx| VibeApp::new(backend, cx)),
+            move |window, cx| {
+                cx.new(|cx| {
+                    let app = VibeApp::new(backend, cx);
+                    cx.observe_window_activation(window, |app: &mut VibeApp, window, cx| {
+                        app.window_active = window.is_window_active();
+                        cx.notify();
+                    })
+                    .detach();
+                    app
+                })
+            },
         )
         .expect("open window");
         cx.activate(true);

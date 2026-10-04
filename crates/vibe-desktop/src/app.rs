@@ -54,6 +54,9 @@ pub struct VibeApp {
     pub vibe_dist: crate::vibe_dist::VibeDist,
     /// Serializes dist ops (probe/install/update) — one at a time.
     dist_inflight: bool,
+    /// Window focus — notifications only fire for sessions you're not
+    /// looking at (background tab, or window unfocused entirely).
+    pub window_active: bool,
 }
 
 enum AttachKind {
@@ -96,6 +99,7 @@ impl VibeApp {
             linked_gen: 0,
             vibe_dist: crate::vibe_dist::VibeDist::Missing,
             dist_inflight: false,
+            window_active: false,
         };
         app.refresh_sessions(cx);
         app.probe_dist(true, cx);
@@ -197,6 +201,33 @@ impl VibeApp {
             });
         })
         .detach();
+    }
+
+    /// OS notification for a session event the user probably missed —
+    /// suppressed while the window is focused on that session, and by
+    /// `VIBE_DESKTOP_NO_NOTIFY` (CI/headless runs).
+    pub fn notify_attention(&mut self, sid: &str, what: &str, cx: &mut Context<Self>) {
+        if std::env::var_os("VIBE_DESKTOP_NO_NOTIFY").is_some() {
+            return;
+        }
+        let on_selected = self
+            .open
+            .get(self.selected)
+            .is_some_and(|v| v.read(cx).session_id() == sid);
+        if self.window_active && on_selected {
+            return;
+        }
+        let title = self
+            .open
+            .iter()
+            .find(|v| v.read(cx).session_id() == sid)
+            .map(|v| v.read(cx).projection.state.session.display_title())
+            .unwrap_or_else(|| "vibe session".to_string());
+        let _ = notify_rust::Notification::new()
+            .appname("vibe desktop")
+            .summary(&title)
+            .body(what)
+            .show();
     }
 
     /// Catalog connection (never attaches a session): serves `session/list`.
