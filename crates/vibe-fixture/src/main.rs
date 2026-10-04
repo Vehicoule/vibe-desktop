@@ -335,11 +335,13 @@ impl SessionData {
 }
 
 /// Mark a stored turn record terminal — called at every site that ends
-/// a turn so `turns` never reports `running` after the turn is gone.
+/// a turn so `turns` never reports `in_progress` after the turn is gone.
+/// `completedAt` reuses the record's own `startedAt` (sequence clock) so
+/// durations never read negative.
 fn end_turn(inner: &mut SessionInner, tid: &str, status: &str) {
     if let Some(t) = inner.turns.iter_mut().find(|t| t["id"] == tid) {
         t["status"] = json!(status);
-        t["completedAt"] = json!(2);
+        t["completedAt"] = t["startedAt"].clone();
         if status != "completed" {
             t["stopReason"] = json!(status);
         }
@@ -892,7 +894,7 @@ async fn spawn_turn(
         inner.active_turn = Some(turn_id.clone());
         inner.active_abort = Some(task.abort_handle());
         inner.turns.push(json!({
-            "id": turn_id, "sessionId": sid, "status": "running",
+            "id": turn_id, "sessionId": sid, "status": "in_progress",
             "startedAt": n, "completedAt": null, "error": null,
             "stopReason": null, "queueItemId": queue_item_id,
         }));
@@ -1426,10 +1428,12 @@ async fn main() {
                     )
                 };
                 // Turn records are history truth — the child inherits
-                // them, but a still-running parent turn isn't the
-                // child's to run: mark it interrupted.
+                // them under ITS id (a record naming the parent would
+                // misattribute the child's history), and a still-running
+                // parent turn isn't the child's to run: interrupted.
                 for t in &mut turns {
-                    if t["status"] == "running" {
+                    t["sessionId"] = json!(fork_id);
+                    if t["status"] == "in_progress" {
                         t["status"] = json!("interrupted");
                         t["stopReason"] = json!("forked");
                     }

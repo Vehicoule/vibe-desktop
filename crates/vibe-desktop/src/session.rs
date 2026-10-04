@@ -2098,27 +2098,25 @@ impl SessionView {
         if now == "blocked" && prev != "blocked" {
             self.notify_attention("needs attention — approval waiting", cx);
         } else if prev == "running" {
-            match &self.projection.state.turns {
-                // The server didn't serve a turns view at all (version
-                // skew) — the status edge is the only signal left.
-                None => match now {
-                    "idle" => self.notify_attention("turn finished", cx),
-                    "failed" => self.notify_attention("turn failed", cx),
-                    _ => {}
-                },
-                Some(turns) => {
-                    if let Some(tid) = prev_turn {
-                        match turns
-                            .iter()
-                            .find(|t| t.id == tid)
-                            .map(|t| t.status.as_str())
-                        {
-                            Some("completed") => self.notify_attention("turn finished", cx),
-                            Some("failed") => self.notify_attention("turn failed", cx),
-                            // interrupted/cancelled or record absent:
-                            // the user caused it — no ping.
-                            _ => {}
-                        }
+            // "failed" is a session-level terminal signal — trust the
+            // edge. "idle" alone proves nothing (an interrupt lands
+            // idle too): only a terminal turn record says why it ended.
+            if now == "failed" {
+                self.notify_attention("turn failed", cx);
+            } else if now == "idle" {
+                if let (Some(tid), Some(turns)) =
+                    (prev_turn, self.projection.state.turns.as_deref())
+                {
+                    match turns
+                        .iter()
+                        .find(|t| t.id == tid)
+                        .map(|t| t.status.as_str())
+                    {
+                        Some("completed") => self.notify_attention("turn finished", cx),
+                        Some("failed") => self.notify_attention("turn failed", cx),
+                        // interrupted/cancelled, no record, or the server
+                        // serves no turns view: silent beats a false ping.
+                        _ => {}
                     }
                 }
             }
