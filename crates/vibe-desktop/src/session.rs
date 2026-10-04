@@ -2057,17 +2057,31 @@ impl SessionView {
         true
     }
 
-    /// Status-edge alerts: `prev` was the label before the state change
-    /// (live event or adopt-replayed one), the projection holds `now`.
-    fn alert_transition(&self, prev: &str, cx: &mut Context<Self>) {
+    /// Status-edge alerts: `prev`/`prev_turn` describe the state before
+    /// the change (live event or adopt-replayed one). Session status
+    /// alone can't say WHY a turn ended (an interrupt lands idle too),
+    /// so completion pings consult the turn record's terminal status.
+    fn alert_transition(&self, prev: &str, prev_turn: Option<&str>, cx: &mut Context<Self>) {
         let now = self.projection.state.session.status.label();
         if now == "blocked" && prev != "blocked" {
             self.notify_attention("needs attention — approval waiting", cx);
         } else if prev == "running" {
-            match now {
-                "idle" => self.notify_attention("turn finished", cx),
-                "failed" => self.notify_attention("turn failed", cx),
-                _ => {}
+            if let Some(tid) = prev_turn {
+                match self
+                    .projection
+                    .state
+                    .turns
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|t| t.id == tid)
+                    .map(|t| t.status.as_str())
+                {
+                    Some("completed") => self.notify_attention("turn finished", cx),
+                    Some("failed") => self.notify_attention("turn failed", cx),
+                    // interrupted/cancelled: the user caused it — no ping.
+                    _ => {}
+                }
             }
         }
     }
@@ -2231,10 +2245,13 @@ impl SessionView {
                             .status
                             .label()
                             .to_string();
+                        let prev_turn = view
+                            .active_turn_id()
+                            .map(str::to_string);
                         let adopted =
                             view.projection.adopt(state) && !view.projection.needs_resync();
                         if adopted {
-                            view.alert_transition(&prev, cx);
+                            view.alert_transition(&prev, prev_turn.as_deref(), cx);
                         }
                         adopted
                     })
