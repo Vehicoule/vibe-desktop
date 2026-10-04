@@ -811,3 +811,143 @@ async fn worktrees_and_loops() {
     drop(conn2);
     cleanup(conn, &dir).await;
 }
+
+/// M4a: vibeCode/projects picker + teleport event flow + relocate.
+#[tokio::test]
+async fn cloud_picker_teleport_and_relocate() {
+    let (dir, envs) = store();
+    let mut conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    let state = conn
+        .session_start(SessionStartParams {
+            agent_config: AgentConfig {
+                cwd: Some("/tmp/demo".into()),
+                ..Default::default()
+            },
+            history_limit: 50,
+            idempotency_key: None,
+            kind: None,
+        })
+        .await
+        .expect("session/start");
+    let sid = state.session.id.clone();
+    let mut rx = conn.take_events().unwrap();
+
+    // Picker opens with two projects + a page cursor.
+    let opened = conn.projects_open(&sid, "teleport").await.unwrap();
+    assert_eq!(opened.picker_id, "picker-1");
+    assert_eq!(opened.view.state.projects.len(), 2);
+    assert_eq!(opened.view.state.next_cursor.as_deref(), Some("c2"));
+    assert_eq!(opened.view.context.repo_root.as_str(), "/tmp/demo");
+
+    // loadMore pages in the third project and clears the cursor.
+    let more = conn
+        .projects_load_more(&sid, &opened.picker_id)
+        .await
+        .unwrap();
+    assert_eq!(more.view.state.projects.len(), 3);
+    assert!(more.view.state.next_cursor.is_none());
+
+    // Select binds the push-gated project.
+    let sel = conn
+        .projects_select(&sid, &opened.picker_id, "proj-push")
+        .await
+        .unwrap();
+    assert_eq!(sel.project.project_id, "proj-push");
+
+    // teleport pauses at push_required until push/respond approves it.
+    conn.teleport_start(&sid, &opened.picker_id, "op-t1", "proj-push")
+        .await
+        .unwrap();
+    wait_for(&mut rx, |m| {
+        matches!(m, ServerMessage::Notification { method, params }
+            if method == "vibeCode/teleport/event"
+                && params["event"]["kind"] == "push_required")
+    })
+    .await;
+    conn.teleport_push_respond(&sid, "op-t1", true)
+        .await
+        .unwrap();
+    let msgs = wait_for(&mut rx, |m| {
+        matches!(m, ServerMessage::Notification { method, params }
+            if method == "vibeCode/teleport/event"
+                && params["event"]["kind"] == "complete")
+    })
+    .await;
+    let complete = msgs.iter().find_map(|m| match m {
+        ServerMessage::Notification { method, params }
+            if method == "vibeCode/teleport/event" =>
+        {
+            params["event"]["url"].as_str().map(str::to_string)
+        }
+        _ => None,
+    });
+    assert_eq!(complete.as_deref(), Some("https://vibe.mistral.ai/s/op-t1"));
+
+    // Declining the push gate fails the run.
+    conn.teleport_start(&sid, &opened.picker_id, "op-t2", "proj-push")
+        .await
+        .unwrap();
+    wait_for(&mut rx, |m| {
+        matches!(m, ServerMessage::Notification { method, params }
+            if method == "vibeCode/teleport/event"
+                && params["event"]["kind"] == "push_required")
+    })
+    .await;
+    conn.teleport_push_respond(&sid, "op-t2", false)
+        .await
+        .unwrap();
+    wait_for(&mut rx, |m| {
+        matches!(m, ServerMessage::Notification { method, params }
+            if method == "vibeCode/teleport/event"
+                && params["event"]["kind"] == "failed")
+    })
+    .await;
+
+    // A non-gated project teleports straight to complete; cancel stops
+    // a run that never finishes (op started then cancelled mid-flight).
+    conn.teleport_start(&sid, &opened.picker_id, "op-t3", "proj-aa")
+        .await
+        .unwrap();
+    wait_for(&mut rx, |m| {
+        matches!(m, ServerMessage::Notification { method, params }
+            if method == "vibeCode/teleport/event"
+                && params["event"]["kind"] == "complete")
+    })
+    .await;
+    conn.teleport_start(&sid, &opened.picker_id, "op-t4", "proj-aa")
+        .await
+        .unwrap();
+    let cancelled = conn.teleport_cancel(&sid, "op-t4").await.unwrap();
+    assert!(cancelled.cancelled);
+
+    // projects/create adds the new project to the view and returns it.
+    let created = conn
+        .projects_create(&sid, &opened.picker_id, "edge-cache", "main")
+        .await
+        .unwrap();
+    assert_eq!(created.project.project_id, "proj-new");
+    assert!(created
+        .view
+        .state
+        .projects
+        .iter()
+        .any(|p| p.project_id == "proj-new"));
+
+    // Relocate returns the moved state — the patch also lands on the
+    // event channel.
+    let moved = conn.session_relocate(&sid, "/tmp/elsewhere").await.unwrap();
+    assert_eq!(
+        moved.state.session.cwd.as_deref(),
+        Some("/tmp/elsewhere")
+    );
+    wait_for(&mut rx, |m| {
+        matches!(m, ServerMessage::Notification { method, params }
+            if method == "session/updated"
+                && params["patch"].to_string().contains("/session/cwd"))
+    })
+    .await;
+
+    conn.projects_cancel(&sid, &opened.picker_id).await.unwrap();
+    cleanup(conn, &dir).await;
+}
