@@ -845,12 +845,38 @@ impl SessionView {
         cx.notify();
     }
 
-    /// `review/approve` (`keep`) or `review/revert` for the displayed
-    /// scope-owner's changes to a file, then refresh the state. The target
-    /// is `ScopeFile` — the open diff shows exactly `owner`'s regions, so
-    /// the decision must hit the same scope (a file-wide revert would
-    /// silently discard other owners' unseen work). One decision per file
-    /// at a time — a second click while the first is in flight is ignored.
+    /// Is `owner` genuinely attached to `path` — a scope naming the pair
+    /// or a regioned file whose regions name it? The first-scope fallback
+    /// in `review_owner_for` only exists so `turnDiff` can READ; deciding
+    /// through a borrowed owner would target changes it doesn't own.
+    fn review_owner_authoritative(&self, path: &str, owner: &ReviewOwner) -> bool {
+        let Some(state) = self.review.as_ref() else {
+            return false;
+        };
+        if state
+            .scopes
+            .iter()
+            .any(|s| s.owner == *owner && s.files.iter().any(|f| f.path == path))
+        {
+            return true;
+        }
+        state
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| {
+                !f.regions.is_empty()
+                    && f.regions.iter().any(|r| r.owner().as_ref() == Some(owner))
+            })
+            .unwrap_or(false)
+    }
+
+    /// `review/approve` (`keep`) or `review/revert`, then refresh state.
+    /// Target: `ScopeFile` when the owner genuinely claims the file (the
+    /// diff shows that scope's slice — the decision must hit the same
+    /// unit); `File` when the owner was only a read-fallback, where a
+    /// scoped target would miss the file's real changes. One decision
+    /// per file at a time — a second click while in flight is ignored.
     pub fn review_apply_file(
         &mut self,
         path: String,
@@ -861,12 +887,22 @@ impl SessionView {
         if !self.review_inflight.insert(path.clone()) {
             return;
         }
+        // A scope-listed owner decides that scope's slice; a file with no
+        // authoritative owner (unscoped + regionless) decides file-wide —
+        // `ScopeFile` on a borrowed owner would miss its changes.
+        let scoped = self.review_owner_authoritative(&path, &owner);
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
-            let target = ReviewTarget::ScopeFile {
-                owner,
-                path: path.clone(),
+            let target = if scoped {
+                ReviewTarget::ScopeFile {
+                    owner: owner.clone(),
+                    path: path.clone(),
+                }
+            } else {
+                ReviewTarget::File {
+                    path: path.clone(),
+                }
             };
             let result = if keep {
                 conn.review_approve(&sid, &target).await
@@ -881,12 +917,12 @@ impl SessionView {
                 match result {
                     Ok(()) => {
                         // Only close the diff that the decision applied
-                        // to — a newer selection may already be showing.
-                        if view
-                            .review_diff_sel
-                            .as_ref()
-                            .is_some_and(|(p, _)| *p == path)
-                        {
+                        // to — a file-wide decision closes its file's diff,
+                        // a scoped one only the matching (path, owner).
+                        let hit = view.review_diff_sel.as_ref().is_some_and(|(p, o)| {
+                            *p == path && (!scoped || *o == owner)
+                        });
+                        if hit {
                             view.review_diff = None;
                             view.review_diff_sel = None;
                             view.review_diff_gen += 1;
