@@ -747,6 +747,23 @@ async fn extensions_roundtrip() {
         "disabled"
     );
 
+    // Connector sources route through connector_catalog/toggle —
+    // connected↔disabled, persisted in the same overlay.
+    let slack = reread.mcp.sources.iter().find(|s| s.name == "slack").unwrap();
+    assert_eq!(slack.status, "connected");
+    let toggled = conn.connector_catalog_toggle(&sid, "slack", true).await.unwrap();
+    let fresh = toggled.runtime.expect("runtime").get("mcp").cloned().unwrap();
+    let state: vibe_protocol::models::MCPState = serde_json::from_value(fresh).unwrap();
+    assert_eq!(
+        state.sources.iter().find(|s| s.name == "slack").unwrap().status,
+        "disabled"
+    );
+    let reread = conn.mcp_read(&sid).await.unwrap();
+    assert_eq!(
+        reread.mcp.sources.iter().find(|s| s.name == "slack").unwrap().status,
+        "disabled"
+    );
+
     // connectors + plugins are read-only surfaces here.
     let conn_counts = conn.connectors_read(&sid).await.unwrap();
     assert_eq!(conn_counts.counts.connected, 2);
