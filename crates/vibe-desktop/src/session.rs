@@ -1026,12 +1026,20 @@ impl SessionView {
                             .review_baseline(&sid, &path)
                             .await
                             .map_err(|e| format!("baseline re-read failed: {e}"))?;
-                        let deleted = state
+                        // Status drift means a different operation than
+                        // was previewed — an empty file deleted after
+                        // the render still compares equal on text.
+                        let fresh_status = state
                             .files
                             .iter()
                             .find(|f| f.path == path)
-                            .map(|f| f.status == "deleted")
-                            .unwrap_or(false);
+                            .map(|f| f.status.as_str());
+                        if fresh_status != Some(displayed.status.as_str()) {
+                            return Err(format!(
+                                "{path}'s status changed — re-open the diff"
+                            ));
+                        }
+                        let deleted = fresh_status == Some("deleted");
                         let Some(cwd) = &cwd else {
                             return Err(
                                 "no local cwd — can't verify the file".to_string()

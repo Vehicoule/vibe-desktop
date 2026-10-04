@@ -2134,6 +2134,23 @@ async fn main() {
                 .await;
             }
             "review/state" => {
+                // Materialize the ownerless file under the session cwd —
+                // the app's whole-file preview reads its current side
+                // from disk, so a listed file must actually exist.
+                if let Some(sid) = params["sessionId"].as_str() {
+                    if let Some(d) = find_session(&sessions, &store, sid).await {
+                        let inner = d.inner.lock().await;
+                        if let Some(cwd) = inner.session["cwd"].as_str() {
+                            let p = std::path::Path::new(cwd).join("notes.txt");
+                            if !p.exists() {
+                                let _ = std::fs::write(
+                                    &p,
+                                    "notes [file-wide] current\nedge cases tracked\n",
+                                );
+                            }
+                        }
+                    }
+                }
                 // Decisions persist to review_decisions.json — an
                 // approve/revert on a file target resolves it off the
                 // pending list (all regions decided ⇒ nothing left to
@@ -2148,7 +2165,9 @@ async fn main() {
                         {"kind": "text", "versionIndex": 0, "ordinal": 1, "owner": {"kind": "agent", "turnId": 1}, "baselineStart": 0, "baselineLineCount": 0, "currentStart": 0, "currentLineCount": 2, "decision": "pending", "dependsOn": []}
                     ]}), "src/lib.rs"),
                     // Unscoped + regionless: exercises the whole-file
-                    // preview path (review/baseline + disk current).
+                    // preview path (review/baseline + disk current) —
+                    // the disk side must actually exist, so materialize
+                    // it under the session cwd on first read.
                     (json!({"path": "notes.txt", "status": "modified", "regions": []}), "notes.txt"),
                 ]
                 .into_iter()
