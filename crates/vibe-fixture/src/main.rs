@@ -2213,6 +2213,16 @@ async fn main() {
                 }))
                 .await;
             }
+            "review/baseline" => {
+                // Whole-file baseline — the read for files no scope
+                // claims; echoes the path so a client asking for the
+                // wrong file can't fake a match.
+                let req_path = params["path"].as_str().unwrap_or("?");
+                respond(json!({
+                    "content": format!("// {req_path} [file-wide] baseline\nfn main() {{\n    old_call();\n}}\n")
+                }))
+                .await;
+            }
             "review/turnDiff" => {
                 // Echo the request's path + owner into the content — a
                 // fixed diff would mask a client asking for the wrong

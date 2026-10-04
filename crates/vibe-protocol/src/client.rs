@@ -15,6 +15,7 @@ use std::sync::Arc;
 use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -841,6 +842,21 @@ impl Connection {
     pub async fn review_state(&self, session_id: &str) -> ClientResult<ReviewStateResponse> {
         self.request_typed("review/state", json!({"sessionId": session_id}))
             .await
+    }
+
+    /// `review/baseline` → whole-file baseline text (no owner) — the
+    /// read for files no scope claims; current side comes from disk.
+    pub async fn review_baseline(&self, session_id: &str, path: &str) -> ClientResult<String> {
+        #[derive(Deserialize)]
+        struct Resp {
+            content: String,
+        }
+        self.request_typed::<Resp>(
+            "review/baseline",
+            json!({"sessionId": session_id, "path": path}),
+        )
+        .await
+        .map(|r| r.content)
     }
 
     /// `review/turnDiff` → baseline/current contents for one file+owner.
