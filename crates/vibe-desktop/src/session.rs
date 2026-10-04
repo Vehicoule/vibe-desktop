@@ -478,6 +478,7 @@ impl SessionView {
             self.cloud_open = false;
             let sid = self.session_id().to_string();
             self.close_picker(&sid, cx);
+            self.clear_link();
         }
         if keep != SheetSurface::Rewind {
             self.rewind = None;
