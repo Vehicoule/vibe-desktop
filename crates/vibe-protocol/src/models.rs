@@ -1519,24 +1519,50 @@ pub struct SpeechConfigView {
     pub provider: AudioProviderView,
 }
 
-/// The voice-bearing subset of `ConfigView` — tolerant to upstream growth
-/// (ADR-0014 version-skew rule: deserialize only what the client uses).
+/// `config/read` config view — the subset the client renders, tolerant to
+/// upstream growth (ADR-0014 version-skew rule: deserialize only what the
+/// client uses).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct VoiceConfigView {
+pub struct ConfigView {
     #[serde(default)]
     pub voice_mode_enabled: bool,
     #[serde(default)]
     pub narrator_enabled: bool,
-    pub speech: SpeechConfigView,
-    pub transcription: TranscriptionConfigView,
+    /// Voice sub-views are optional — a server without speech/
+    /// transcription config must not sink the whole read (ADR-0014 skew).
+    pub speech: Option<SpeechConfigView>,
+    pub transcription: Option<TranscriptionConfigView>,
+    // --- M3a: settings ---
+    #[serde(default)]
+    pub active_model: ModelConfigView,
+    #[serde(default)]
+    pub active_model_pinned: bool,
+    #[serde(default)]
+    pub default_model_alias: String,
+    #[serde(default)]
+    pub default_agent: String,
+    #[serde(default)]
+    pub models: Vec<ModelConfigView>,
+    #[serde(default)]
+    pub theme: String,
+    #[serde(default)]
+    pub worktree_limit: u32,
+    #[serde(default)]
+    pub enable_notifications: bool,
+    #[serde(default)]
+    pub transcribe_models: Vec<String>,
+    #[serde(default)]
+    pub tts_models: Vec<String>,
+    #[serde(default)]
+    pub validation_warnings: Vec<String>,
 }
 
-/// `config/read` response — the client reads `config` as `VoiceConfigView`.
+/// `config/read` response — the client reads `config` as `ConfigView`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigReadResponse {
-    pub config: VoiceConfigView,
+    pub config: ConfigView,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1556,4 +1582,126 @@ pub struct NarrationSummarizeParams {
 pub struct NarrationSummarizeResponse {
     #[serde(default)]
     pub summary: Option<String>,
+}
+
+// --- M3a: settings & pickers --------------------------------------------
+
+/// `models[]` / `activeModel` entry in `ConfigView` (`ModelConfigView`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelConfigView {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub alias: String,
+    /// "off" | "low" | "medium" | "high" | "max"
+    #[serde(default)]
+    pub thinking: String,
+    #[serde(default)]
+    pub supports_images: bool,
+    #[serde(default)]
+    pub display_name: String,
+}
+
+/// `agents/list` response — `AgentSummary` is defined with the session
+/// models (`safety`/`agent_type` stay strings so new variants decode).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentsListResponse {
+    pub active: AgentSummary,
+    #[serde(default)]
+    pub agents: Vec<AgentSummary>,
+}
+
+/// One layer's contribution to a config field (`ConfigLayerValueWire`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigLayerValueView {
+    #[serde(default)]
+    pub layer: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
+}
+
+/// `config/fields/read` field (`ConfigFieldWire`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigFieldView {
+    pub name: String,
+    /// "bool" | "enum" | "int" | "float" | "str" | "list" | "complex"
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub popular: bool,
+    #[serde(default)]
+    pub enum_choices: Vec<String>,
+    #[serde(default)]
+    pub value_labels: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub layer_values: Vec<ConfigLayerValueView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigFieldsReadResponse {
+    #[serde(default)]
+    pub fields: Vec<ConfigFieldView>,
+    #[serde(default)]
+    pub targets: Vec<String>,
+}
+
+/// `config/write` op (`ConfigWriteOpWire`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigWriteOp {
+    /// "set" | "remove"
+    pub op: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_layer: Option<String>,
+}
+
+/// Mutation acknowledgement — `RuntimeMutationResponse`'s `status`
+/// ("applied"/"pending") plus `ConfigWriteResponse`'s rejection fields;
+/// the embedded runtime snapshot is ignored (tolerant).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigWriteResponse {
+    #[serde(default)]
+    pub rejected: bool,
+    #[serde(default)]
+    pub failures: Vec<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    /// `RuntimeMutationResponse` embeds a `runtime` snapshot — kept as a
+    /// loose `Value` so `activeAgent` etc. can be read tolerantly.
+    #[serde(default)]
+    pub runtime: Option<serde_json::Value>,
+}
+
+/// `config/model/write` params (`ModelConfigWriteParams`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelConfigWriteParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+/// `session/agent/update` params (`AgentSwitchParams`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSwitchParams {
+    pub session_id: String,
+    pub agent_name: String,
 }

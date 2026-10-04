@@ -3,7 +3,7 @@
 
 use gpui::{
     div, hsla, prelude::FluentBuilder as _, px, Context, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
 };
 use vibe_protocol::models::*;
 
@@ -626,6 +626,7 @@ impl Render for SessionView {
             .when_some(callback_area, |d, area| d.child(area))
             .when_some(self.render_queue_strip(cx), |d, q| d.child(q))
             .when_some(self.render_rewind_sheet(cx), |d, s| d.child(s))
+            .when_some(self.render_settings_sheet(cx), |d, s| d.child(s))
             .child(self.render_composer(cx))
             .child(self.render_status_bar(cx))
     }
@@ -1208,6 +1209,155 @@ impl SessionView {
         Some(sheet)
     }
 
+    /// Settings sheet: model + agent pickers and the popular config
+    /// fields, driven by `config/read`, `agents/list`, `config/fields/read`.
+    fn render_settings_sheet(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.settings_open {
+            return None;
+        }
+        let mut sheet = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mx_4()
+            .mb_2()
+            .px_4()
+            .py_3()
+            .rounded_lg()
+            .bg(c(theme::CARD))
+            .border_1()
+            .border_color(c(theme::EDGE))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(text("settings", 12.5, c(theme::INK)))
+                    .child(div().flex_1())
+                    .child(
+                        ghost_button("close-settings", "close")
+                            .on_click(cx.listener(|v, _e, _w, cx| v.toggle_settings(cx))),
+                    ),
+            );
+
+        // ── model ──
+        if let Some(cfg) = &self.config {
+            let active = cfg.active_model.alias.clone();
+            let mut rows = div().flex().flex_col().gap_1();
+            for m in &cfg.models {
+                let picked = m.alias == active;
+                let alias = m.alias.clone();
+                let label = if m.display_name.is_empty() {
+                    m.alias.clone()
+                } else {
+                    format!("{} ({})", m.display_name, m.alias)
+                };
+                rows = rows.child(
+                    div()
+                        .id(SharedString::from(format!("model-row-{alias}")))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |v, _e, _w, cx| v.pick_model(alias.clone(), cx)))
+                        .child(text(
+                            format!("{} {label}", if picked { "●" } else { "○" }),
+                            11.5,
+                            c(if picked {
+                                theme::AMBER
+                            } else {
+                                theme::INK_SOFT
+                            }),
+                        )),
+                );
+            }
+            sheet = sheet
+                .child(text("model", 10.5, c(theme::INK_FAINT)))
+                .child(rows);
+        }
+
+        // ── agent ──
+        if !self.agents.is_empty() {
+            let mut rows = div().flex().flex_col().gap_1();
+            for a in &self.agents {
+                let picked = a.name == self.active_agent;
+                let pending = self.pending_agent.as_deref() == Some(a.name.as_str());
+                let name = a.name.clone();
+                let label = if a.display_name.is_empty() {
+                    a.name.clone()
+                } else {
+                    a.display_name.clone()
+                };
+                let (mark, suffix) = if pending {
+                    ("◐", " (pending)")
+                } else if picked {
+                    ("●", "")
+                } else {
+                    ("○", "")
+                };
+                rows = rows.child(
+                    div()
+                        .id(SharedString::from(format!("agent-row-{name}")))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |v, _e, _w, cx| v.pick_agent(name.clone(), cx)))
+                        .child(text(
+                            format!("{mark} {label}{suffix}"),
+                            11.5,
+                            c(if picked || pending {
+                                theme::AMBER
+                            } else {
+                                theme::INK_SOFT
+                            }),
+                        )),
+                );
+            }
+            sheet = sheet
+                .child(text("agent", 10.5, c(theme::INK_FAINT)))
+                .child(rows);
+        }
+
+        // ── config fields (popular first, bools + enums actionable) ──
+        let mut fields: Vec<&ConfigFieldView> = self.config_fields.iter().collect();
+        fields.sort_by_key(|f| !f.popular);
+        if !fields.is_empty() {
+            let mut rows = div().flex().flex_col().gap_1();
+            for f in fields {
+                let (mark, value_text) = if f.kind == "bool" {
+                    (
+                        if f.value.as_bool().unwrap_or(false) {
+                            "☑"
+                        } else {
+                            "☐"
+                        },
+                        String::new(),
+                    )
+                } else if f.kind == "enum" {
+                    ("▸", format!(" {}", f.value.as_str().unwrap_or_default()))
+                } else {
+                    continue;
+                };
+                let path = f.path.clone();
+                let actionable =
+                    f.kind == "bool" || (f.kind == "enum" && !f.enum_choices.is_empty());
+                let row = div()
+                    .id(SharedString::from(format!("cfg-row-{}", f.path)))
+                    .when(actionable, |d| {
+                        d.cursor_pointer().on_click(
+                            cx.listener(move |v, _e, _w, cx| {
+                                v.toggle_config_field(path.clone(), cx)
+                            }),
+                        )
+                    })
+                    .child(text(
+                        format!("{} {}{}", mark, f.name, value_text),
+                        11.5,
+                        c(theme::INK_SOFT),
+                    ));
+                rows = rows.child(row);
+            }
+            sheet = sheet
+                .child(text("config", 10.5, c(theme::INK_FAINT)))
+                .child(rows);
+        }
+        Some(sheet)
+    }
+
     fn render_composer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.active_turn_id().is_some();
         let hint = if running {
@@ -1220,7 +1370,7 @@ impl SessionView {
         } else {
             text(format!("{}▏", self.composer), 13.0, c(theme::INK))
         };
-        let mic = self.voice.as_ref().is_some_and(|v| v.voice_mode_enabled);
+        let mic = self.config.as_ref().is_some_and(|v| v.voice_mode_enabled);
         let recording = self.dictation.is_some();
         let stopping = self.dictation.as_ref().is_some_and(|d| d.stopping);
         let rec_level = self
@@ -1365,7 +1515,7 @@ impl SessionView {
         if let Some(err) = &self.error {
             bar = bar.child(text(format!("error: {err}"), 10.5, c(theme::RED)));
         }
-        if self.voice.as_ref().is_some_and(|v| v.voice_mode_enabled) {
+        if self.config.as_ref().is_some_and(|v| v.voice_mode_enabled) {
             bar = bar.child(
                 div()
                     .id("narrator-toggle")
@@ -1400,6 +1550,41 @@ impl SessionView {
                 }
                 Narration::Idle => {}
             }
+        }
+        {
+            // Settings must not depend on the voice config reading — the
+            // sheet's own sections degrade independently.
+            let model = self
+                .config
+                .as_ref()
+                .map(|cfg| {
+                    if cfg.active_model.display_name.is_empty() {
+                        cfg.active_model.alias.clone()
+                    } else {
+                        cfg.active_model.display_name.clone()
+                    }
+                })
+                .unwrap_or_default();
+            let agent_label = if let Some(p) = &self.pending_agent {
+                format!("{p}…")
+            } else {
+                self.active_agent.clone()
+            };
+            bar = bar.child(
+                div()
+                    .id("settings-toggle")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _e, _w, cx| v.toggle_settings(cx)))
+                    .child(text(
+                        format!("⚙ {model} · {agent_label}"),
+                        10.5,
+                        c(if self.settings_open {
+                            theme::AMBER
+                        } else {
+                            theme::INK_FAINT
+                        }),
+                    )),
+            );
         }
         bar.child(div().flex_1()).child(text(
             format!(

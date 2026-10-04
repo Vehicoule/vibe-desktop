@@ -1,7 +1,7 @@
 //! One attached session: its `vibe-app-server` process, protocol projection,
 //! composer state, and callback handling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -60,9 +60,24 @@ pub struct SessionView {
     pub trust_dismissed: bool,
     /// A `session/history/list` backward page is in flight.
     pub loading_earlier: bool,
-    /// `config/read` voice subset — `None` until the read lands (or fails:
-    /// voice UI stays hidden then).
-    pub voice: Option<VoiceConfigView>,
+    /// `config/read` client subset — `None` until the read lands (or
+    /// fails: voice + settings UI stay hidden then).
+    pub config: Option<ConfigView>,
+    /// `agents/list` snapshot for the settings sheet.
+    pub agents: Vec<AgentSummary>,
+    /// Name of the active agent (from `agents/list` or a session update).
+    pub active_agent: String,
+    /// `config/fields/read` snapshot for the settings sheet.
+    pub config_fields: Vec<ConfigFieldView>,
+    /// Settings sheet open/closed.
+    pub settings_open: bool,
+    /// Agent a `session/agent/update` mutation reported as `pending` —
+    /// not yet the active agent; reconciled from `agents/list` on the
+    /// next `session/updated`.
+    pub pending_agent: Option<String>,
+    /// Config paths with an in-flight `config/write` — repeat clicks
+    /// during the write would send the same value again.
+    cfg_inflight: HashSet<String>,
     /// Dictation run in flight while the mic toggle is down.
     pub dictation: Option<DictationRun>,
     dictation_pump: Option<Task<()>>,
@@ -127,7 +142,13 @@ impl SessionView {
             trust: None,
             trust_dismissed: false,
             loading_earlier: false,
-            voice: None,
+            config: None,
+            agents: Vec::new(),
+            active_agent: String::new(),
+            config_fields: Vec::new(),
+            settings_open: false,
+            pending_agent: None,
+            cfg_inflight: HashSet::new(),
             dictation: None,
             dictation_pump: None,
             dictation_meter: None,
@@ -150,11 +171,230 @@ impl SessionView {
     fn load_voice_config(&mut self, cx: &mut Context<Self>) {
         let conn = self.conn.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let cfg = conn.config_read_voice().await;
+            let cfg = conn.config_read().await;
             let _ = this.update(cx, |view, cx| {
                 if let Ok(cfg) = cfg {
                     view.narrator_on = cfg.narrator_enabled && cfg.voice_mode_enabled;
-                    view.voice = Some(cfg);
+                    view.config = Some(cfg);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fetch `agents/list` + `config/fields/read` for the settings sheet.
+    fn load_settings(&mut self, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let agents = conn.agents_list(&sid).await;
+            let fields = conn.config_fields_read(&sid).await;
+            let _ = this.update(cx, |view, cx| {
+                // A handoff may have swapped the session while this was
+                // in flight — the response belongs to the old session.
+                if view.session_id() != sid {
+                    return;
+                }
+                if let Ok(list) = agents {
+                    view.active_agent = list.active.name.clone();
+                    view.agents = list.agents;
+                }
+                if let Ok(resp) = fields {
+                    view.config_fields = resp.fields;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Settings sheet toggle — loads pickers lazily the first time.
+    pub fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open && self.agents.is_empty() && self.config_fields.is_empty() {
+            self.load_settings(cx);
+        }
+        cx.notify();
+    }
+
+    /// `config/model/write` — pin a model (and keep its thinking effort).
+    pub fn pick_model(&mut self, alias: String, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn.config_model_write(&sid, &alias, None).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
+                match resp {
+                    Ok(r) if !r.rejected => {
+                        if let Some(cfg) = &mut view.config {
+                            cfg.active_model.alias = alias.clone();
+                            cfg.active_model.display_name = cfg
+                                .models
+                                .iter()
+                                .find(|m| m.alias == alias)
+                                .map(|m| m.display_name.clone())
+                                .unwrap_or_else(|| alias.clone());
+                            cfg.active_model_pinned = true;
+                        }
+                    }
+                    Ok(r) => {
+                        view.error = Some(format!("model pick rejected: {}", r.failures.join(", ")))
+                    }
+                    Err(e) => view.error = Some(format!("model pick failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `session/agent/update` — switch the session's agent. A `pending`
+    /// mutation keeps `pending_agent` until `session/updated` reconciles
+    /// the authoritative active agent; `applied` reads the runtime
+    /// snapshot when present.
+    pub fn pick_agent(&mut self, name: String, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn.session_agent_update(&sid, &name).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
+                match resp {
+                    Ok(r) if r.rejected => {
+                        view.error = Some(format!(
+                            "agent switch rejected: {}",
+                            r.failures.join(", ")
+                        ));
+                    }
+                    Ok(r) if r.status.as_deref() == Some("pending") => {
+                        // The switch may already have applied (its
+                        // session/updated raced ahead of this reply) —
+                        // reconcile immediately instead of waiting for
+                        // a notification that may never come.
+                        view.pending_agent = Some(name.clone());
+                        view.refresh_agents(cx);
+                    }
+                    Ok(r) => {
+                        let applied = r
+                            .runtime
+                            .as_ref()
+                            .and_then(|rt| rt.get("activeAgent"))
+                            .and_then(|a| a.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| name.clone());
+                        view.active_agent = applied.clone();
+                        view.pending_agent = None;
+                        if let Some(cfg) = &mut view.config {
+                            cfg.default_agent = applied;
+                        }
+                    }
+                    Err(e) => view.error = Some(format!("agent switch failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Re-fetch `agents/list` to learn the authoritative active agent.
+    /// A pending switch only clears once the list actually reports it
+    /// active — an unrelated `session/updated` answering with the old
+    /// agent must not drop the pending marker.
+    fn refresh_agents(&mut self, cx: &mut Context<Self>) {
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let agents = conn.agents_list(&sid).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
+                if let Ok(list) = agents {
+                    let active = list.active.name.clone();
+                    view.agents = list.agents;
+                    view.active_agent = active.clone();
+                    if view.pending_agent.as_deref() == Some(active.as_str()) {
+                        view.pending_agent = None;
+                    }
+                    if let Some(cfg) = &mut view.config {
+                        cfg.default_agent = view.active_agent.clone();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `config/write` — flip a bool field; enum fields cycle their
+    /// `enum_choices`. One write per path at a time: a click while the
+    /// previous write is in flight would resend the same value.
+    pub fn toggle_config_field(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.cfg_inflight.insert(path.clone()) {
+            return;
+        }
+        let Some(field) = self.config_fields.iter().find(|f| f.path == path).cloned() else {
+            self.cfg_inflight.remove(&path);
+            return;
+        };
+        let next = if field.kind == "bool" {
+            serde_json::Value::Bool(!field.value.as_bool().unwrap_or(false))
+        } else if field.kind == "enum" && !field.enum_choices.is_empty() {
+            let cur = field.value.as_str().unwrap_or_default();
+            // A value outside `enum_choices` starts cycling at the first
+            // choice rather than skipping it.
+            let idx = field
+                .enum_choices
+                .iter()
+                .position(|c| c == cur)
+                .map(|i| (i + 1) % field.enum_choices.len())
+                .unwrap_or(0);
+            serde_json::Value::String(field.enum_choices[idx].clone())
+        } else {
+            self.cfg_inflight.remove(&path);
+            return;
+        };
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this, cx| {
+            let resp = conn
+                .config_write(
+                    &sid,
+                    vec![ConfigWriteOp {
+                        op: "set".to_string(),
+                        path: field.path.clone(),
+                        value: Some(next.clone()),
+                        target_layer: None,
+                    }],
+                )
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                // Skip entirely if a handoff swapped the session: the
+                // response is for the old session and the new one may
+                // have re-marked this path in flight.
+                if view.session_id() != sid {
+                    return;
+                }
+                view.cfg_inflight.remove(&field.path);
+                match resp {
+                    Ok(r) if !r.rejected => {
+                        if let Some(f) =
+                            view.config_fields.iter_mut().find(|f| f.path == field.path)
+                        {
+                            f.value = next;
+                        }
+                    }
+                    Ok(r) => {
+                        view.error = Some(format!("config rejected: {}", r.failures.join(", ")))
+                    }
+                    Err(e) => view.error = Some(format!("config write failed: {e}")),
                 }
                 cx.notify();
             });
@@ -223,6 +463,7 @@ impl SessionView {
     fn on_server_message(&mut self, msg: &ServerMessage, cx: &mut Context<Self>) -> bool {
         match msg {
             ServerMessage::Notification { method, params } => {
+                let session_updated = method == "session/updated";
                 let narrate_turn = (method == "turn/completed")
                     .then(|| {
                         params
@@ -238,6 +479,9 @@ impl SessionView {
                 );
                 if resync {
                     self.resync(cx);
+                }
+                if session_updated && self.pending_agent.is_some() {
+                    self.refresh_agents(cx);
                 }
                 if narrate_turn.is_some() && self.narrator_on {
                     self.narrate_turn(narrate_turn, cx);
@@ -260,6 +504,16 @@ impl SessionView {
             let old = std::mem::replace(&mut self.reported_id, current.clone());
             if let Some(app) = self.app.as_ref().and_then(|w| w.upgrade()) {
                 app.update(cx, |app, _| app.sync_session_id(&old, &current));
+            }
+            // A compact/fork handoff swaps the session id under this view —
+            // drop session-scoped settings so nothing stale survives it.
+            self.agents.clear();
+            self.active_agent.clear();
+            self.pending_agent = None;
+            self.config_fields.clear();
+            self.cfg_inflight.clear();
+            if self.settings_open {
+                self.load_settings(cx);
             }
         }
     }
@@ -828,16 +1082,21 @@ impl SessionView {
             cx.notify();
             return;
         }
-        let Some(cfg) = &self.voice else { return };
+        let Some(cfg) = &self.config else { return };
         if !cfg.voice_mode_enabled {
             return;
         }
+        let Some(t) = cfg.transcription.as_ref() else {
+            self.error = Some("dictation needs a transcription config".to_string());
+            cx.notify();
+            return;
+        };
         let tcfg = voice::TranscriptionConfig {
-            api_base: cfg.transcription.provider.api_base.clone(),
-            api_key_env_var: cfg.transcription.provider.api_key_env_var.clone(),
-            model_name: cfg.transcription.model.name.clone(),
-            encoding: cfg.transcription.model.encoding.clone(),
-            target_streaming_delay_ms: cfg.transcription.model.target_streaming_delay_ms,
+            api_base: t.provider.api_base.clone(),
+            api_key_env_var: t.provider.api_key_env_var.clone(),
+            model_name: t.model.name.clone(),
+            encoding: t.model.encoding.clone(),
+            target_streaming_delay_ms: t.model.target_streaming_delay_ms,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let peak = Arc::new(AtomicU32::new(0));
@@ -943,21 +1202,22 @@ impl SessionView {
     /// `turn/completed` while the narrator is on: summarize → TTS → play,
     /// all on the host runtime; phases arrive back over the channel.
     fn narrate_turn(&mut self, turn_id: Option<String>, cx: &mut Context<Self>) {
-        let Some(cfg) = &self.voice else { return };
+        let Some(cfg) = &self.config else { return };
         if !cfg.voice_mode_enabled {
             return;
         }
         let Some(turn_id) = turn_id else { return };
+        let Some(s) = cfg.speech.as_ref() else { return };
         let history = self.projection.state.history.as_deref().unwrap_or(&[]);
         let Some((user, asst)) = voice::turn_text(history, &turn_id) else {
             return;
         };
         let scfg = voice::SpeechConfig {
-            api_base: cfg.speech.provider.api_base.clone(),
-            api_key_env_var: cfg.speech.provider.api_key_env_var.clone(),
-            model_name: cfg.speech.model.name.clone(),
-            voice: cfg.speech.model.voice.clone(),
-            response_format: cfg.speech.model.response_format.clone(),
+            api_base: s.provider.api_base.clone(),
+            api_key_env_var: s.provider.api_key_env_var.clone(),
+            model_name: s.model.name.clone(),
+            voice: s.model.voice.clone(),
+            response_format: s.model.response_format.clone(),
         };
         self.cancel_narration(cx);
         self.narrating = Narration::Preparing;

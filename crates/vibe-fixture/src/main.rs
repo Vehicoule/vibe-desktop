@@ -1767,9 +1767,97 @@ async fn main() {
                             "model": {"name": "voxtral-mini-transcribe-realtime-2602", "sampleRate": 16000, "encoding": "pcm_s16le", "language": "en", "targetStreamingDelayMs": 240},
                             "provider": {"apiBase": "https://transcribe.fixture.invalid", "apiKeyEnvVar": "VIBE_FIXTURE_TRANSCRIBE_KEY", "client": "mistral"},
                         },
+                        "activeModel": {"name": "mistral-large-latest", "alias": "large", "thinking": "medium", "supportsImages": true, "displayName": "Large"},
+                        "activeModelPinned": false,
+                        "defaultModelAlias": "large",
+                        "defaultAgent": "build",
+                        "models": [
+                            {"name": "mistral-large-latest", "alias": "large", "thinking": "medium", "supportsImages": true, "displayName": "Large"},
+                            {"name": "mistral-small-latest", "alias": "small", "thinking": "low", "supportsImages": false, "displayName": "Small"},
+                        ],
+                        "theme": "vibe",
+                        "worktreeLimit": 3,
+                        "enableNotifications": true,
+                        "transcribeModels": ["voxtral-mini-transcribe-realtime-2602"],
+                        "ttsModels": ["voxtral-mini-tts-latest"],
+                        "validationWarnings": [],
                     }
                 }))
                 .await;
+            }
+            "config/fields/read" => {
+                // Writes persist to config_values.json so a later read
+                // reflects them — the round-trip must be observable.
+                let overlays: serde_json::Map<String, Value> = std::fs::read_to_string(
+                    store.join("config_values.json"),
+                )
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+                let mut fields = json!([
+                    {"name": "enable_notifications", "kind": "bool", "description": "Desktop notifications", "value": true, "path": "enable_notifications", "popular": true, "enumChoices": [], "valueLabels": {}, "layerValues": [{"layer": "user", "value": true}]},
+                    {"name": "theme", "kind": "enum", "description": "UI theme", "value": "vibe", "path": "theme", "popular": true, "enumChoices": ["vibe", "light", "dark"], "valueLabels": {}, "layerValues": [{"layer": "default", "value": "vibe"}]},
+                    {"name": "worktree_limit", "kind": "int", "description": "Max git worktrees", "value": 3, "path": "worktree_limit", "popular": false, "enumChoices": [], "valueLabels": {}, "layerValues": [{"layer": "default", "value": 3}]},
+                ]);
+                for f in fields.as_array_mut().into_iter().flatten() {
+                    let path = f["path"].as_str().unwrap_or_default();
+                    if let Some(v) = overlays.get(path) {
+                        f["value"] = v.clone();
+                    }
+                }
+                respond(json!({"fields": fields, "targets": ["user", "project"]}))
+                    .await;
+            }
+            "config/write" => {
+                let mut overlays: serde_json::Map<String, Value> = std::fs::read_to_string(
+                    store.join("config_values.json"),
+                )
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+                for op in params["ops"].as_array().into_iter().flatten() {
+                    let path = op["path"].as_str().unwrap_or_default();
+                    match op["op"].as_str() {
+                        Some("set") => {
+                            overlays.insert(path.to_string(), op["value"].clone());
+                        }
+                        Some("remove") => {
+                            overlays.remove(path);
+                        }
+                        _ => {}
+                    }
+                }
+                let tmp = store.join("config_values.json.tmp");
+                let persisted = tokio::fs::write(&tmp, serde_json::to_string(&overlays).unwrap_or_default())
+                    .await
+                    .is_ok()
+                    && tokio::fs::rename(&tmp, store.join("config_values.json"))
+                        .await
+                        .is_ok();
+                if persisted {
+                    respond(json!({"rejected": false, "failures": [], "status": "applied"})).await;
+                } else {
+                    respond(json!({"rejected": true, "failures": ["fixture: config persist failed"], "status": null})).await;
+                }
+            }
+            "config/model/write" => {
+                respond(json!({"status": "applied"})).await;
+            }
+            "agents/list" => {
+                respond(json!({
+                    "active": {"name": "build", "displayName": "Build", "description": "Edits code freely", "safety": "neutral", "agentType": "agent"},
+                    "agents": [
+                        {"name": "build", "displayName": "Build", "description": "Edits code freely", "safety": "neutral", "agentType": "agent"},
+                        {"name": "plan", "displayName": "Plan", "description": "Read-only planning", "safety": "safe", "agentType": "agent"},
+                        {"name": "accept-edits", "displayName": "Accept Edits", "description": "Auto-approves edits", "safety": "yolo", "agentType": "agent"},
+                    ]
+                }))
+                .await;
+            }
+            "session/agent/update" => {
+                respond(json!({"status": "applied"})).await;
             }
             "narration/summarize" => {
                 respond(json!({"summary": format!("Fixture narration: {}",
