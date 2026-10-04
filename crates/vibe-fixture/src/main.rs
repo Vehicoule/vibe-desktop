@@ -35,6 +35,9 @@ struct SessionInner {
     queue_paused: bool,
     active_turn: Option<String>,
     active_abort: Option<tokio::task::AbortHandle>,
+    /// Turn records — `session/read` serves these so a resync can tell a
+    /// completed turn from an interrupted one by record, not status edge.
+    turns: Vec<Value>,
 }
 
 fn queue_value(inner: &SessionInner) -> Value {
@@ -62,6 +65,7 @@ fn inner_default() -> SessionInner {
         queue_paused: false,
         active_turn: None,
         active_abort: None,
+        turns: Vec::new(),
     }
 }
 
@@ -186,6 +190,7 @@ impl SessionData {
             event_id: v["event_id"].as_u64().unwrap_or(0),
             queue_items: serde_json::from_value(v["queue_items"].clone()).unwrap_or_default(),
             queue_paused: v["queue_paused"].as_bool().unwrap_or(false),
+            turns: serde_json::from_value(v["turns"].clone()).unwrap_or_default(),
             ..inner_default()
         };
         Some(Arc::new(SessionData {
@@ -229,6 +234,7 @@ impl SessionData {
             "queue_items": inner.queue_items,
             "queue_paused": inner.queue_paused,
             "queue_seq": self.queue_seq.load(Ordering::SeqCst),
+            "turns": inner.turns,
         });
         let tmp = self.store.join(format!("{id}.json.tmp"));
         if tokio::fs::write(&tmp, body.to_string()).await.is_ok() {
@@ -323,7 +329,20 @@ impl SessionData {
                 Value::Null
             },
             queue_value(&inner),
+            json!(inner.turns),
         )
+    }
+}
+
+/// Mark a stored turn record terminal — called at every site that ends
+/// a turn so `turns` never reports `running` after the turn is gone.
+fn end_turn(inner: &mut SessionInner, tid: &str, status: &str) {
+    if let Some(t) = inner.turns.iter_mut().find(|t| t["id"] == tid) {
+        t["status"] = json!(status);
+        t["completedAt"] = json!(2);
+        if status != "completed" {
+            t["stopReason"] = json!(status);
+        }
     }
 }
 
@@ -358,6 +377,7 @@ fn state_value(
     history: Value,
     before_cursor: Value,
     queue: Value,
+    turns: Value,
 ) -> Value {
     json!({
         "format": "vibe.public-session-state/v1",
@@ -366,7 +386,7 @@ fn state_value(
         "isQuiescent": true,
         "history": history,
         "historyBeforeCursor": before_cursor,
-        "turns": [],
+        "turns": turns,
         "activeCallbacks": [],
         "childSessions": [],
         "turnQueue": queue,
@@ -863,7 +883,7 @@ async fn spawn_turn(
         text,
         n,
         turn_id.clone(),
-        queue_item_id,
+        queue_item_id.clone(),
         tx.clone(),
         pending.clone(),
     ));
@@ -871,6 +891,11 @@ async fn spawn_turn(
         let mut inner = data.inner.lock().await;
         inner.active_turn = Some(turn_id.clone());
         inner.active_abort = Some(task.abort_handle());
+        inner.turns.push(json!({
+            "id": turn_id, "sessionId": sid, "status": "running",
+            "startedAt": n, "completedAt": null, "error": null,
+            "stopReason": null, "queueItemId": queue_item_id,
+        }));
         data.persist(&inner).await;
     }
     set_status(
@@ -1134,6 +1159,8 @@ async fn finish_turn(
         let mut inner = data.inner.lock().await;
         inner.active_turn = None;
         inner.active_abort = None;
+        end_turn(&mut inner, &turn_id, "completed");
+        data.persist(&inner).await;
     }
     let term = terminal_status(&data).await;
     set_status(&data, &tx2, &sid, term).await;
@@ -1364,6 +1391,7 @@ async fn main() {
                         json!([]),
                         Value::Null,
                         empty_queue(),
+                        json!([]),
                     ),
                 };
                 respond(json!({"state": state, "lastEventId": 0})).await;
@@ -1387,15 +1415,25 @@ async fn main() {
                 // Snapshot session + history + watermark + turn counter
                 // under one parent lock — the child must never claim a
                 // watermark ahead of the history it inherited.
-                let (mut session, history, event_id, turn_seq) = {
+                let (mut session, history, event_id, turn_seq, mut turns) = {
                     let p = d.inner.lock().await;
                     (
                         p.session.clone(),
                         p.history.clone(),
                         p.event_id,
                         d.turn_seq.load(Ordering::SeqCst),
+                        p.turns.clone(),
                     )
                 };
+                // Turn records are history truth — the child inherits
+                // them, but a still-running parent turn isn't the
+                // child's to run: mark it interrupted.
+                for t in &mut turns {
+                    if t["status"] == "running" {
+                        t["status"] = json!("interrupted");
+                        t["stopReason"] = json!("forked");
+                    }
+                }
                 // Refresh catalog fields from the parent's disk record while
                 // the clone still carries the parent's id — a rail process's
                 // archive/rename lands in memory only via this merge.
@@ -1409,6 +1447,7 @@ async fn main() {
                 {
                     let mut inner = fork.inner.lock().await;
                     inner.history = history;
+                    inner.turns = turns;
                     inner.event_id = event_id;
                     fork.turn_seq.store(turn_seq, Ordering::SeqCst);
                     fork.persist(&inner).await;
@@ -1582,6 +1621,7 @@ async fn main() {
                             }
                             inner.active_turn = None;
                             pending_callbacks.lock().await.remove(&format!("cb-{t}"));
+                            end_turn(&mut inner, &t, "interrupted");
                             // Interrupting pauses the queue (upstream
                             // _after_turn_terminal).
                             inner.queue_paused = true;
@@ -1786,6 +1826,7 @@ async fn main() {
                     let killed = inner.active_turn.is_some();
                     if let Some(t) = inner.active_turn.take() {
                         pending_callbacks.lock().await.remove(&format!("cb-{t}"));
+                        end_turn(&mut inner, &t, "interrupted");
                     }
                     data.persist(&inner).await;
                     (changed, killed)
@@ -1807,6 +1848,7 @@ async fn main() {
                             json!(inner.history.clone()),
                             Value::Null,
                             queue_value(&inner),
+                            json!(inner.turns.clone()),
                         );
                         data.persist(&inner).await;
                         (message, state)

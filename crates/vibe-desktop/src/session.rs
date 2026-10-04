@@ -2066,21 +2066,28 @@ impl SessionView {
         if now == "blocked" && prev != "blocked" {
             self.notify_attention("needs attention — approval waiting", cx);
         } else if prev == "running" {
-            if let Some(tid) = prev_turn {
-                match self
-                    .projection
-                    .state
-                    .turns
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .find(|t| t.id == tid)
-                    .map(|t| t.status.as_str())
-                {
-                    Some("completed") => self.notify_attention("turn finished", cx),
-                    Some("failed") => self.notify_attention("turn failed", cx),
-                    // interrupted/cancelled: the user caused it — no ping.
+            match &self.projection.state.turns {
+                // The server didn't serve a turns view at all (version
+                // skew) — the status edge is the only signal left.
+                None => match now {
+                    "idle" => self.notify_attention("turn finished", cx),
+                    "failed" => self.notify_attention("turn failed", cx),
                     _ => {}
+                },
+                Some(turns) => {
+                    if let Some(tid) = prev_turn {
+                        match turns
+                            .iter()
+                            .find(|t| t.id == tid)
+                            .map(|t| t.status.as_str())
+                        {
+                            Some("completed") => self.notify_attention("turn finished", cx),
+                            Some("failed") => self.notify_attention("turn failed", cx),
+                            // interrupted/cancelled or record absent:
+                            // the user caused it — no ping.
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
