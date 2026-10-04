@@ -349,6 +349,9 @@ impl SessionView {
         let Some(owner) = owner.or_else(|| self.review_owner_for(&path)) else {
             return;
         };
+        // Drop the displayed diff at once — keep/revert must not stay
+        // actionable on the previous file while this read is in flight.
+        self.review_diff = None;
         self.review_diff_sel = Some((path.clone(), owner.clone()));
         self.review_diff_gen += 1;
         let gen = self.review_diff_gen;
@@ -417,17 +420,29 @@ impl SessionView {
         cx.notify();
     }
 
-    /// `review/approve` (`keep`) or `review/revert` for a whole file, then
-    /// refresh the state and close the diff. One decision per file at a
-    /// time — a second click while the first is in flight is ignored.
-    pub fn review_apply_file(&mut self, path: String, keep: bool, cx: &mut Context<Self>) {
+    /// `review/approve` (`keep`) or `review/revert` for the displayed
+    /// scope-owner's changes to a file, then refresh the state. The target
+    /// is `ScopeFile` — the open diff shows exactly `owner`'s regions, so
+    /// the decision must hit the same scope (a file-wide revert would
+    /// silently discard other owners' unseen work). One decision per file
+    /// at a time — a second click while the first is in flight is ignored.
+    pub fn review_apply_file(
+        &mut self,
+        path: String,
+        owner: ReviewOwner,
+        keep: bool,
+        cx: &mut Context<Self>,
+    ) {
         if !self.review_inflight.insert(path.clone()) {
             return;
         }
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
-            let target = ReviewTarget::File { path: path.clone() };
+            let target = ReviewTarget::ScopeFile {
+                owner,
+                path: path.clone(),
+            };
             let result = if keep {
                 conn.review_approve(&sid, &target).await
             } else {
@@ -440,9 +455,17 @@ impl SessionView {
                 view.review_inflight.remove(&path);
                 match result {
                     Ok(()) => {
-                        view.review_diff = None;
-                        view.review_diff_sel = None;
-                        view.review_diff_gen += 1;
+                        // Only close the diff that the decision applied
+                        // to — a newer selection may already be showing.
+                        if view
+                            .review_diff_sel
+                            .as_ref()
+                            .is_some_and(|(p, _)| *p == path)
+                        {
+                            view.review_diff = None;
+                            view.review_diff_sel = None;
+                            view.review_diff_gen += 1;
+                        }
                         view.load_review(cx);
                     }
                     Err(e) => view.error = Some(format!("review write failed: {e}")),
@@ -1131,9 +1154,20 @@ impl SessionView {
                     Ok(resp) => {
                         if inplace {
                             // Same-session truncation: the returned state
-                            // supersedes the projection wholesale.
+                            // supersedes the projection wholesale — and
+                            // rewound-away edits must leave the review
+                            // sheet, which a same-session replace can't
+                            // reach through the notification refresh.
                             if !view.projection.adopt(resp.state) {
                                 view.resync(cx);
+                            }
+                            view.review = None;
+                            view.review_diff = None;
+                            view.review_diff_sel = None;
+                            view.review_state_gen += 1;
+                            view.review_diff_gen += 1;
+                            if view.review_open {
+                                view.load_review(cx);
                             }
                         } else if let Some(app) = view.app.as_ref().and_then(|w| w.upgrade()) {
                             let id = resp.state.session.id.clone();
