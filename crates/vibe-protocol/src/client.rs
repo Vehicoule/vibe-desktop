@@ -1192,6 +1192,160 @@ impl Connection {
         )
         .await
     }
+
+    /// `vibeCode/projects/recover` — recover a stale saved link on an
+    /// open picker.
+    pub async fn projects_recover(
+        &self,
+        session_id: &str,
+        picker_id: &str,
+    ) -> ClientResult<VibeCodeProjectRecoverResponse> {
+        self.request_typed(
+            "vibeCode/projects/recover",
+            VibeCodeProjectRecoverParams {
+                session_id: session_id.to_string(),
+                picker_id: picker_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    // ── projectLinks/* — session-less local↔remote link management ──
+
+    /// `projectLinks/list` — every cloud project with its local links.
+    pub async fn project_links_list(&self) -> ClientResult<ProjectLinksListResponse> {
+        self.request_typed("projectLinks/list", serde_json::json!({}))
+            .await
+    }
+
+    /// `projectLinks/resolveRoot` — is this directory linkable?
+    pub async fn project_links_resolve_root(
+        &self,
+        root_path: &str,
+    ) -> ClientResult<ProjectLinksResolveRootResponse> {
+        self.request_typed(
+            "projectLinks/resolveRoot",
+            ProjectLinksRootParams {
+                root_path: root_path.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `projectLinks/inspectRoot` — resolve + the stored link (if any).
+    pub async fn project_links_inspect_root(
+        &self,
+        root_path: &str,
+    ) -> ClientResult<ProjectLinksInspectRootResponse> {
+        self.request_typed(
+            "projectLinks/inspectRoot",
+            ProjectLinksRootParams {
+                root_path: root_path.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `projectLinks/picker/load` — candidates to link `root_path` to.
+    pub async fn project_links_picker_load(
+        &self,
+        root_path: &str,
+    ) -> ClientResult<ProjectLinksPickerLoadResponse> {
+        self.request_typed(
+            "projectLinks/picker/load",
+            ProjectLinksRootParams {
+                root_path: root_path.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `projectLinks/picker/loadMore` — next page of candidates.
+    pub async fn project_links_picker_load_more(
+        &self,
+        root_path: &str,
+        cursor: &str,
+    ) -> ClientResult<ProjectLinksPickerLoadMoreResponse> {
+        self.request_typed(
+            "projectLinks/picker/loadMore",
+            ProjectLinksPickerLoadMoreParams {
+                root_path: root_path.to_string(),
+                cursor: cursor.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `projectLinks/create` — create a remote project and link it.
+    pub async fn project_links_create(
+        &self,
+        root_path: &str,
+        name: &str,
+        default_branch: &str,
+    ) -> ClientResult<ProjectLinkMutationResponse> {
+        self.request_typed(
+            "projectLinks/create",
+            ProjectLinksCreateParams {
+                root_path: root_path.to_string(),
+                name: name.to_string(),
+                default_branch: default_branch.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `projectLinks/link` — bind `root_path` to an existing project.
+    pub async fn project_links_link(
+        &self,
+        root_path: &str,
+        project_id: &str,
+        project_name: &str,
+    ) -> ClientResult<ProjectLinkMutationResponse> {
+        self.request_typed(
+            "projectLinks/link",
+            ProjectLinksLinkParams {
+                root_path: root_path.to_string(),
+                project_id: project_id.to_string(),
+                project_name: project_name.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `projectLinks/save` — persist the link, re-checking the repo
+    /// remote hasn't drifted (`expected_github_repo_url`).
+    pub async fn project_links_save(
+        &self,
+        root_path: &str,
+        project_id: &str,
+        project_name: &str,
+        expected_github_repo_url: Option<&str>,
+    ) -> ClientResult<ProjectLinkMutationResponse> {
+        self.request_typed(
+            "projectLinks/save",
+            ProjectLinksSaveParams {
+                root_path: root_path.to_string(),
+                project_id: project_id.to_string(),
+                project_name: project_name.to_string(),
+                expected_github_repo_url: expected_github_repo_url.map(str::to_string),
+            },
+        )
+        .await
+    }
+
+    /// `projectLinks/unlink` — drop the stored link for `root_path`.
+    pub async fn project_links_unlink(
+        &self,
+        root_path: &str,
+    ) -> ClientResult<ProjectLinksUnlinkResponse> {
+        self.request_typed(
+            "projectLinks/unlink",
+            ProjectLinksRootParams {
+                root_path: root_path.to_string(),
+            },
+        )
+        .await
+    }
 }
 
 impl Drop for Connection {

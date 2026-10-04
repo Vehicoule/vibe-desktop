@@ -2382,3 +2382,194 @@ pub struct SessionRelocateParams {
 pub struct SessionRelocateResponse {
     pub state: PublicSessionState,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectRecoverParams {
+    pub session_id: String,
+    pub picker_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectRecoverResponse {
+    #[serde(default)]
+    pub recovered: bool,
+    pub view: VibeCodePickerView,
+}
+
+// ── projectLinks/* — session-less local↔remote link management ──
+
+/// A local directory bound to a cloud project.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksLocalLink {
+    pub directory_path: String,
+    #[serde(default)]
+    pub has_commits: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksLinkedProject {
+    pub project_id: String,
+    #[serde(default)]
+    pub local_links: Vec<ProjectLinksLocalLink>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksListResponse {
+    #[serde(default)]
+    pub projects: Vec<ProjectLinksLinkedProject>,
+}
+
+/// Git facts the server resolved for an inspected directory.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksDirectoryGit {
+    pub current_branch: Option<String>,
+    pub default_branch: Option<String>,
+    pub github_repo_url: Option<String>,
+    #[serde(default)]
+    pub has_commits: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksInspectedDirectory {
+    pub directory_path: String,
+    pub directory_name: String,
+    pub git: Option<ProjectLinksDirectoryGit>,
+}
+
+/// `not_git | unsupported_remote | nested_unresolvable | no_commits`
+/// (String per ADR-0014 skew rules — an unknown reason must not break
+/// decoding).
+pub type ProjectLinksRejectReason = String;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksRootParams {
+    pub root_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksResolveRootResponse {
+    #[serde(default)]
+    pub eligible: bool,
+    pub reject_reason: Option<ProjectLinksRejectReason>,
+    pub root: Option<ProjectLinksInspectedDirectory>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksSavedLink {
+    pub project_id: String,
+    pub project_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksInspectRootResponse {
+    #[serde(default)]
+    pub eligible: bool,
+    pub reject_reason: Option<ProjectLinksRejectReason>,
+    pub root: Option<ProjectLinksInspectedDirectory>,
+    pub saved_link: Option<ProjectLinksSavedLink>,
+    #[serde(default)]
+    pub stale_link_cleared: bool,
+    #[serde(default)]
+    pub stale_link_clear_failed: bool,
+}
+
+/// A remote project offered by the links picker.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksPickerCandidate {
+    pub project_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksPickerCandidates {
+    #[serde(default)]
+    pub items: Vec<ProjectLinksPickerCandidate>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksPickerLoadResponse {
+    pub root: ProjectLinksInspectedDirectory,
+    pub saved_link: Option<ProjectLinksSavedLink>,
+    #[serde(default)]
+    pub stale_link_cleared: bool,
+    pub candidates: ProjectLinksPickerCandidates,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksPickerLoadMoreParams {
+    pub root_path: String,
+    pub cursor: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksPickerLoadMoreResponse {
+    pub candidates: ProjectLinksPickerCandidates,
+    pub focus_project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksCreateParams {
+    pub root_path: String,
+    pub name: String,
+    pub default_branch: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksLinkParams {
+    pub root_path: String,
+    pub project_id: String,
+    pub project_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksSaveParams {
+    pub root_path: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub expected_github_repo_url: Option<String>,
+}
+
+/// The persisted local↔remote binding (`link`, `create`, `save` all
+/// return it).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLink {
+    pub project_id: String,
+    pub project_name: String,
+    pub directory_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinkMutationResponse {
+    pub link: ProjectLink,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLinksUnlinkResponse {
+    #[serde(default)]
+    pub unlinked: bool,
+}

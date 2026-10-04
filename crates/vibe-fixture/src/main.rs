@@ -506,6 +506,29 @@ async fn session_cwd(sessions: &Sessions, store: &std::path::Path, params: &Valu
     }
 }
 
+/// Object-valued JSON persisted under `store` — `{}` when absent.
+async fn read_json_map(store: &std::path::Path, name: &str) -> serde_json::Map<String, Value> {
+    tokio::fs::read_to_string(store.join(name))
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Atomic write of an object-valued map (tmp + rename).
+async fn write_json_map(
+    store: &std::path::Path,
+    name: &str,
+    map: &serde_json::Map<String, Value>,
+) -> bool {
+    let tmp = store.join(format!("{name}.tmp"));
+    tokio::fs::write(&tmp, serde_json::to_string(map).unwrap_or_default())
+        .await
+        .is_ok()
+        && tokio::fs::rename(&tmp, store.join(name)).await.is_ok()
+}
+
 /// Canned `VibeCodePickerView` — two cloud projects (+ one on loadMore),
 /// context bound to the session's cwd as the repo root.
 fn picker_view(root: &str) -> Value {
@@ -2433,6 +2456,147 @@ async fn main() {
                 } else {
                     respond_err("not_found", "session").await;
                 }
+            }
+            // ── projectLinks/* — session-less local↔remote links,
+            // persisted in project_links.json keyed by root path ──
+            "projectLinks/list" => {
+                let links = read_json_map(&store, "project_links.json").await;
+                let mut grouped: serde_json::Map<String, Value> = serde_json::Map::new();
+                for (root, link) in &links {
+                    let pid = link["projectId"].as_str().unwrap_or_default().to_string();
+                    let entry = grouped
+                        .entry(pid.clone())
+                        .or_insert_with(|| json!({"projectId": pid, "localLinks": []}));
+                    entry["localLinks"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({
+                            "directoryPath": root,
+                            "hasCommits": link["hasCommits"].as_bool().unwrap_or(true),
+                        }));
+                }
+                respond(json!({"projects": Value::Array(grouped.values().cloned().collect())})).await;
+            }
+            "projectLinks/resolveRoot" | "projectLinks/inspectRoot" => {
+                let root = params["rootPath"].as_str().unwrap_or("/tmp").to_string();
+                let name = std::path::Path::new(&root)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| root.clone());
+                let inspected = json!({
+                    "directoryPath": root,
+                    "directoryName": name,
+                    "git": {
+                        "currentBranch": "main",
+                        "defaultBranch": "main",
+                        "githubRepoUrl": "https://github.com/vehicoule/vibe-desktop",
+                        "hasCommits": true,
+                    }
+                });
+                if method == "projectLinks/resolveRoot" {
+                    respond(json!({"eligible": true, "rejectReason": null, "root": inspected})).await;
+                } else {
+                    let links = read_json_map(&store, "project_links.json").await;
+                    let saved = links.get(&root).map(|l| json!({
+                        "projectId": l["projectId"], "projectName": l["projectName"],
+                    }));
+                    respond(json!({
+                        "eligible": true, "rejectReason": null, "root": inspected,
+                        "savedLink": saved, "staleLinkCleared": false,
+                        "staleLinkClearFailed": false,
+                    }))
+                    .await;
+                }
+            }
+            "projectLinks/picker/load" => {
+                let root = params["rootPath"].as_str().unwrap_or("/tmp").to_string();
+                let name = std::path::Path::new(&root)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| root.clone());
+                let links = read_json_map(&store, "project_links.json").await;
+                let saved = links.get(&root).map(|l| json!({
+                    "projectId": l["projectId"], "projectName": l["projectName"],
+                }));
+                respond(json!({
+                    "root": {
+                        "directoryPath": root,
+                        "directoryName": name,
+                        "git": {
+                            "currentBranch": "main",
+                            "defaultBranch": "main",
+                            "githubRepoUrl": "https://github.com/vehicoule/vibe-desktop",
+                            "hasCommits": true,
+                        }
+                    },
+                    "savedLink": saved,
+                    "staleLinkCleared": false,
+                    "candidates": {
+                        "items": [
+                            {"projectId": "proj-aa", "name": "vibe-demo", "recommended": true},
+                            {"projectId": "proj-bb", "name": "side-quest", "recommended": false},
+                        ],
+                        "nextCursor": "lc2",
+                    }
+                }))
+                .await;
+            }
+            "projectLinks/picker/loadMore" => {
+                respond(json!({
+                    "candidates": {
+                        "items": [
+                            {"projectId": "proj-cc", "name": "overflow", "recommended": false},
+                        ],
+                        "nextCursor": null,
+                    },
+                    "focusProjectId": "proj-cc",
+                }))
+                .await;
+            }
+            "projectLinks/link" | "projectLinks/create" | "projectLinks/save" => {
+                let root = params["rootPath"].as_str().unwrap_or("/tmp").to_string();
+                let (pid, pname) = if method == "projectLinks/create" {
+                    (
+                        format!("proj-{}", params["name"].as_str().unwrap_or("x")),
+                        params["name"].as_str().unwrap_or("unnamed").to_string(),
+                    )
+                } else {
+                    (
+                        params["projectId"].as_str().unwrap_or("proj-?").to_string(),
+                        params["projectName"].as_str().unwrap_or("unnamed").to_string(),
+                    )
+                };
+                // `save` rejects when the expected remote drifted from
+                // the fixture's single repoUrl.
+                if method == "projectLinks/save" {
+                    let expected = params["expectedGithubRepoUrl"].as_str();
+                    if expected != Some("https://github.com/vehicoule/vibe-desktop") {
+                        respond_err(
+                            "invalid_params",
+                            "fixture: repository remote changed before the link could be saved",
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+                let link = json!({
+                    "projectId": pid, "projectName": pname, "directoryPath": root,
+                    "hasCommits": true,
+                });
+                let mut links = read_json_map(&store, "project_links.json").await;
+                links.insert(root, link.clone());
+                if write_json_map(&store, "project_links.json", &links).await {
+                    respond(json!({"link": link})).await;
+                } else {
+                    respond_err("internal_error", "fixture: link persist failed").await;
+                }
+            }
+            "projectLinks/unlink" => {
+                let root = params["rootPath"].as_str().unwrap_or("/tmp");
+                let mut links = read_json_map(&store, "project_links.json").await;
+                links.remove(root);
+                let _ = write_json_map(&store, "project_links.json", &links).await;
+                respond(json!({"unlinked": true})).await;
             }
             "runtime/read" => {
                 respond(json!({

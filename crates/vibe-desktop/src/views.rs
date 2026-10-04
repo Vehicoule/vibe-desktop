@@ -159,6 +159,13 @@ impl VibeApp {
                 .hover(|s| s.bg(c(theme::CARD)))
                 .on_click(cx.listener(move |app, _e, _w, cx| app.open_session(&sid2, cx)));
             let pinned = s.pinned_at.is_some();
+            // Linked-dir marker: the session's cwd sits inside (or above)
+            // a directory bound to a remote project (`projectLinks`).
+            let linked = s.cwd.as_deref().is_some_and(|cwd| {
+                self.linked_dirs
+                    .iter()
+                    .any(|d| cwd.starts_with(d.as_str()) || d.starts_with(cwd))
+            });
             if self.renaming.as_deref() == Some(s.id.as_str()) {
                 // Inline rename field replaces the title row.
                 let field = div()
@@ -196,6 +203,9 @@ impl VibeApp {
                                 .child(s.display_title()),
                         )
                         .when(pinned, |d| d.child(text("·", 12.0, c(theme::AMBER))))
+                        .when(linked, |d| {
+                            d.child(text("⇄", 12.0, c(theme::INK_FAINT)))
+                        })
                         .child(
                             div()
                                 .id(gpui::ElementId::Name(format!("menu-{i}").into()))
@@ -1877,6 +1887,170 @@ impl SessionView {
                 ghost_button("teleport-dismiss", if settled { "dismiss" } else { "cancel" })
                     .on_click(cx.listener(|v, _e, _w, cx| v.teleport_cancel(cx))),
             );
+            sheet = sheet.child(block);
+        }
+
+        // ── local link (projectLinks) — bind this session's cwd to a
+        // remote project, or manage the saved binding ──
+        if let Some(link) = &self.link {
+            let mut block = div().flex().flex_col().gap_1();
+            if let Some(saved) = &link.saved_link {
+                let mut row = div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(text(
+                        format!("linked to project: {}", saved.project_name),
+                        10.5,
+                        c(theme::AMBER),
+                    ));
+                if !self.link_busy("unlink") {
+                    row = row.child(
+                        ghost_button("link-unlink", "unlink")
+                            .on_click(cx.listener(|v, _e, _w, cx| v.link_remove(cx))),
+                    );
+                }
+                block = block.child(row);
+            } else if !link.eligible {
+                block = block.child(text(
+                    format!(
+                        "directory can't be linked ({})",
+                        link.reject_reason.as_deref().unwrap_or("unknown")
+                    ),
+                    10.5,
+                    c(theme::INK_FAINT),
+                ));
+            } else {
+                if link.stale_link_cleared {
+                    block = block.child(text(
+                        "saved link was stale and was cleared",
+                        10.0,
+                        c(theme::INK_FAINT),
+                    ));
+                }
+                if let Some(cands) = &self.link_candidates {
+                    let mut rows = div().flex().flex_col().gap_1();
+                    for cand in &cands.items {
+                        let pid = cand.project_id.clone();
+                        let pid2 = cand.project_id.clone();
+                        let pname = cand.name.clone();
+                        let pname2 = cand.name.clone();
+                        let name = if cand.recommended {
+                            format!("{} · recommended", cand.name)
+                        } else {
+                            cand.name.clone()
+                        };
+                        let mut row = div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(text(name, 11.0, c(theme::INK)));
+                        if !self.link_busy("link") {
+                            row = row.child(
+                                div()
+                                    .id(SharedString::from(format!("link-{}", cand.project_id)))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(c(theme::INK_SOFT))
+                                    .hover(|s| s.bg(c(theme::IVORY_DEEP)).text_color(c(theme::INK)))
+                                    .child("link")
+                                    .on_click(cx.listener(move |v, _e, _w, cx| {
+                                        v.link_pick(pid.clone(), pname.clone(), cx)
+                                    })),
+                            );
+                        }
+                        if !self.link_busy("save") {
+                            row = row.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "link-save-{}", cand.project_id
+                                    )))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(c(theme::INK_SOFT))
+                                    .hover(|s| s.bg(c(theme::IVORY_DEEP)).text_color(c(theme::INK)))
+                                    .child("save")
+                                    .on_click(cx.listener(move |v, _e, _w, cx| {
+                                        v.link_save(pid2.clone(), pname2.clone(), cx)
+                                    })),
+                            );
+                        }
+                        rows = rows.child(row);
+                    }
+                    if cands.next_cursor.is_some() && !self.link_busy("load_more") {
+                        rows = rows.child(
+                            div()
+                                .id("link-candidates-more")
+                                .cursor_pointer()
+                                .child(text("more projects…", 10.5, c(theme::INK_FAINT)))
+                                .on_click(
+                                    cx.listener(|v, _e, _w, cx| v.link_candidates_more(cx)),
+                                ),
+                        );
+                    }
+                    block = block.child(rows);
+                } else {
+                    block = block.child(text("loading candidates…", 10.5, c(theme::INK_FAINT)));
+                }
+                // new-project-and-link row
+                let name_text = if self.link_name_input.is_empty() {
+                    "new remote project name…".to_string()
+                } else {
+                    format!("{}▏", self.link_name_input)
+                };
+                let mut create_row = div()
+                    .id("link-create")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .track_focus(&self.link_focus)
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(c(theme::IVORY))
+                            .border_1()
+                            .border_color(c(theme::EDGE))
+                            .on_key_down(cx.listener(|v, e: &gpui::KeyDownEvent, _w, cx| {
+                                match e.keystroke.key.as_str() {
+                                    "backspace" => v.edit_link_input(None, cx),
+                                    "enter" => v.link_create(cx),
+                                    _ => {
+                                        if let Some(ch) = &e.keystroke.key_char {
+                                            v.edit_link_input(Some(ch), cx);
+                                        }
+                                    }
+                                }
+                            }))
+                            .child(text(
+                                name_text,
+                                11.0,
+                                c(if self.link_name_input.is_empty() {
+                                    theme::INK_FAINT
+                                } else {
+                                    theme::INK
+                                }),
+                            )),
+                    )
+                    .on_click(cx.listener(|v, _e, window, _cx| {
+                        window.focus(&v.link_focus);
+                    }));
+                if !self.link_busy("create") {
+                    create_row = create_row.child(
+                        ghost_button("link-create-btn", "create + link")
+                            .on_click(cx.listener(|v, _e, _w, cx| v.link_create(cx))),
+                    );
+                }
+                block = block.child(create_row);
+            }
             sheet = sheet.child(block);
         }
 

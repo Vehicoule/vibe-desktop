@@ -41,6 +41,9 @@ pub struct VibeApp {
     /// flight — also the re-entrancy guard. A toggle during the flight
     /// re-runs the refresh once it lands.
     catalog_inflight: Option<bool>,
+    /// Directory paths bound to remote projects (`projectLinks/list`) —
+    /// rail rows inside one get a link marker.
+    pub linked_dirs: std::collections::HashSet<String>,
 }
 
 enum AttachKind {
@@ -79,6 +82,7 @@ impl VibeApp {
             spawning: false,
             show_archived: false,
             catalog_inflight: None,
+            linked_dirs: std::collections::HashSet::new(),
         };
         app.refresh_sessions(cx);
         app
@@ -148,7 +152,20 @@ impl VibeApp {
                             _ => break,
                         }
                     }
-                    Ok(items)
+                    // Session-less: every local dir bound to a remote
+                    // project (the rail's link markers).
+                    let linked = conn
+                        .project_links_list()
+                        .await
+                        .map(|r| {
+                            r.projects
+                                .into_iter()
+                                .flat_map(|p| p.local_links)
+                                .map(|l| l.directory_path)
+                                .collect::<std::collections::HashSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    Ok((items, linked))
                 })
                 .await
                 .map_err(|_| vibe_protocol::client::ClientError::Closed)
@@ -156,8 +173,9 @@ impl VibeApp {
             let _ = this.update(cx, |app, cx| {
                 app.catalog_inflight = None;
                 match out {
-                    Ok(items) => {
+                    Ok((items, linked)) => {
                         app.sessions = items;
+                        app.linked_dirs = linked;
                         app.sort_sessions();
                         app.status = format!("{} session(s)", app.sessions.len());
                     }
