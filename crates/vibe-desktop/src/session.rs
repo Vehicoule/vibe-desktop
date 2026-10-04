@@ -583,7 +583,14 @@ impl SessionView {
                 }
                 view.ext_inflight.remove(&key);
                 match resp {
-                    Ok(_) => view.refresh_loops(cx),
+                    Ok(_) => {
+                        // Optimistic remove — the row is gone, so its
+                        // delete control can't be double-clicked into a
+                        // second delete that would surface a misleading
+                        // not_found. The gen-guarded refresh confirms.
+                        view.loops.retain(|l| l.id != id);
+                        view.refresh_loops(cx);
+                    }
                     Err(e) => view.error = Some(format!("loop delete failed: {e}")),
                 }
                 cx.notify();
