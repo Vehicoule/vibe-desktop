@@ -197,6 +197,9 @@ pub struct TeleportState {
     pub push: Option<(u64, bool)>,
     pub url: Option<String>,
     pub error: Option<String>,
+    /// A `teleport/cancel` request is in flight — repeated clicks are
+    /// ignored until it settles.
+    pub cancel_pending: bool,
 }
 
 impl TeleportState {
@@ -895,22 +898,29 @@ impl SessionView {
                 .unwrap_or_default();
             self.load_picker(cx);
         } else {
-            self.picker_gen += 1;
-            self.picker = None;
-            self.picker_selected = None;
-            self.picker_inflight.clear();
-            // The picker is a server-side workflow — cancel it on close
-            // so a suspended picker can't linger.
-            if let Some(picker_id) = self.picker_id.take() {
-                let conn = self.conn.clone();
-                let sid = self.session_id().to_string();
-                cx.spawn(async move |_, _| {
-                    let _ = conn.projects_cancel(&sid, &picker_id).await;
-                })
-                .detach();
-            }
+            let sid = self.session_id().to_string();
+            self.close_picker(&sid, cx);
         }
         cx.notify();
+    }
+
+    /// Cancel the live picker workflow server-side and drop its state —
+    /// shared by sheet-close, session handoff, and relocate refresh.
+    /// `cancel_sid` is the session the picker was opened against (the old
+    /// id on handoff, where the projection already reports the new one).
+    fn close_picker(&mut self, cancel_sid: &str, cx: &mut Context<Self>) {
+        self.picker_gen += 1;
+        self.picker = None;
+        self.picker_selected = None;
+        self.picker_inflight.clear();
+        if let Some(picker_id) = self.picker_id.take() {
+            let conn = self.conn.clone();
+            let sid = cancel_sid.to_string();
+            cx.spawn(async move |_, _| {
+                let _ = conn.projects_cancel(&sid, &picker_id).await;
+            })
+            .detach();
+        }
     }
 
     /// Picker mutation in flight (`create`, `select:{id}`, `unlink`,
@@ -934,9 +944,15 @@ impl SessionView {
         let sid = self.session_id().to_string();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.projects_open(&sid, "teleport").await;
-            let _ = this.update(cx, |view, cx| {
+            let stale_pid = this.update(cx, |view, cx| {
                 if view.session_id() != sid || view.picker_gen != gen || !view.cloud_open {
-                    return;
+                    // A picker that opened after its generation died still
+                    // exists server-side — hand the id back so the caller
+                    // can cancel the suspended workflow.
+                    return match resp {
+                        Ok(r) => Some(r.picker_id),
+                        Err(_) => None,
+                    };
                 }
                 match resp {
                     Ok(r) => {
@@ -970,7 +986,11 @@ impl SessionView {
                     Err(e) => view.error = Some(format!("projects read failed: {e}")),
                 }
                 cx.notify();
+                None
             });
+            if let Ok(Some(pid)) = stale_pid {
+                let _ = conn.projects_cancel(&sid, &pid).await;
+            }
         })
         .detach();
     }
@@ -1006,13 +1026,14 @@ impl SessionView {
     }
 
     /// `vibeCode/projects/select` — choose the project a later
-    /// `teleport/start` binds to.
+    /// `teleport/start` binds to. Selections serialize (one in flight at
+    /// a time): two row clicks can't race a stale reply into overwriting
+    /// the newest choice.
     pub fn picker_select(&mut self, project_id: String, cx: &mut Context<Self>) {
         let Some(picker_id) = self.picker_id.clone() else {
             return;
         };
-        let key = format!("select:{project_id}");
-        if !self.picker_inflight.insert(key.clone()) {
+        if !self.picker_inflight.insert("select".to_string()) {
             return;
         }
         let conn = self.conn.clone();
@@ -1020,12 +1041,19 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.projects_select(&sid, &picker_id, &project_id).await;
             let _ = this.update(cx, |view, cx| {
-                view.picker_inflight.remove(&key);
-                if view.session_id() != sid {
+                view.picker_inflight.remove("select");
+                // The reply must land on the picker it was issued
+                // against — a reopened picker has a new id, and an
+                // old picker's reply must not overwrite it.
+                if view.session_id() != sid || view.picker_id.as_deref() != Some(picker_id.as_str())
+                {
                     return;
                 }
                 match resp {
                     Ok(r) => {
+                        // The applied view supersedes any in-flight
+                        // read — invalidate pending loadMore replies.
+                        view.picker_gen += 1;
                         view.picker = Some(r.view);
                         view.picker_selected = Some(r.project);
                     }
@@ -1051,11 +1079,13 @@ impl SessionView {
             let resp = conn.projects_unlink(&sid, &picker_id).await;
             let _ = this.update(cx, |view, cx| {
                 view.picker_inflight.remove("unlink");
-                if view.session_id() != sid {
+                if view.session_id() != sid || view.picker_id.as_deref() != Some(picker_id.as_str())
+                {
                     return;
                 }
                 match resp {
                     Ok(r) => {
+                        view.picker_gen += 1;
                         view.picker = Some(r.view);
                         view.picker_selected = None;
                     }
@@ -1109,11 +1139,13 @@ impl SessionView {
             let resp = conn.projects_create(&sid, &picker_id, &name, &branch).await;
             let _ = this.update(cx, |view, cx| {
                 view.picker_inflight.remove("create");
-                if view.session_id() != sid {
+                if view.session_id() != sid || view.picker_id.as_deref() != Some(picker_id.as_str())
+                {
                     return;
                 }
                 match resp {
                     Ok(r) => {
+                        view.picker_gen += 1;
                         view.picker = Some(r.view);
                         view.picker_selected = Some(r.project);
                         view.project_input.clear();
@@ -1149,6 +1181,7 @@ impl SessionView {
             push: None,
             url: None,
             error: None,
+            cancel_pending: false,
         });
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
@@ -1192,7 +1225,7 @@ impl SessionView {
         if t.push.is_none() {
             return;
         }
-        t.push = None;
+        let gate = t.push.take();
         t.phase = if approved { "pushing" } else { "declining" };
         let op = t.operation_id.clone();
         let conn = self.conn.clone();
@@ -1206,8 +1239,12 @@ impl SessionView {
                 if let Err(e) = resp {
                     if let Some(t) = view.teleport.as_mut() {
                         if t.operation_id == op && !t.settled() {
-                            t.error = Some(format!("push answer failed: {e}"));
-                            t.phase = "failed";
+                            // The server still awaits the gate answer —
+                            // restore it so the user can retry instead
+                            // of being left with only dismissal.
+                            t.push = gate;
+                            t.phase = "push required";
+                            view.error = Some(format!("push answer failed: {e}"));
                         }
                     }
                 }
@@ -1228,7 +1265,13 @@ impl SessionView {
             cx.notify();
             return;
         }
+        if t.cancel_pending {
+            return;
+        }
         let op = t.operation_id.clone();
+        if let Some(t) = self.teleport.as_mut() {
+            t.cancel_pending = true;
+        }
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -1237,12 +1280,32 @@ impl SessionView {
                 if view.session_id() != sid {
                     return;
                 }
+                // The response must apply to the run it cancelled — a
+                // late reply for a superseded operation must not erase
+                // (or error) the run that's current now.
                 match resp {
-                    Ok(r) if r.cancelled => view.teleport = None,
-                    Ok(_) => {}
+                    Ok(r) if r.cancelled => {
+                        if view
+                            .teleport
+                            .as_ref()
+                            .is_some_and(|t| t.operation_id == op)
+                        {
+                            view.teleport = None;
+                        }
+                    }
+                    Ok(_) => {
+                        if let Some(t) = view.teleport.as_mut() {
+                            if t.operation_id == op {
+                                t.cancel_pending = false;
+                            }
+                        }
+                    }
                     Err(e) => {
                         if let Some(t) = view.teleport.as_mut() {
-                            t.error = Some(format!("cancel failed: {e}"));
+                            if t.operation_id == op {
+                                t.cancel_pending = false;
+                                t.error = Some(format!("cancel failed: {e}"));
+                            }
                         }
                     }
                 }
@@ -1250,6 +1313,7 @@ impl SessionView {
             });
         })
         .detach();
+        cx.notify();
     }
 
     /// `session/relocate` — move this session's cwd; the returned state
@@ -1275,6 +1339,23 @@ impl SessionView {
                         // adopt() refuses a stale snapshot — resync then.
                         if !view.projection.adopt(r.state) {
                             view.resync(cx);
+                        }
+                        // cwd moved: the picker + workspace reads are
+                        // bound to the old checkout — reopen the picker
+                        // against the new root and refresh workspace-
+                        // scoped trust/worktrees/settings.
+                        let sid2 = view.session_id().to_string();
+                        view.close_picker(&sid2, cx);
+                        view.worktrees.clear();
+                        view.config_fields.clear();
+                        view.trust_dismissed = false;
+                        view.check_trust(cx);
+                        view.load_worktrees(cx);
+                        if view.cloud_open {
+                            view.load_picker(cx);
+                        }
+                        if view.settings_open {
+                            view.load_settings(cx);
                         }
                     }
                     Err(e) => view.error = Some(format!("relocate failed: {e}")),
@@ -1519,9 +1600,13 @@ impl SessionView {
             let result = conn.workspace_trust_status(cwd.as_deref()).await;
             let _ = this.update(cx, |view, cx| {
                 if let Ok(status) = result {
-                    if status.status == "untrusted" {
-                        view.trust = status.details;
-                    }
+                    // Clear a stale banner too — after a relocate the
+                    // new cwd may be trusted where the old one wasn't.
+                    view.trust = if status.status == "untrusted" {
+                        status.details
+                    } else {
+                        None
+                    };
                 }
                 cx.notify();
             });
@@ -1658,6 +1743,16 @@ impl SessionView {
             self.loops.clear();
             self.loops_gen += 1;
             self.worktrees_gen += 1;
+            // Cloud state is session-scoped too — cancel the old picker
+            // against the OLD session id, drop teleport tracking, and
+            // reopen the picker for the handed-off session when the
+            // sheet is up.
+            self.close_picker(&old, cx);
+            self.teleport = None;
+            self.relocate_inflight = false;
+            if self.cloud_open {
+                self.load_picker(cx);
+            }
             if self.settings_open {
                 self.load_worktrees(cx);
                 self.load_settings(cx);
