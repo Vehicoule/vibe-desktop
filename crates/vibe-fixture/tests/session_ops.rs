@@ -591,6 +591,12 @@ async fn settings_roundtrip_reads_and_writes() {
     assert!(!resp.rejected);
     assert_eq!(resp.status.as_deref(), Some("applied"));
 
+    // The applied switch persists — agents/list reports it instead of
+    // reverting to build; unknown agents reject.
+    let agents = conn.agents_list(&sid).await.unwrap();
+    assert_eq!(agents.active.name, "plan");
+    assert!(conn.session_agent_update(&sid, "bogus").await.is_err());
+
     cleanup(conn, &dir).await;
 }
 
