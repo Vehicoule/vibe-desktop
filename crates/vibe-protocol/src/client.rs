@@ -957,6 +957,26 @@ impl Connection {
         .await
     }
 
+    /// `connector_catalog/toggle` — connector sources don't go through
+    /// `mcp/toggle` (upstream rejects `source:"connector"`); they flip
+    /// via their own catalog. Same `runtime.mcp` response shape.
+    pub async fn connector_catalog_toggle(
+        &self,
+        session_id: &str,
+        alias: &str,
+        disabled: bool,
+    ) -> ClientResult<MCPMutationResponse> {
+        self.request_typed(
+            "connector_catalog/toggle",
+            json!({
+                "sessionId": session_id,
+                "alias": alias,
+                "disabled": disabled,
+            }),
+        )
+        .await
+    }
+
     /// `connectors/read` → `{counts:{connected,total}}`.
     pub async fn connectors_read(
         &self,
