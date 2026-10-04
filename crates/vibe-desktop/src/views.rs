@@ -1907,6 +1907,7 @@ impl SessionView {
         Some(sheet)
     }
 
+
     /// Cloud sheet — the `vibeCode/projects` picker (teleport target),
     /// the live teleport run with its push gate, and `session/relocate`.
     fn render_cloud_sheet(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
@@ -2358,6 +2359,7 @@ impl SessionView {
         sheet = sheet.child(reloc_row);
         Some(sheet)
     }
+
 
     fn render_composer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.active_turn_id().is_some();
