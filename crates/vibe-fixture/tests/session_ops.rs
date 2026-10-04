@@ -609,6 +609,28 @@ async fn settings_roundtrip_reads_and_writes() {
         .await
         .is_err());
 
+    // The canned demo rows open without a store record — they resolve
+    // for agent reads/writes until tombstoned by session/delete.
+    assert!(conn.agents_list("saved-aaaa1111").await.is_ok());
+    let resp = conn
+        .session_agent_update("saved-aaaa1111", "plan")
+        .await
+        .unwrap();
+    assert_eq!(resp.status.as_deref(), Some("applied"));
+    let agents = conn.agents_list("saved-aaaa1111").await.unwrap();
+    assert_eq!(agents.active.name, "plan");
+    conn.request(
+        "session/delete",
+        serde_json::json!({"sessionId": "saved-aaaa1111"}),
+    )
+    .await
+    .unwrap();
+    assert!(conn.agents_list("saved-aaaa1111").await.is_err());
+    assert!(conn
+        .session_agent_update("saved-aaaa1111", "plan")
+        .await
+        .is_err());
+
     cleanup(conn, &dir).await;
 }
 
