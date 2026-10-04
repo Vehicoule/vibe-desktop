@@ -65,6 +65,19 @@ pub struct RewindDialog {
     pub read_error: Option<String>,
 }
 
+/// The four surfaces pinned above the composer. They render as column
+/// siblings, so more than one open at a time can overflow the session
+/// column and shrink each sheet's hit-bounds under the last-painted
+/// sheet (dead clicks on everything above the bottom one). Opening one
+/// closes the rest — at most one is ever on screen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SheetSurface {
+    Rewind,
+    Settings,
+    Review,
+    Cloud,
+}
+
 pub struct SessionView {
     pub conn: Arc<Connection>,
     pub projection: Projection,
@@ -449,11 +462,35 @@ impl SessionView {
         .detach();
     }
 
+    /// Close every pinned sheet except `keep`, running each surface's
+    /// real close path so nothing leaks: review's gens bump (pending
+    /// reads die), cloud's picker cancels server-side.
+    fn close_sheets_except(&mut self, keep: SheetSurface, cx: &mut Context<Self>) {
+        if keep != SheetSurface::Settings {
+            self.settings_open = false;
+        }
+        if keep != SheetSurface::Review && self.review_open {
+            self.review_open = false;
+            self.review_state_gen += 1;
+            self.review_diff_gen += 1;
+        }
+        if keep != SheetSurface::Cloud && self.cloud_open {
+            self.cloud_open = false;
+            let sid = self.session_id().to_string();
+            self.close_picker(&sid, cx);
+            self.clear_link();
+        }
+        if keep != SheetSurface::Rewind {
+            self.rewind = None;
+        }
+    }
+
     /// Settings sheet toggle — refreshes every section on every open so
     /// a read that failed last time retries (gen-guarded).
     pub fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
         if self.settings_open {
+            self.close_sheets_except(SheetSurface::Settings, cx);
             self.load_settings(cx);
             self.load_worktrees(cx);
         }
@@ -787,6 +824,7 @@ impl SessionView {
     pub fn toggle_review(&mut self, cx: &mut Context<Self>) {
         self.review_open = !self.review_open;
         if self.review_open {
+            self.close_sheets_except(SheetSurface::Review, cx);
             self.load_review(cx);
         } else {
             // Pending reads must not land after the sheet closed.
@@ -1131,6 +1169,7 @@ impl SessionView {
     pub fn toggle_cloud(&mut self, cx: &mut Context<Self>) {
         self.cloud_open = !self.cloud_open;
         if self.cloud_open {
+            self.close_sheets_except(SheetSurface::Cloud, cx);
             self.relocate_input = self
                 .projection
                 .state
@@ -2758,6 +2797,7 @@ impl SessionView {
             restore_files: false,
             read_error: None,
         });
+        self.close_sheets_except(SheetSurface::Rewind, cx);
         let conn = self.conn.clone();
         let session_id = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
