@@ -349,6 +349,7 @@ impl SessionView {
                         if let Some(s) = view.ext_skills.iter_mut().find(|s| s.name == name) {
                             s.enabled = enabled;
                         }
+                        view.settle_settings_write(cx);
                     }
                     Err(e) => {
                         view.ext_inflight.remove(&key);
@@ -360,6 +361,14 @@ impl SessionView {
         })
         .detach();
         cx.notify();
+    }
+
+    /// A settings write applied server-side: drop any in-flight read
+    /// batch (its snapshot predates the write) and start a replacement
+    /// so every section re-converges — same race the mcp arm handles.
+    fn settle_settings_write(&mut self, cx: &mut Context<Self>) {
+        self.settings_gen += 1;
+        self.load_settings(cx);
     }
 
     /// `mcp/toggle` — flip a source between enabled/disabled. Other
@@ -399,17 +408,12 @@ impl SessionView {
                             .runtime
                             .and_then(|rt| serde_json::from_value::<MCPState>(rt["mcp"].clone()).ok());
                         if let Some(mcp) = fresh {
-                            // Invalidate any settings batch still in
-                            // flight — its older mcp read must not undo
-                            // this toggle's fresh state.
-                            view.settings_gen += 1;
                             view.mcp_state = Some(mcp);
                         }
-                        // A discarded batch may have been carrying other
-                        // sections (e.g. a pending-skill confirmation) —
-                        // start a replacement read so nothing stays
-                        // dropped; its mcp read is post-toggle anyway.
-                        view.load_settings(cx);
+                        // Drop any in-flight batch (its snapshot predates
+                        // the write) and start a replacement read so every
+                        // section re-converges — same as other writes.
+                        view.settle_settings_write(cx);
                     }
                     Err(e) => view.error = Some(format!("mcp toggle failed: {e}")),
                 }
@@ -650,6 +654,7 @@ impl SessionView {
                         if let Some(cfg) = &mut view.config {
                             cfg.default_agent = applied;
                         }
+                        view.settle_settings_write(cx);
                     }
                     Err(e) => view.error = Some(format!("agent switch failed: {e}")),
                 }
@@ -746,6 +751,7 @@ impl SessionView {
                         {
                             f.value = next;
                         }
+                        view.settle_settings_write(cx);
                     }
                     Ok(r) => {
                         view.error = Some(format!("config rejected: {}", r.failures.join(", ")))
