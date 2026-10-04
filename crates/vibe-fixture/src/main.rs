@@ -465,8 +465,18 @@ type Sessions = Arc<tokio::sync::Mutex<BTreeMap<String, Arc<SessionData>>>>;
 type PendingCallbacks = Arc<tokio::sync::Mutex<BTreeMap<String, (Arc<SessionData>, u64, String)>>>;
 type Tx = tokio::sync::mpsc::Sender<String>;
 
+/// The canned demo catalog rows: `(id, cwd, archived)`. `session/read`
+/// and `session/resume` serve these without a store record, so
+/// session-scoped handlers couldn't resolve them — the tombstone-aware
+/// materialization in `find_session` keeps them live until deleted.
+const CANNED_SESSIONS: &[(&str, &str, bool)] = &[
+    ("saved-aaaa1111", "/tmp/project-a", false),
+    ("saved-bbbb2222", "/tmp/project-b", true),
+];
+
 /// Session lookup: in-memory first, then the shared store — a session may
-/// live in a different fixture process (forks, earlier runs).
+/// live in a different fixture process (forks, earlier runs) — then a
+/// canned catalog row materializes while it isn't tombstoned.
 async fn find_session(
     sessions: &Sessions,
     store: &std::path::Path,
@@ -475,7 +485,32 @@ async fn find_session(
     if let Some(d) = sessions.lock().await.get(sid).cloned() {
         return Some(d);
     }
-    SessionData::load(store, sid).await
+    if let Some(d) = SessionData::load(store, sid).await {
+        return Some(d);
+    }
+    // A canned row's first session-scoped touch materializes it (same as
+    // pin/archive do for any safe id) — unless a tombstone says it's
+    // deleted, in which case it stays unresolvable.
+    let (_, cwd, archived) = CANNED_SESSIONS.iter().find(|(id, ..)| *id == sid)?;
+    let tombstoned = tokio::fs::read_to_string(store.join(format!("{sid}.json")))
+        .await
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .is_some_and(|v| v["deleted"] == true);
+    if tombstoned {
+        return None;
+    }
+    let mut session = session_value(
+        sid,
+        cwd,
+        json!({"type": if *archived { "archived" } else { "idle" }}),
+    );
+    if *archived && session["archivedAt"].is_null() {
+        session["archivedAt"] = json!(1_700_000_000);
+    }
+    let d = Arc::new(SessionData::new(session, store.to_path_buf()));
+    sessions.lock().await.insert(sid.to_string(), d.clone());
+    Some(d)
 }
 
 /// Emit a `session/updated` JSON-patch notification (claiming its event id).
@@ -1067,14 +1102,13 @@ async fn main() {
                         }
                     }
                 }
-                for mut demo in [
-                    session_value("saved-aaaa1111", "/tmp/project-a", json!({"type": "idle"})),
+                for mut demo in CANNED_SESSIONS.iter().map(|(id, cwd, archived)| {
                     session_value(
-                        "saved-bbbb2222",
-                        "/tmp/project-b",
-                        json!({"type": "archived"}),
-                    ),
-                ] {
+                        id,
+                        cwd,
+                        json!({"type": if *archived { "archived" } else { "idle" }}),
+                    )
+                }) {
                     // An archived row carries `archivedAt` — the rail reads
                     // the timestamp to decide archive vs unarchive.
                     if demo["status"]["type"] == json!("archived") && demo["archivedAt"].is_null() {
