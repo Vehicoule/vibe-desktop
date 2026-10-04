@@ -1934,6 +1934,7 @@ impl SessionView {
                                 .unwrap_or_else(|| cwd.clone());
                             let sid3 = sid.clone();
                             app.update(cx, |app, cx| {
+                                app.cwd_gen += 1;
                                 if let Some(row) =
                                     app.sessions.iter_mut().find(|s| s.id == sid3)
                                 {

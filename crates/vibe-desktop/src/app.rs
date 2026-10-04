@@ -49,6 +49,10 @@ pub struct VibeApp {
     /// gen it started under is still current — otherwise its older
     /// snapshot would erase the mutation's marker.
     pub linked_gen: u64,
+    /// Bumped when a relocate updates a rail row's cwd locally. A
+    /// refresh that started before the bump fetched the old cwd — it
+    /// re-fires after applying so the stale row can't stick.
+    pub cwd_gen: u64,
 }
 
 enum AttachKind {
@@ -89,6 +93,7 @@ impl VibeApp {
             catalog_inflight: None,
             linked_dirs: std::collections::HashSet::new(),
             linked_gen: 0,
+            cwd_gen: 0,
         };
         app.refresh_sessions(cx);
         app
@@ -128,6 +133,7 @@ impl VibeApp {
         }
         let include_archived = self.show_archived;
         let linked_gen_at_start = self.linked_gen;
+        let cwd_gen_at_start = self.cwd_gen;
         self.catalog_inflight = Some(include_archived);
         let program = self.program();
         self.status = format!("connecting to {}…", program.display());
@@ -198,6 +204,11 @@ impl VibeApp {
                 // The archived toggle flipped while this request was in
                 // flight — reload with the filter the user now expects.
                 if app.show_archived != include_archived {
+                    app.refresh_sessions(cx);
+                } else if app.cwd_gen != cwd_gen_at_start {
+                    // A relocate landed mid-refresh — the fetched rows
+                    // still carry the old cwd. Refetch so the linked
+                    // marker reflects the new checkout.
                     app.refresh_sessions(cx);
                 }
                 cx.notify();
