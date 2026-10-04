@@ -1718,6 +1718,213 @@ impl SessionView {
         Some(sheet)
     }
 
+    /// Review sheet — changed files grouped by owner scope; clicking a file
+    /// swaps the list for its baseline→current diff with keep/revert.
+    fn render_review_sheet(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.review_open {
+            return None;
+        }
+        let mut sheet = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mx_4()
+            .mb_2()
+            .px_4()
+            .py_3()
+            .rounded_lg()
+            .bg(c(theme::CARD))
+            .border_1()
+            .border_color(c(theme::EDGE))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(text("review", 12.5, c(theme::INK)))
+                    .child(div().flex_1())
+                    .child(
+                        ghost_button("close-review", "close")
+                            .on_click(cx.listener(|v, _e, _w, cx| v.toggle_review(cx))),
+                    ),
+            );
+
+        // ── open diff view ──
+        if let Some((path, owner, diff)) = &self.review_diff {
+            let keep_path = path.clone();
+            let revert_path = path.clone();
+            let keep_owner = owner.clone();
+            let revert_owner = owner.clone();
+            let busy = self.review_busy(path);
+            // Whole-file previews (owner None) always decide — the
+            // preview showed every pending change; a scoped sel only
+            // decides while its owner still claims the file.
+            let decidable = self.review_decidable(path, owner.as_ref());
+            let mut lines = div().flex().flex_col();
+            for change in
+                similar::TextDiff::from_lines(&diff.baseline, &diff.current).iter_all_changes()
+            {
+                let (mark, color) = match change.tag() {
+                    similar::ChangeTag::Delete => ("−", theme::RED),
+                    similar::ChangeTag::Insert => ("+", theme::GREEN),
+                    similar::ChangeTag::Equal => (" ", theme::INK_FAINT),
+                };
+                // Strip only the line terminator — trailing whitespace
+                // inside the line is itself diff content.
+                let line = change.value().trim_end_matches(['\n', '\r']);
+                lines = lines.child(text(format!("{mark}{line}"), 10.5, c(color)));
+            }
+            return Some(
+                sheet
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(text(
+                                match owner {
+                                    Some(o) => format!(
+                                        "{path} · {} · {}",
+                                        diff.status,
+                                        review_owner_tag(o)
+                                    ),
+                                    None => format!("{path} · {} · whole file", diff.status),
+                                },
+                                11.5,
+                                c(theme::INK_SOFT),
+                            ))
+                            .child(div().flex_1())
+                            // One decision per file at a time — keep and
+                            // revert both collapse into an inflight label
+                            // so opposing decisions can't race.
+                            .when(busy, |el| {
+                                el.child(text("applying…", 11.0, c(theme::INK_FAINT)))
+                            })
+                            .when(!busy && !decidable, |el| {
+                                el.child(text(
+                                    "owner changed — re-open the diff",
+                                    11.0,
+                                    c(theme::INK_FAINT),
+                                ))
+                            })
+                            .when(!busy && decidable, |el| {
+                                el.child(
+                                    ghost_button("review-keep", "keep").on_click(cx.listener(
+                                        move |v, _e, _w, cx| {
+                                            v.review_apply_file(
+                                                keep_path.clone(),
+                                                keep_owner.clone(),
+                                                true,
+                                                cx,
+                                            )
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    ghost_button("review-revert", "revert").on_click(
+                                        cx.listener(move |v, _e, _w, cx| {
+                                            v.review_apply_file(
+                                                revert_path.clone(),
+                                                revert_owner.clone(),
+                                                false,
+                                                cx,
+                                            )
+                                        }),
+                                    ),
+                                )
+                            })
+                            .child(
+                                ghost_button("review-diff-back", "back")
+                                    .on_click(cx.listener(|v, _e, _w, cx| {
+                                        v.close_review_diff(cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("review-diff-lines")
+                            .max_h(px(280.0))
+                            .overflow_y_scroll()
+                            .child(lines),
+                    ),
+            );
+        }
+
+        // ── file list, grouped by scope ──
+        let Some(state) = &self.review else {
+            return Some(sheet.child(text("no review state", 11.0, c(theme::INK_FAINT))));
+        };
+        let mut listed = Vec::new();
+        for scope in &state.scopes {
+            let scope_label = review_owner_tag(&scope.owner);
+            sheet = sheet.child(text(scope_label, 10.5, c(theme::INK_FAINT)));
+            let mut rows = div().flex().flex_col().gap_1();
+            for f in &scope.files {
+                listed.push(f.path.clone());
+                let color = match f.status.as_str() {
+                    "created" => theme::GREEN,
+                    "deleted" => theme::RED,
+                    _ => theme::AMBER,
+                };
+                let path = f.path.clone();
+                // The row's own scope owner — two scopes touching one
+                // file each get their own diff.
+                let owner = scope.owner.clone();
+                rows = rows.child(
+                    div()
+                        .id(SharedString::from(format!("review-file-{}", f.path)))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |v, _e, _w, cx| {
+                            v.open_review_diff(path.clone(), Some(owner.clone()), cx)
+                        }))
+                        .child(text(
+                            format!("{}  {} ({} region{})", f.path, f.status, f.region_count,
+                                if f.region_count == 1 { "" } else { "s" }),
+                            11.5,
+                            c(color),
+                        )),
+                );
+            }
+            sheet = sheet.child(rows);
+        }
+        // Files not claimed by any scope (regions carry no scope grouping).
+        let unscoped: Vec<&ReviewFile> = state
+            .files
+            .iter()
+            .filter(|f| !listed.iter().any(|p| p == &f.path))
+            .collect();
+        if !unscoped.is_empty() {
+            sheet = sheet.child(text("all files", 10.5, c(theme::INK_FAINT)));
+            let mut rows = div().flex().flex_col().gap_1();
+            for f in unscoped {
+                let color = match f.status.as_str() {
+                    "created" => theme::GREEN,
+                    "deleted" => theme::RED,
+                    _ => theme::AMBER,
+                };
+                let path = f.path.clone();
+                // Files with no resolvable owner render inert — better a
+                // label than a click that does nothing.
+                let openable = self.review_file_openable(&f.path);
+                let mut row = div()
+                    .id(SharedString::from(format!("review-file-{}", f.path)))
+                    .child(text(
+                        format!("{}  {} ({} region{})", f.path, f.status, f.regions.len(),
+                            if f.regions.len() == 1 { "" } else { "s" }),
+                        11.5,
+                        c(if openable { color } else { theme::INK_FAINT }),
+                    ));
+                if openable {
+                    row = row.cursor_pointer().on_click(cx.listener(
+                        move |v, _e, _w, cx| v.open_review_diff(path.clone(), None, cx),
+                    ));
+                }
+                rows = rows.child(row);
+            }
+            sheet = sheet.child(rows);
+        }
+        Some(sheet)
+    }
+
     fn render_composer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.active_turn_id().is_some();
         let hint = if running {

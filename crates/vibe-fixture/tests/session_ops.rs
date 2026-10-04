@@ -776,3 +776,71 @@ async fn extensions_roundtrip() {
 
     cleanup(conn, &dir).await;
 }
+
+/// review/state + turnDiff + approve/revert round-trip.
+#[tokio::test]
+async fn review_state_diff_and_mutation() {
+    let (dir, envs) = store();
+    let mut conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    let (sid, _rx) = session_with_completed_turn(&mut conn).await;
+
+    let state = conn.review_state(&sid).await.unwrap();
+    assert_eq!(state.files.len(), 3);
+    assert_eq!(state.scopes.len(), 1);
+    // notes.txt: unscoped + regionless — the whole-file preview path.
+    let notes = state
+        .files
+        .iter()
+        .find(|f| f.path == "notes.txt")
+        .expect("ownerless file listed");
+    assert!(notes.regions.is_empty());
+    assert!(!state
+        .scopes
+        .iter()
+        .any(|s| s.files.iter().any(|f| f.path == "notes.txt")));
+    let baseline = conn.review_baseline(&sid, "notes.txt").await.unwrap();
+    assert!(baseline.contains("notes.txt"));
+    let owner = state.scopes[0].owner.clone();
+    assert!(matches!(
+        owner,
+        vibe_protocol::models::ReviewOwner::Agent { turn_id: 1 }
+    ));
+
+    let diff = conn
+        .review_turn_diff(&sid, "src/main.rs", &owner)
+        .await
+        .unwrap();
+    assert_eq!(diff.status, "modified");
+    assert!(diff.baseline.contains("old_call"));
+    assert!(diff.current.contains("new_call"));
+
+    conn.review_approve(&sid, &vibe_protocol::models::ReviewTarget::File {
+        path: "src/main.rs".into(),
+    })
+    .await
+    .unwrap();
+    // A decided file resolves off the pending list — the mutation is
+    // observable on the next read.
+    let after_keep = conn.review_state(&sid).await.unwrap();
+    assert_eq!(after_keep.files.len(), 2);
+    assert_eq!(after_keep.scopes[0].files.len(), 1);
+
+    // A file-wide decision resolves an ownerless file too.
+    conn.review_approve(&sid, &vibe_protocol::models::ReviewTarget::File {
+        path: "notes.txt".into(),
+    })
+    .await
+    .unwrap();
+
+    conn.review_revert(&sid, &vibe_protocol::models::ReviewTarget::File {
+        path: "src/lib.rs".into(),
+    })
+    .await
+    .unwrap();
+    let after_all = conn.review_state(&sid).await.unwrap();
+    assert!(after_all.files.is_empty());
+    assert!(after_all.scopes[0].files.is_empty());
+
+    cleanup(conn, &dir).await;
+}
