@@ -373,7 +373,8 @@ impl SessionView {
     /// Does `owner` still author `path` in the current state? Used when
     /// revalidating an open selection after a refresh — a scope naming
     /// the pair counts, and so does an unscoped file whose regions name
-    /// the owner or that no scope claims at all (the derived-owner case).
+    /// the owner — or a regionless file no scope claims (the
+    /// derived-owner case).
     fn review_owner_valid(&self, path: &str, owner: &ReviewOwner) -> bool {
         let Some(state) = self.review.as_ref() else {
             return false;
@@ -388,11 +389,19 @@ impl SessionView {
         let Some(file) = state.files.iter().find(|f| f.path == path) else {
             return false;
         };
-        file.regions.iter().any(|r| r.owner().as_ref() == Some(owner))
-            || !state
-                .scopes
+        if !file.regions.is_empty() {
+            // A regioned file's owner must still come from its regions —
+            // the no-scope-claims fallback is for regionless files only,
+            // otherwise an obsolete owner survives a region handoff.
+            return file
+                .regions
                 .iter()
-                .any(|s| s.files.iter().any(|f| f.path == path))
+                .any(|r| r.owner().as_ref() == Some(owner));
+        }
+        !state
+            .scopes
+            .iter()
+            .any(|s| s.files.iter().any(|f| f.path == path))
     }
 
     /// True when `path` has a resolvable owner — rows without one render
