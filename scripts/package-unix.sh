@@ -23,9 +23,15 @@ case "$OS" in
     STAGE="$(mktemp -d)/Vibe Desktop.app/Contents"
     mkdir -p "$STAGE/MacOS" "$STAGE/Resources"
     cp "$BIN" "$STAGE/MacOS/vibe-desktop"
-    sed "s/VIBE_DESKTOP_VERSION/${VERSION}/" "$PACKAGING/Info.plist" > "$STAGE/Info.plist"
+    # CFBundle*Version must be numeric — strip a leading v and any
+    # non-numeric suffix from the release version.
+    BVER="${VERSION#v}"
+    BVER="${BVER%%[^0-9.]*}"
+    [ -n "$BVER" ] || BVER="0.0.0"
+    sed "s/VIBE_DESKTOP_VERSION/${BVER}/" "$PACKAGING/Info.plist" > "$STAGE/Info.plist"
     # Build the icns from icon.png (macOS-only tools — run in the macOS job).
     ICONSET="$(mktemp -d)/icon.iconset"
+    mkdir -p "$ICONSET"
     for size in 16 32 128 256 512; do
       sips -z "$size" "$size" "$PACKAGING/icon.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
       dbl=$((size * 2))

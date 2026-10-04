@@ -43,13 +43,15 @@ jobs:
       - name: build
         run: cargo build --release --locked -p vibe-desktop
 
+      # VERSION is passed through the environment, never ${{ }}-interpolated
+      # into shell text — a tag name can't inject commands.
       - name: package (linux)
         if: matrix.os == 'ubuntu-latest'
-        run: ./scripts/package-unix.sh target/release/vibe-desktop linux "$VERSION" vibe-desktop-${{ env.VERSION }}-${{ matrix.artifact }}.tar.gz
+        run: ./scripts/package-unix.sh target/release/vibe-desktop linux "$VERSION" "vibe-desktop-${VERSION}-${{ matrix.artifact }}.tar.gz"
 
       - name: package (macos)
         if: matrix.os == 'macos-latest'
-        run: ./scripts/package-unix.sh target/release/vibe-desktop macos "$VERSION" "Vibe Desktop-${{ env.VERSION }}-${{ matrix.artifact }}.zip"
+        run: ./scripts/package-unix.sh target/release/vibe-desktop macos "$VERSION" "Vibe Desktop-${VERSION}-${{ matrix.artifact }}.zip"
         # Signing + notarization: add steps here once Apple certs are
         # provisioned (see README → Releasing). Unsigned zip for now.
 
@@ -57,7 +59,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          Compress-Archive -Path target/release/vibe-desktop.exe, packaging/icon.png -DestinationPath "vibe-desktop-${{ env.VERSION }}-${{ matrix.artifact }}.zip"
+          Compress-Archive -Path target/release/vibe-desktop.exe, packaging/icon.png -DestinationPath "vibe-desktop-$env:VERSION-${{ matrix.artifact }}.zip"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
