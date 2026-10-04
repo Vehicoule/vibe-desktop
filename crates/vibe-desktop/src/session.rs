@@ -527,8 +527,10 @@ impl SessionView {
         self.load_settings(cx);
     }
 
-    /// `mcp/toggle` — flip a source between enabled/disabled. Other
-    /// statuses (needs_auth, connected, …) aren't toggleable here.
+    /// `mcp/toggle` — flip a source between enabled/disabled. Connector-
+    /// kind sources toggle `connected`↔`disabled` via
+    /// `connector_catalog/toggle` (upstream rejects them on `mcp/toggle`).
+    /// Other statuses (needs_auth, needs_setup, …) aren't toggleable.
     pub fn toggle_mcp(&mut self, name: String, cx: &mut Context<Self>) {
         let key = format!("mcp:{name}");
         if !self.ext_inflight.insert(key.clone()) {
@@ -538,9 +540,11 @@ impl SessionView {
             .mcp_state
             .as_ref()
             .and_then(|m| m.sources.iter().find(|s| s.name == name))
-            .and_then(|s| match s.status.as_str() {
-                "enabled" => Some((s.kind.clone(), true)),
-                "disabled" => Some((s.kind.clone(), false)),
+            .and_then(|s| match (s.kind.as_str(), s.status.as_str()) {
+                ("connector", "connected") => Some((s.kind.clone(), true)),
+                ("connector", "disabled") => Some((s.kind.clone(), false)),
+                (_, "enabled") => Some((s.kind.clone(), true)),
+                (_, "disabled") => Some((s.kind.clone(), false)),
                 _ => None,
             })
         else {
@@ -550,7 +554,11 @@ impl SessionView {
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
-            let resp = conn.mcp_toggle(&sid, &name, &kind, disabled).await;
+            let resp = if kind == "connector" {
+                conn.connector_catalog_toggle(&sid, &name, disabled).await
+            } else {
+                conn.mcp_toggle(&sid, &name, &kind, disabled).await
+            };
             let _ = this.update(cx, |view, cx| {
                 if view.session_id() != sid {
                     return;
