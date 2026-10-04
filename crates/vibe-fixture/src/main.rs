@@ -148,6 +148,14 @@ fn store_safe_id(sid: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// Loops are per-session state — each session gets its own
+/// `loops_{sid}.json` overlay so two sessions can't see or delete each
+/// other's entries.
+fn loops_file(params: &Value) -> Option<String> {
+    let sid = params["sessionId"].as_str()?;
+    store_safe_id(sid).then(|| format!("loops_{sid}.json"))
+}
+
 impl SessionData {
     fn new(session: Value, store: std::path::PathBuf) -> Self {
         let inner = SessionInner {
@@ -1550,6 +1558,7 @@ async fn main() {
                     .await;
                     // Session-scoped overlays die with their session.
                     let _ = tokio::fs::remove_file(store.join(format!("agent_{sid}.json"))).await;
+                    let _ = tokio::fs::remove_file(store.join(format!("loops_{sid}.json"))).await;
                 }
                 respond(json!({})).await;
             }
@@ -2179,6 +2188,97 @@ async fn main() {
                     "dropped": []
                 }}))
                 .await;
+            }
+            "workspace/git/worktrees/list" => {
+                respond(json!({
+                    "worktrees": [
+                        {"name": "feature-x", "branch": "feature-x",
+                         "cwd": "/repo/.worktrees/feature-x", "root": "/repo",
+                         "repoRoot": "/repo",
+                         "branchChanges": {"additions": 12, "deletions": 3}}
+                    ],
+                    "repositoryBranch": "main",
+                    "repositoryCwd": "",
+                    "repositoryMappedCwd": "",
+                    "repositoryRoot": "/repo"
+                }))
+                .await;
+            }
+            "loops/list" => {
+                let Some(file) = loops_file(&params) else {
+                    respond_err("invalid_params", "fixture: unsafe session id").await;
+                    continue;
+                };
+                let ov = read_overlay(&store, &file);
+                let items = ov.get("items").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                respond(json!({"loops": items.values().cloned().collect::<Vec<_>>()}))
+                    .await;
+            }
+            "loops/create" => {
+                let Some(file) = loops_file(&params) else {
+                    respond_err("invalid_params", "fixture: unsafe session id").await;
+                    continue;
+                };
+                let mut ov = read_overlay(&store, &file);
+                // Monotonic per-session sequence — len()+1 would reuse a
+                // deleted loop's id and overwrite its survivor.
+                let seq = ov.get("_seq").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+                let id = format!("loop-{seq}");
+                // `<n><unit>` like upstream parse_interval; the unit is a
+                // char (not a byte slice) so multibyte tails can't panic,
+                // and unknown intervals reject instead of silently
+                // becoming 60s.
+                let Some(interval) = params["interval"].as_str().and_then(|s| {
+                    let u = s.chars().next_back()?;
+                    let mult = match u {
+                        's' => 1u64,
+                        'm' => 60,
+                        'h' => 3600,
+                        'd' => 86400,
+                        _ => return None,
+                    };
+                    s[..s.len() - u.len_utf8()].parse::<u64>().ok().map(|v| v * mult)
+                }) else {
+                    respond_err("invalid_params", "fixture: bad interval").await;
+                    continue;
+                };
+                let entry = json!({
+                    "id": id,
+                    "prompt": params["prompt"],
+                    "intervalSeconds": interval,
+                    "nextFireAt": 0.0
+                });
+                ov.insert("_seq".to_string(), json!(seq));
+                if !ov.get("items").is_some_and(|v| v.is_object()) {
+                    ov.insert("items".to_string(), json!({}));
+                }
+                ov.get_mut("items").and_then(|v| v.as_object_mut()).unwrap().insert(id, entry.clone());
+                if persist_overlay(&store, &file, &ov).await {
+                    respond(json!({"loop": entry})).await;
+                } else {
+                    respond_err("internal_error", "fixture: loop persist failed").await;
+                }
+            }
+            "loops/delete" => {
+                let Some(file) = loops_file(&params) else {
+                    respond_err("invalid_params", "fixture: unsafe session id").await;
+                    continue;
+                };
+                let mut ov = read_overlay(&store, &file);
+                let id = params["loopId"].as_str().unwrap_or_default();
+                let entry = ov
+                    .get_mut("items")
+                    .and_then(|v| v.as_object_mut())
+                    .and_then(|m| m.remove(id));
+                let Some(entry) = entry else {
+                    respond_err("not_found", "fixture: unknown loop").await;
+                    continue;
+                };
+                if persist_overlay(&store, &file, &ov).await {
+                    respond(json!({"loop": entry})).await;
+                } else {
+                    respond_err("internal_error", "fixture: loop persist failed").await;
+                }
             }
             "runtime/read" => {
                 respond(json!({

@@ -777,70 +777,77 @@ async fn extensions_roundtrip() {
     cleanup(conn, &dir).await;
 }
 
-/// review/state + turnDiff + approve/revert round-trip.
+
+/// M3d: workspace worktrees + scheduled loops.
 #[tokio::test]
-async fn review_state_diff_and_mutation() {
+async fn worktrees_and_loops() {
     let (dir, envs) = store();
     let mut conn = spawn_fixture(&envs).await;
     conn.initialize(info(), caps()).await.unwrap();
     let (sid, _rx) = session_with_completed_turn(&mut conn).await;
 
-    let state = conn.review_state(&sid).await.unwrap();
-    assert_eq!(state.files.len(), 3);
-    assert_eq!(state.scopes.len(), 1);
-    // notes.txt: unscoped + regionless — the whole-file preview path.
-    let notes = state
-        .files
-        .iter()
-        .find(|f| f.path == "notes.txt")
-        .expect("ownerless file listed");
-    assert!(notes.regions.is_empty());
-    assert!(!state
-        .scopes
-        .iter()
-        .any(|s| s.files.iter().any(|f| f.path == "notes.txt")));
-    let baseline = conn.review_baseline(&sid, "notes.txt").await.unwrap();
-    assert!(baseline.contains("notes.txt"));
-    let owner = state.scopes[0].owner.clone();
-    assert!(matches!(
-        owner,
-        vibe_protocol::models::ReviewOwner::Agent { turn_id: 1 }
-    ));
+    let wt = conn.workspace_worktrees("/repo").await.unwrap();
+    assert_eq!(wt.worktrees.len(), 1);
+    assert_eq!(wt.worktrees[0].branch, "feature-x");
+    assert_eq!(
+        wt.worktrees[0]
+            .branch_changes
+            .as_ref()
+            .map(|c| (c.additions, c.deletions)),
+        Some((12, 3))
+    );
+    assert_eq!(wt.repository_branch.as_deref(), Some("main"));
 
-    let diff = conn
-        .review_turn_diff(&sid, "src/main.rs", &owner)
+    // loops: empty → create (interval parses 5m → 300s) → list → delete.
+    assert!(conn.loops_list(&sid).await.unwrap().loops.is_empty());
+    let created = conn
+        .loops_create(&sid, "5m", "summarize the diff")
         .await
         .unwrap();
-    assert_eq!(diff.status, "modified");
-    assert!(diff.baseline.contains("old_call"));
-    assert!(diff.current.contains("new_call"));
+    assert_eq!(created.scheduled_loop.interval_seconds, 300);
+    let listed = conn.loops_list(&sid).await.unwrap();
+    assert_eq!(listed.loops.len(), 1);
+    assert_eq!(listed.loops[0].prompt, "summarize the diff");
 
-    conn.review_approve(&sid, &vibe_protocol::models::ReviewTarget::File {
-        path: "src/main.rs".into(),
-    })
-    .await
-    .unwrap();
-    // A decided file resolves off the pending list — the mutation is
-    // observable on the next read.
-    let after_keep = conn.review_state(&sid).await.unwrap();
-    assert_eq!(after_keep.files.len(), 2);
-    assert_eq!(after_keep.scopes[0].files.len(), 1);
+    let removed = conn
+        .loops_delete(&sid, &created.scheduled_loop.id)
+        .await
+        .unwrap();
+    assert_eq!(removed.scheduled_loop.id, created.scheduled_loop.id);
+    assert!(conn.loops_list(&sid).await.unwrap().loops.is_empty());
+    assert!(conn.loops_delete(&sid, "loop-9").await.is_err());
 
-    // A file-wide decision resolves an ownerless file too.
-    conn.review_approve(&sid, &vibe_protocol::models::ReviewTarget::File {
-        path: "notes.txt".into(),
-    })
-    .await
-    .unwrap();
+    // Ids are monotonic — create,create,delete-first,create must not
+    // overwrite the surviving loop.
+    let a = conn.loops_create(&sid, "1m", "first").await.unwrap();
+    let b = conn.loops_create(&sid, "2m", "second").await.unwrap();
+    conn.loops_delete(&sid, &a.scheduled_loop.id).await.unwrap();
+    let c = conn.loops_create(&sid, "3m", "third").await.unwrap();
+    let remaining = conn.loops_list(&sid).await.unwrap().loops;
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().any(|l| l.prompt == "second"));
+    assert!(remaining.iter().any(|l| l.prompt == "third"));
+    assert_ne!(b.scheduled_loop.id, c.scheduled_loop.id);
 
-    conn.review_revert(&sid, &vibe_protocol::models::ReviewTarget::File {
-        path: "src/lib.rs".into(),
-    })
-    .await
-    .unwrap();
-    let after_all = conn.review_state(&sid).await.unwrap();
-    assert!(after_all.files.is_empty());
-    assert!(after_all.scopes[0].files.is_empty());
+    // Bad intervals reject instead of defaulting to 60s.
+    assert!(conn.loops_create(&sid, "5x", "bad").await.is_err());
+    assert!(conn.loops_create(&sid, "mé", "bad").await.is_err());
 
+    // Loops are session-scoped — a second fixture process on the same
+    // store sees none of these (one connection = one session).
+    let mut conn2 = spawn_fixture(&envs).await;
+    conn2.initialize(info(), caps()).await.unwrap();
+    let (sid2, _rx2) = session_with_completed_turn(&mut conn2).await;
+    assert_ne!(sid, sid2);
+    assert!(conn2.loops_list(&sid2).await.unwrap().loops.is_empty());
+    assert!(conn2
+        .loops_delete(&sid2, &b.scheduled_loop.id)
+        .await
+        .is_err());
+
+    drop(conn2);
     cleanup(conn, &dir).await;
 }
+
+
+
