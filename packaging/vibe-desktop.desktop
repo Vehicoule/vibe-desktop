@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Vibe Desktop
+Comment=Desktop client for Mistral Vibe
+Exec=vibe-desktop
+Icon=vibe-desktop
+Categories=Development;Utility;
+Terminal=false
+StartupWMClass=vibe-desktop
