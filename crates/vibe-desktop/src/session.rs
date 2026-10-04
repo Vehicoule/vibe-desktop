@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use gpui::{AsyncApp, Context, FocusHandle, Task, WeakEntity};
-use vibe_protocol::client::{ClientResult, Connection};
+use vibe_protocol::client::{ClientError, ClientResult, Connection};
 use vibe_protocol::models::*;
 use vibe_protocol::projection::{Projection, Reduce};
 
@@ -82,14 +82,15 @@ pub struct SessionView {
     pub review: Option<ReviewStateResponse>,
     /// Review sheet open/closed.
     pub review_open: bool,
-    /// Open per-file diff — (path, owner, response). `None` until
-    /// `review/turnDiff` lands.
-    pub review_diff: Option<(String, ReviewOwner, ReviewTurnDiffResponse)>,
+    /// Open per-file diff — (path, owner, response), `None` until the
+    /// read lands. `None` owner = whole-file preview (no scope claims
+    /// the file; baseline→current rendered file-wide).
+    pub review_diff: Option<(String, Option<ReviewOwner>, ReviewTurnDiffResponse)>,
     /// Latest diff selection the reviewer asked for — independent of what
     /// `review_diff` currently displays. State refreshes revalidate THIS,
     /// so a refresh can neither reopen a superseded file nor lose a click
     /// whose response is still in flight.
-    review_diff_sel: Option<(String, ReviewOwner)>,
+    review_diff_sel: Option<(String, Option<ReviewOwner>)>,
     /// Generation guarding `review/state` reads — a stale response must
     /// not overwrite a newer refresh.
     review_state_gen: u64,
@@ -274,22 +275,18 @@ impl SessionView {
                         view.review = Some(s);
                         if let Some((path, owner)) = sel {
                             // Keep the reviewer's owner while it still
-                            // applies — only a file that outlived its
-                            // owner gets re-resolved (or closed).
-                            let owner = if view.review_owner_valid(&path, &owner) {
-                                Some(owner)
-                            } else {
-                                view.review_owner_for(&path)
+                            // applies — a scoped sel that outlived its
+                            // owner re-resolves (possibly to file-wide).
+                            let owner = match owner {
+                                Some(o) if view.review_owner_valid(&path, &o) => Some(o),
+                                _ => view.review_owner_scoped(&path),
                             };
-                            match (still_present, owner) {
-                                (true, Some(owner)) => {
-                                    view.open_review_diff(path, Some(owner), cx)
-                                }
-                                _ => {
-                                    view.review_diff = None;
-                                    view.review_diff_sel = None;
-                                    view.review_diff_gen += 1;
-                                }
+                            if still_present {
+                                view.open_review_diff(path, owner, cx)
+                            } else {
+                                view.review_diff = None;
+                                view.review_diff_sel = None;
+                                view.review_diff_gen += 1;
                             }
                         }
                     }
@@ -314,10 +311,11 @@ impl SessionView {
         cx.notify();
     }
 
-    /// Owner a file belongs to — the scope listing it, else the file's
-    /// own region owner, else the first scope (`turnDiff` needs an owner
-    /// even for a plain file view; `None` when the state offers none).
-    fn review_owner_for(&self, path: &str) -> Option<ReviewOwner> {
+    /// The owner that genuinely claims `path` — a scope listing it, else
+    /// the file's own region owner. `None` when no scope or region does:
+    /// never borrow an unrelated scope's owner, its `turnDiff` would
+    /// show an empty slice (and deciding it could revert unseen edits).
+    fn review_owner_scoped(&self, path: &str) -> Option<ReviewOwner> {
         let state = self.review.as_ref()?;
         if let Some(scope) = state
             .scopes
@@ -326,29 +324,25 @@ impl SessionView {
         {
             return Some(scope.owner.clone());
         }
-        if let Some(owner) = state
+        state
             .files
             .iter()
             .find(|f| f.path == path)
             .and_then(|f| f.regions.iter().find_map(|r| r.owner()))
-        {
-            return Some(owner);
-        }
-        state.scopes.first().map(|s| s.owner.clone())
     }
 
-    /// `review/turnDiff` — open the baseline→current diff for a file.
-    /// Scoped rows pass their scope's owner explicitly so two owners on
-    /// one file show their own diffs; unscoped rows derive one.
+    /// Open the baseline→current diff for a file. A scoped owner reads
+    /// `review/turnDiff` (that scope's slice — two owners on one file
+    /// show their own diffs). No owner → whole-file preview:
+    /// `review/baseline` + the file as it stands on disk, so a
+    /// `ReviewTarget::File` decision later covers exactly what was shown.
     pub fn open_review_diff(
         &mut self,
         path: String,
         owner: Option<ReviewOwner>,
         cx: &mut Context<Self>,
     ) {
-        let Some(owner) = owner.or_else(|| self.review_owner_for(&path)) else {
-            return;
-        };
+        let owner = owner.or_else(|| self.review_owner_scoped(&path));
         // Drop the displayed diff at once — keep/revert must not stay
         // actionable on the previous file while this read is in flight.
         self.review_diff = None;
@@ -358,8 +352,42 @@ impl SessionView {
         let gen = self.review_diff_gen;
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
+        let status = self
+            .review
+            .as_ref()
+            .and_then(|s| s.files.iter().find(|f| f.path == path))
+            .map(|f| f.status.clone())
+            .unwrap_or_else(|| "modified".into());
+        let cwd = self.projection.state.session.cwd.clone();
         cx.spawn(async move |this, cx| {
-            let resp = conn.review_turn_diff(&sid, &path, &owner).await;
+            let resp = match &owner {
+                Some(owner) => conn.review_turn_diff(&sid, &path, owner).await,
+                None => {
+                    let local_read = |e: String| ClientError::Protocol {
+                        code: "local_read".into(),
+                        message: format!("file-wide preview needs the file on disk: {e}"),
+                        data: serde_json::Value::Null,
+                    };
+                    match (conn.review_baseline(&sid, &path).await, &cwd) {
+                        (Ok(baseline), Some(cwd)) => {
+                            match tokio::fs::read_to_string(
+                                std::path::Path::new(cwd).join(&path),
+                            )
+                            .await
+                            {
+                                Ok(current) => Ok(ReviewTurnDiffResponse {
+                                    status,
+                                    baseline,
+                                    current,
+                                }),
+                                Err(e) => Err(local_read(e.to_string())),
+                            }
+                        }
+                        (Ok(_), None) => Err(local_read("session has no local cwd".into())),
+                        (Err(e), _) => Err(e),
+                    }
+                }
+            };
             let _ = this.update(cx, |view, cx| {
                 if view.session_id() != sid || view.review_diff_gen != gen {
                     return;
@@ -395,23 +423,21 @@ impl SessionView {
         };
         if !file.regions.is_empty() {
             // A regioned file's owner must still come from its regions —
-            // the no-scope-claims fallback is for regionless files only,
             // otherwise an obsolete owner survives a region handoff.
             return file
                 .regions
                 .iter()
                 .any(|r| r.owner().as_ref() == Some(owner));
         }
-        !state
-            .scopes
-            .iter()
-            .any(|s| s.files.iter().any(|f| f.path == path))
+        // Regionless + unscoped: no owner is authoritative — the sel
+        // re-resolves to a whole-file preview instead of keeping one.
+        false
     }
 
-    /// True when `path` has a resolvable owner — rows without one render
-    /// non-clickable instead of silently doing nothing.
-    pub fn review_file_openable(&self, path: &str) -> bool {
-        self.review_owner_for(path).is_some()
+    /// Every listed file is openable — ownerless rows fall back to the
+    /// whole-file preview rather than rendering inert.
+    pub fn review_file_openable(&self, _path: &str) -> bool {
+        true
     }
 
     pub fn close_review_diff(&mut self, cx: &mut Context<Self>) {
@@ -421,12 +447,14 @@ impl SessionView {
         cx.notify();
     }
 
-    /// Is `owner` genuinely attached to `path` — a scope naming the pair
-    /// or a regioned file whose regions name it? The first-scope fallback
-    /// in `review_owner_for` only exists so `turnDiff` can READ; deciding
-    /// through a borrowed owner would target changes it doesn't own.
-    /// Views gate keep/revert on this.
-    pub fn review_decidable(&self, path: &str, owner: &ReviewOwner) -> bool {
+    /// Is this selection safe to keep/revert? `None` (whole-file preview)
+    /// always is — the preview showed every pending change. `Some(o)`
+    /// only when `o` genuinely claims the file: a scope naming the pair
+    /// or a regioned file whose regions name it.
+    pub fn review_decidable(&self, path: &str, owner: Option<&ReviewOwner>) -> bool {
+        let Some(owner) = owner else {
+            return true;
+        };
         let Some(state) = self.review.as_ref() else {
             return false;
         };
@@ -449,25 +477,22 @@ impl SessionView {
     }
 
     /// `review/approve` (`keep`) or `review/revert`, then refresh state.
-    /// The target is always `ScopeFile` on the displayed owner — the diff
-    /// shows that scope's slice, so the decision hits the same unit. A
-    /// file without an authoritative owner only showed a borrowed-owner
-    /// diff: deciding it could revert changes never displayed, so the
-    /// request is refused. One decision per file — a second click while
-    /// in flight is ignored.
+    /// The decision target always matches the displayed diff: `ScopeFile`
+    /// on a scope-claimed file (that scope's slice was shown), `File` on
+    /// the whole-file preview (every pending change was shown). A scoped
+    /// owner that lost its claim since the diff opened is refused — its
+    /// diff no longer matches what a decision would touch. One decision
+    /// per file — a second click while in flight is ignored.
     pub fn review_apply_file(
         &mut self,
         path: String,
-        owner: ReviewOwner,
+        owner: Option<ReviewOwner>,
         keep: bool,
         cx: &mut Context<Self>,
     ) {
-        // An ownerless file (unscoped + regionless) only ever showed a
-        // borrowed-owner diff — a decision here could revert changes the
-        // diff never displayed. No decision is safer than a blind one.
-        if !self.review_decidable(&path, &owner) {
+        if !self.review_decidable(&path, owner.as_ref()) {
             self.error = Some(format!(
-                "review: {path} has no owning scope — decisions disabled"
+                "review: {path}'s owner changed — re-read the diff before deciding"
             ));
             cx.notify();
             return;
@@ -478,9 +503,12 @@ impl SessionView {
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
-            let target = ReviewTarget::ScopeFile {
-                owner: owner.clone(),
-                path: path.clone(),
+            let target = match &owner {
+                Some(owner) => ReviewTarget::ScopeFile {
+                    owner: owner.clone(),
+                    path: path.clone(),
+                },
+                None => ReviewTarget::File { path: path.clone() },
             };
             let result = if keep {
                 conn.review_approve(&sid, &target).await
@@ -495,8 +523,8 @@ impl SessionView {
                 match result {
                     Ok(()) => {
                         // Only close the diff that the decision applied
-                        // to — the matching (path, owner); another owner's
-                        // diff on the same file stays open.
+                        // to — the exact (path, owner) selection; another
+                        // scope's or view's diff on the file stays open.
                         let hit = view
                             .review_diff_sel
                             .as_ref()
