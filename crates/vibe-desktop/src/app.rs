@@ -61,6 +61,10 @@ pub struct VibeApp {
     /// Window focus — notifications only fire for sessions you're not
     /// looking at (background tab, or window unfocused entirely).
     pub window_active: bool,
+    /// Bumped when a relocate updates a rail row's cwd locally. A
+    /// refresh that started before the bump fetched the old cwd — it
+    /// re-fires after applying so the stale row can't stick.
+    pub cwd_gen: u64,
 }
 
 enum AttachKind {
@@ -105,6 +109,7 @@ impl VibeApp {
             vibe_dist: crate::vibe_dist::VibeDist::Missing,
             dist_inflight: false,
             window_active: false,
+            cwd_gen: 0,
         };
         app.refresh_sessions(cx);
         // The dist row manages the REAL server — meaningless under the
@@ -274,6 +279,7 @@ impl VibeApp {
         }
         let include_archived = self.show_archived;
         let linked_gen_at_start = self.linked_gen;
+        let cwd_gen_at_start = self.cwd_gen;
         self.catalog_inflight = Some(include_archived);
         let program = self.program();
         self.status = format!("connecting to {}…", program.display());
@@ -347,6 +353,11 @@ impl VibeApp {
                 // recovery) replays too.
                 if app.show_archived != include_archived || app.catalog_retry_pending {
                     app.catalog_retry_pending = false;
+                    app.refresh_sessions(cx);
+                } else if app.cwd_gen != cwd_gen_at_start {
+                    // A relocate landed mid-refresh — the fetched rows
+                    // still carry the old cwd. Refetch so the linked
+                    // marker reflects the new checkout.
                     app.refresh_sessions(cx);
                 }
                 cx.notify();
