@@ -777,6 +777,7 @@ async fn extensions_roundtrip() {
     cleanup(conn, &dir).await;
 }
 
+
 /// M3d: workspace worktrees + scheduled loops.
 #[tokio::test]
 async fn worktrees_and_loops() {
@@ -847,3 +848,6 @@ async fn worktrees_and_loops() {
     drop(conn2);
     cleanup(conn, &dir).await;
 }
+
+
+
