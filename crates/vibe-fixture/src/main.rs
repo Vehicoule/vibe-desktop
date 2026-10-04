@@ -121,8 +121,11 @@ fn mcp_state_value(store: &std::path::Path) -> Value {
     for s in sources.as_array_mut().into_iter().flatten() {
         let name = s["name"].as_str().unwrap_or_default();
         if let Some(disabled) = states.get(name).and_then(Value::as_bool) {
-            // enabled↔disabled are the only toggleable statuses.
-            if matches!(s["status"].as_str(), Some("enabled" | "disabled")) {
+            if s["kind"].as_str() == Some("connector") {
+                // Connector sources toggle connected↔disabled via
+                // connector_catalog/toggle.
+                s["status"] = json!(if disabled { "disabled" } else { "connected" });
+            } else if matches!(s["status"].as_str(), Some("enabled" | "disabled")) {
                 s["status"] = json!(if disabled { "disabled" } else { "enabled" });
             }
         }
@@ -2207,6 +2210,18 @@ async fn main() {
                     respond(json!({"runtime": {"mcp": mcp_state_value(&store)}})).await;
                 } else {
                     respond_err("internal_error", "fixture: mcp persist failed").await;
+                }
+            }
+            "connector_catalog/toggle" => {
+                // Connector sources share the mcp_states overlay, keyed
+                // by alias — upstream routes them off mcp/toggle.
+                let mut states = read_overlay(&store, "mcp_states.json");
+                let name = params["alias"].as_str().unwrap_or_default();
+                states.insert(name.to_string(), params["disabled"].clone());
+                if persist_overlay(&store, "mcp_states.json", &states).await {
+                    respond(json!({"runtime": {"mcp": mcp_state_value(&store)}})).await;
+                } else {
+                    respond_err("internal_error", "fixture: connector persist failed").await;
                 }
             }
             "connectors/read" => {
