@@ -193,6 +193,20 @@ pub struct SessionView {
     /// `"unlink"`, `"load_more"`) — repeat clicks wait for the
     /// response-applied view.
     picker_inflight: HashSet<String>,
+    /// `projectLinks/inspectRoot` for the session cwd — drives the
+    /// local-link section (saved link + unlink, or candidates).
+    pub link: Option<ProjectLinksInspectRootResponse>,
+    /// `projectLinks/picker/load` candidates when the cwd is eligible
+    /// and unlinked.
+    pub link_candidates: Option<ProjectLinksPickerCandidates>,
+    /// New-project name input for `projectLinks/create`.
+    pub link_name_input: String,
+    pub link_focus: FocusHandle,
+    /// Generation for link reads — stale inspect/picker replies drop.
+    link_gen: u64,
+    /// In-flight link ops (`"inspect"`, `"load"`, `"load_more"`,
+    /// `"link"`, `"save"`, `"create"`, `"unlink"`).
+    link_inflight: HashSet<String>,
     /// Dictation run in flight while the mic toggle is down.
     pub dictation: Option<DictationRun>,
     dictation_pump: Option<Task<()>>,
@@ -321,6 +335,12 @@ impl SessionView {
             teleport: None,
             picker_gen: 0,
             picker_inflight: HashSet::new(),
+            link: None,
+            link_candidates: None,
+            link_name_input: String::new(),
+            link_focus: cx.focus_handle(),
+            link_gen: 0,
+            link_inflight: HashSet::new(),
             dictation: None,
             dictation_pump: None,
             dictation_meter: None,
@@ -1119,9 +1139,11 @@ impl SessionView {
                 .clone()
                 .unwrap_or_default();
             self.load_picker(cx);
+            self.load_link(cx);
         } else {
             let sid = self.session_id().to_string();
             self.close_picker(&sid, cx);
+            self.clear_link();
         }
         cx.notify();
     }
@@ -1143,6 +1165,313 @@ impl SessionView {
             })
             .detach();
         }
+    }
+
+    // ── projectLinks — the session cwd's local↔remote binding ──
+
+    /// The cwd the current `link` state was inspected for — a relocate or
+    /// handoff invalidates it.
+    fn link_root(&self) -> Option<String> {
+        self.projection.state.session.cwd.clone()
+    }
+
+    /// `projectLinks/inspectRoot` — refresh the local-link state. When
+    /// the root is eligible and unlinked, the candidate picker loads
+    /// right after so the section shows choices, not a spinner.
+    fn load_link(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.link_root() else {
+            self.link = None;
+            self.link_candidates = None;
+            return;
+        };
+        if !self.link_inflight.insert("inspect".to_string()) {
+            return;
+        }
+        self.link_gen += 1;
+        let gen = self.link_gen;
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let resp = conn.project_links_inspect_root(&root).await;
+            let _ = this.update(cx, |view, cx| {
+                view.link_inflight.remove("inspect");
+                if view.session_id() != sid || view.link_gen != gen {
+                    return;
+                }
+                match resp {
+                    Ok(r) => {
+                        let needs_candidates =
+                            r.eligible && r.saved_link.is_none();
+                        view.link = Some(r);
+                        view.link_candidates = None;
+                        if needs_candidates {
+                            view.link_picker_load(cx);
+                        }
+                    }
+                    Err(e) => {
+                        view.link = None;
+                        view.error = Some(format!("link inspect failed: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `projectLinks/picker/load` — first page of link candidates.
+    fn link_picker_load(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.link_root() else {
+            return;
+        };
+        if !self.link_inflight.insert("load".to_string()) {
+            return;
+        }
+        self.link_gen += 1;
+        let gen = self.link_gen;
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let resp = conn.project_links_picker_load(&root).await;
+            let _ = this.update(cx, |view, cx| {
+                view.link_inflight.remove("load");
+                if view.session_id() != sid || view.link_gen != gen {
+                    return;
+                }
+                match resp {
+                    Ok(r) => view.link_candidates = Some(r.candidates),
+                    Err(e) => view.error = Some(format!("link picker failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `projectLinks/picker/loadMore` — next candidates page.
+    pub fn link_candidates_more(&mut self, cx: &mut Context<Self>) {
+        let (Some(root), Some(cursor)) = (
+            self.link_root(),
+            self.link_candidates
+                .as_ref()
+                .and_then(|c| c.next_cursor.clone()),
+        ) else {
+            return;
+        };
+        if !self.link_inflight.insert("load_more".to_string()) {
+            return;
+        }
+        self.link_gen += 1;
+        let gen = self.link_gen;
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let resp = conn.project_links_picker_load_more(&root, &cursor).await;
+            let _ = this.update(cx, |view, cx| {
+                view.link_inflight.remove("load_more");
+                if view.session_id() != sid || view.link_gen != gen {
+                    return;
+                }
+                match resp {
+                    Ok(r) => {
+                        if let Some(cands) = view.link_candidates.as_mut() {
+                            cands.items.extend(r.candidates.items);
+                            cands.next_cursor = r.candidates.next_cursor;
+                        } else {
+                            view.link_candidates = Some(r.candidates);
+                        }
+                    }
+                    Err(e) => view.error = Some(format!("link page failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `projectLinks/link` — bind the cwd to a picked candidate, then
+    /// re-inspect so the section shows the saved link.
+    pub fn link_pick(&mut self, project_id: String, project_name: String, cx: &mut Context<Self>) {
+        let Some(root) = self.link_root() else {
+            return;
+        };
+        if !self.link_inflight.insert("mutate".to_string()) {
+            return;
+        }
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let resp = conn
+                .project_links_link(&root, &project_id, &project_name)
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.link_inflight.remove("mutate");
+                if view.session_id() != sid {
+                    return;
+                }
+                match resp {
+                    Ok(_) => {
+                        view.mark_linked(&root, true, cx);
+                        view.load_link(cx);
+                    }
+                    Err(e) => view.error = Some(format!("link failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `projectLinks/save` — persist the link, carrying the inspected
+    /// repo url as the drift check (a changed remote fails server-side).
+    pub fn link_save(&mut self, project_id: String, project_name: String, cx: &mut Context<Self>) {
+        let Some(root) = self.link_root() else {
+            return;
+        };
+        if !self.link_inflight.insert("mutate".to_string()) {
+            return;
+        }
+        let expected = self
+            .link
+            .as_ref()
+            .and_then(|l| l.root.as_ref())
+            .and_then(|r| r.git.as_ref())
+            .and_then(|g| g.github_repo_url.clone());
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let resp = conn
+                .project_links_save(&root, &project_id, &project_name, expected.as_deref())
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.link_inflight.remove("mutate");
+                if view.session_id() != sid {
+                    return;
+                }
+                match resp {
+                    Ok(_) => {
+                        view.mark_linked(&root, true, cx);
+                        view.load_link(cx);
+                    }
+                    Err(e) => view.error = Some(format!("link save failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `projectLinks/create` — new remote project from the link-name
+    /// input, linked to this cwd on the inspected default branch.
+    pub fn link_create(&mut self, cx: &mut Context<Self>) {
+        let name = self.link_name_input.trim().to_string();
+        let Some(root) = self.link_root() else {
+            return;
+        };
+        if name.is_empty() || !self.link_inflight.insert("mutate".to_string()) {
+            return;
+        }
+        let branch = self
+            .link
+            .as_ref()
+            .and_then(|l| l.root.as_ref())
+            .and_then(|r| r.git.as_ref())
+            .and_then(|g| g.default_branch.clone().or(g.current_branch.clone()))
+            .unwrap_or_else(|| "main".to_string());
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let resp = conn.project_links_create(&root, &name, &branch).await;
+            let _ = this.update(cx, |view, cx| {
+                view.link_inflight.remove("mutate");
+                if view.session_id() != sid {
+                    return;
+                }
+                match resp {
+                    Ok(_) => {
+                        view.link_name_input.clear();
+                        view.mark_linked(&root, true, cx);
+                        view.load_link(cx);
+                    }
+                    Err(e) => view.error = Some(format!("link create failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `projectLinks/unlink` — drop the saved binding for this cwd.
+    pub fn link_remove(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.link_root() else {
+            return;
+        };
+        if !self.link_inflight.insert("mutate".to_string()) {
+            return;
+        }
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let resp = conn.project_links_unlink(&root).await;
+            let _ = this.update(cx, |view, cx| {
+                view.link_inflight.remove("mutate");
+                if view.session_id() != sid {
+                    return;
+                }
+                match resp {
+                    Ok(_) => {
+                        view.mark_linked(&root, false, cx);
+                        view.load_link(cx);
+                    }
+                    Err(e) => view.error = Some(format!("link unlink failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Link-name input for `projectLinks/create`.
+    pub fn edit_link_input(&mut self, ch: Option<&str>, cx: &mut Context<Self>) {
+        match ch {
+            Some(c) => self.link_name_input.push_str(c),
+            None => {
+                self.link_name_input.pop();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Update the rail's linked-dir set after a mutation so the marker
+    /// appears/disappears without waiting for a catalog refresh.
+    fn mark_linked(&mut self, root: &str, linked: bool, cx: &mut Context<Self>) {
+        if let Some(app) = self.app.as_ref().and_then(|w| w.upgrade()) {
+            let root = root.to_string();
+            app.update(cx, |app, cx| {
+                app.linked_gen += 1;
+                if linked {
+                    app.linked_dirs.insert(root);
+                } else {
+                    app.linked_dirs.remove(&root);
+                }
+                cx.notify();
+            });
+        }
+    }
+
+    /// A link op is in flight. `"mutate"` covers link/save/create/unlink
+    /// — one guard for all of them so concurrent choices can't interleave
+    /// server-side writes for the same root.
+    pub fn link_busy(&self, key: &str) -> bool {
+        self.link_inflight.contains(key)
+    }
+
+    /// Drop link state — handoff/relocate/sheet-close paths share it.
+    fn clear_link(&mut self) {
+        self.link = None;
+        self.link_candidates = None;
+        self.link_gen += 1;
+        self.link_inflight.clear();
     }
 
     /// Picker mutation in flight (`create`, `select:{id}`, `unlink`,
@@ -1591,8 +1920,32 @@ impl SessionView {
                         view.trust_dismissed = false;
                         view.check_trust(cx);
                         view.load_worktrees(cx);
+                        view.clear_link();
+                        // The rail row's cwd is stale now — update it so
+                        // the linked-dir marker recomputes against the new
+                        // checkout without waiting for a catalog refresh.
+                        if let Some(app) = view.app.as_ref().and_then(|w| w.upgrade()) {
+                            let new_cwd = view
+                                .projection
+                                .state
+                                .session
+                                .cwd
+                                .clone()
+                                .unwrap_or_else(|| cwd.clone());
+                            let sid3 = sid.clone();
+                            app.update(cx, |app, cx| {
+                                app.cwd_gen += 1;
+                                if let Some(row) =
+                                    app.sessions.iter_mut().find(|s| s.id == sid3)
+                                {
+                                    row.cwd = Some(new_cwd);
+                                }
+                                cx.notify();
+                            });
+                        }
                         if view.cloud_open {
                             view.load_picker(cx);
+                            view.load_link(cx);
                         }
                         if view.settings_open {
                             view.load_settings(cx);
@@ -1995,8 +2348,10 @@ impl SessionView {
             self.close_picker(&old, cx);
             self.teleport = None;
             self.relocate_inflight = false;
+            self.clear_link();
             if self.cloud_open {
                 self.load_picker(cx);
+                self.load_link(cx);
             }
             if self.settings_open {
                 self.load_worktrees(cx);

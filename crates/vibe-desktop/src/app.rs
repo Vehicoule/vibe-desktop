@@ -41,6 +41,18 @@ pub struct VibeApp {
     /// flight — also the re-entrancy guard. A toggle during the flight
     /// re-runs the refresh once it lands.
     catalog_inflight: Option<bool>,
+    /// Directory paths bound to remote projects (`projectLinks/list`) —
+    /// rail rows inside one get a link marker.
+    pub linked_dirs: std::collections::HashSet<String>,
+    /// Bumped by in-app link mutations (session sheet's `mark_linked`).
+    /// A catalog refresh only applies its fetched `linked_dirs` when the
+    /// gen it started under is still current — otherwise its older
+    /// snapshot would erase the mutation's marker.
+    pub linked_gen: u64,
+    /// Bumped when a relocate updates a rail row's cwd locally. A
+    /// refresh that started before the bump fetched the old cwd — it
+    /// re-fires after applying so the stale row can't stick.
+    pub cwd_gen: u64,
 }
 
 enum AttachKind {
@@ -79,6 +91,9 @@ impl VibeApp {
             spawning: false,
             show_archived: false,
             catalog_inflight: None,
+            linked_dirs: std::collections::HashSet::new(),
+            linked_gen: 0,
+            cwd_gen: 0,
         };
         app.refresh_sessions(cx);
         app
@@ -117,6 +132,8 @@ impl VibeApp {
             return;
         }
         let include_archived = self.show_archived;
+        let linked_gen_at_start = self.linked_gen;
+        let cwd_gen_at_start = self.cwd_gen;
         self.catalog_inflight = Some(include_archived);
         let program = self.program();
         self.status = format!("connecting to {}…", program.display());
@@ -148,7 +165,20 @@ impl VibeApp {
                             _ => break,
                         }
                     }
-                    Ok(items)
+                    // Session-less: every local dir bound to a remote
+                    // project (the rail's link markers).
+                    let linked = conn
+                        .project_links_list()
+                        .await
+                        .map(|r| {
+                            r.projects
+                                .into_iter()
+                                .flat_map(|p| p.local_links)
+                                .map(|l| l.directory_path)
+                                .collect::<std::collections::HashSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    Ok((items, linked))
                 })
                 .await
                 .map_err(|_| vibe_protocol::client::ClientError::Closed)
@@ -156,8 +186,14 @@ impl VibeApp {
             let _ = this.update(cx, |app, cx| {
                 app.catalog_inflight = None;
                 match out {
-                    Ok(items) => {
+                    Ok((items, linked)) => {
                         app.sessions = items;
+                        // The fetched links snapshot predates any mutation
+                        // made while the refresh was in flight — keep the
+                        // newer optimistic set in that case.
+                        if app.linked_gen == linked_gen_at_start {
+                            app.linked_dirs = linked;
+                        }
                         app.sort_sessions();
                         app.status = format!("{} session(s)", app.sessions.len());
                     }
@@ -168,6 +204,11 @@ impl VibeApp {
                 // The archived toggle flipped while this request was in
                 // flight — reload with the filter the user now expects.
                 if app.show_archived != include_archived {
+                    app.refresh_sessions(cx);
+                } else if app.cwd_gen != cwd_gen_at_start {
+                    // A relocate landed mid-refresh — the fetched rows
+                    // still carry the old cwd. Refetch so the linked
+                    // marker reflects the new checkout.
                     app.refresh_sessions(cx);
                 }
                 cx.notify();

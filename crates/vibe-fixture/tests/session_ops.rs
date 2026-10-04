@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use vibe_protocol::client::Connection;
+use vibe_protocol::client::{ClientError, Connection};
 use vibe_protocol::models::*;
 
 fn fixture() -> PathBuf {
@@ -994,6 +994,86 @@ async fn cloud_picker_teleport_and_relocate() {
     .await;
 
     conn.projects_cancel(&sid, &opened.picker_id).await.unwrap();
+    cleanup(conn, &dir).await;
+}
+
+
+/// M4b: projectLinks/* — session-less local↔remote link lifecycle.
+#[tokio::test]
+async fn project_links_lifecycle() {
+    let (dir, envs) = store();
+    let conn = spawn_fixture(&envs).await;
+    conn.initialize(info(), caps()).await.unwrap();
+    let root = "/tmp/demo";
+
+    // resolveRoot: eligible with git metadata.
+    let resolved = conn.project_links_resolve_root(root).await.unwrap();
+    assert!(resolved.eligible);
+    assert_eq!(
+        resolved.root.unwrap().git.unwrap().github_repo_url.as_deref(),
+        Some("https://github.com/vehicoule/vibe-desktop")
+    );
+
+    // No link saved yet — inspect reports none, picker offers candidates
+    // with a page cursor.
+    let inspected = conn.project_links_inspect_root(root).await.unwrap();
+    assert!(inspected.eligible);
+    assert!(inspected.saved_link.is_none());
+    let loaded = conn.project_links_picker_load(root).await.unwrap();
+    assert_eq!(loaded.candidates.items.len(), 2);
+    assert!(loaded.candidates.items[0].recommended);
+    assert_eq!(loaded.candidates.next_cursor.as_deref(), Some("lc2"));
+    let more = conn
+        .project_links_picker_load_more(root, "lc2")
+        .await
+        .unwrap();
+    assert_eq!(more.candidates.items.len(), 1);
+    assert_eq!(more.focus_project_id.as_deref(), Some("proj-cc"));
+
+    // list is empty before any link; link persists and groups by project.
+    assert!(conn.project_links_list().await.unwrap().projects.is_empty());
+    let linked = conn
+        .project_links_link(root, "proj-aa", "vibe-demo")
+        .await
+        .unwrap();
+    assert_eq!(linked.link.project_id, "proj-aa");
+    let inspected = conn.project_links_inspect_root(root).await.unwrap();
+    assert_eq!(
+        inspected.saved_link.unwrap().project_name,
+        "vibe-demo"
+    );
+    let list = conn.project_links_list().await.unwrap();
+    assert_eq!(list.projects.len(), 1);
+    assert_eq!(list.projects[0].local_links[0].directory_path, root);
+
+    // save re-checks the remote: a drifted expectedGithubRepoUrl is
+    // rejected, a matching one persists.
+    let drift = conn
+        .project_links_save(
+            root,
+            "proj-bb",
+            "side-quest",
+            Some("https://github.com/other/moved"),
+        )
+        .await;
+    assert!(matches!(drift, Err(ClientError::Protocol { .. })));
+    conn.project_links_save(
+        root,
+        "proj-bb",
+        "side-quest",
+        Some("https://github.com/vehicoule/vibe-desktop"),
+    )
+    .await
+    .unwrap();
+    let inspected = conn.project_links_inspect_root(root).await.unwrap();
+    assert_eq!(inspected.saved_link.unwrap().project_id, "proj-bb");
+
+    // unlink clears it — inspect goes back to no savedLink.
+    assert!(conn.project_links_unlink(root).await.unwrap().unlinked);
+    let inspected = conn.project_links_inspect_root(root).await.unwrap();
+    assert!(inspected.saved_link.is_none());
+    assert!(conn.project_links_list().await.unwrap().projects.is_empty());
+
     cleanup(conn, &dir).await;
 }
 

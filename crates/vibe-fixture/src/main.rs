@@ -509,6 +509,86 @@ async fn session_cwd(sessions: &Sessions, store: &std::path::Path, params: &Valu
     }
 }
 
+/// Object-valued JSON persisted under `store` — `{}` when absent.
+async fn read_json_map(store: &std::path::Path, name: &str) -> serde_json::Map<String, Value> {
+    tokio::fs::read_to_string(store.join(name))
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Atomic write of an object-valued map (unique tmp + rename — two
+/// fixture processes can't collide on the temp path).
+async fn write_json_map(
+    store: &std::path::Path,
+    name: &str,
+    map: &serde_json::Map<String, Value>,
+) -> bool {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = store.join(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    tokio::fs::write(&tmp, serde_json::to_string(map).unwrap_or_default())
+        .await
+        .is_ok()
+        && tokio::fs::rename(&tmp, store.join(name)).await.is_ok()
+}
+
+/// Cross-process lock for stored-map mutation: catalog + attached
+/// session processes share the store, so a read-modify-write has to be
+/// serialized file-side, not by an in-process mutex. Uses an OS-level
+/// `flock` on an anchor file: acquisition is atomic in the kernel and a
+/// crashed holder's lock dies with its fd — no stale lockfile to reap,
+/// so no reap-race against a fresh acquisition. The anchor file itself
+/// persists; it carries no state.
+struct MapLock {
+    _file: std::fs::File,
+}
+
+async fn map_lock(store: &std::path::Path, name: &str) -> Option<MapLock> {
+    use fs2::FileExt;
+    let path = store.join(format!("{name}.lock"));
+    for _ in 0..400 {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+        else {
+            return None;
+        };
+        if file.try_lock_exclusive().is_ok() {
+            return Some(MapLock { _file: file });
+        }
+        drop(file);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // 10s of contention is a deadlock — refuse the mutation rather than
+    // run the read-modify-write unserialized.
+    None
+}
+
+/// Lock + read + mutate + atomic write of a stored map; `None` when the
+/// lock can't be acquired or the persist step fails.
+async fn update_json_map<R>(
+    store: &std::path::Path,
+    name: &str,
+    f: impl FnOnce(&mut serde_json::Map<String, Value>) -> R,
+) -> Option<R> {
+    let _guard = map_lock(store, name).await?;
+    let mut map = read_json_map(store, name).await;
+    let out = f(&mut map);
+    if write_json_map(store, name, &map).await {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// Canned `VibeCodePickerView` — two cloud projects (+ one on loadMore),
 /// context bound to the session's cwd as the repo root.
 fn picker_view(root: &str) -> Value {
@@ -2506,6 +2586,158 @@ async fn main() {
                     respond_err("not_found", "session").await;
                 }
             }
+            // ── projectLinks/* — session-less local↔remote links,
+            // persisted in project_links.json keyed by root path ──
+            "projectLinks/list" => {
+                let links = read_json_map(&store, "project_links.json").await;
+                let mut grouped: serde_json::Map<String, Value> = serde_json::Map::new();
+                for (root, link) in &links {
+                    let pid = link["projectId"].as_str().unwrap_or_default().to_string();
+                    let entry = grouped
+                        .entry(pid.clone())
+                        .or_insert_with(|| json!({"projectId": pid, "localLinks": []}));
+                    entry["localLinks"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({
+                            "directoryPath": root,
+                            "hasCommits": link["hasCommits"].as_bool().unwrap_or(true),
+                        }));
+                }
+                respond(json!({"projects": Value::Array(grouped.values().cloned().collect())})).await;
+            }
+            "projectLinks/resolveRoot" | "projectLinks/inspectRoot" => {
+                let root = params["rootPath"].as_str().unwrap_or("/tmp").to_string();
+                let name = std::path::Path::new(&root)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| root.clone());
+                let inspected = json!({
+                    "directoryPath": root,
+                    "directoryName": name,
+                    "git": {
+                        "currentBranch": "main",
+                        "defaultBranch": "main",
+                        "githubRepoUrl": "https://github.com/vehicoule/vibe-desktop",
+                        "hasCommits": true,
+                    }
+                });
+                if method == "projectLinks/resolveRoot" {
+                    respond(json!({"eligible": true, "rejectReason": null, "root": inspected})).await;
+                } else {
+                    let links = read_json_map(&store, "project_links.json").await;
+                    let saved = links.get(&root).map(|l| json!({
+                        "projectId": l["projectId"], "projectName": l["projectName"],
+                    }));
+                    respond(json!({
+                        "eligible": true, "rejectReason": null, "root": inspected,
+                        "savedLink": saved, "staleLinkCleared": false,
+                        "staleLinkClearFailed": false,
+                    }))
+                    .await;
+                }
+            }
+            "projectLinks/picker/load" => {
+                let root = params["rootPath"].as_str().unwrap_or("/tmp").to_string();
+                let name = std::path::Path::new(&root)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| root.clone());
+                let links = read_json_map(&store, "project_links.json").await;
+                let saved = links.get(&root).map(|l| json!({
+                    "projectId": l["projectId"], "projectName": l["projectName"],
+                }));
+                respond(json!({
+                    "root": {
+                        "directoryPath": root,
+                        "directoryName": name,
+                        "git": {
+                            "currentBranch": "main",
+                            "defaultBranch": "main",
+                            "githubRepoUrl": "https://github.com/vehicoule/vibe-desktop",
+                            "hasCommits": true,
+                        }
+                    },
+                    "savedLink": saved,
+                    "staleLinkCleared": false,
+                    "candidates": {
+                        "items": [
+                            {"projectId": "proj-aa", "name": "vibe-demo", "recommended": true},
+                            {"projectId": "proj-bb", "name": "side-quest", "recommended": false},
+                        ],
+                        "nextCursor": "lc2",
+                    }
+                }))
+                .await;
+            }
+            "projectLinks/picker/loadMore" => {
+                respond(json!({
+                    "candidates": {
+                        "items": [
+                            {"projectId": "proj-cc", "name": "overflow", "recommended": false},
+                        ],
+                        "nextCursor": null,
+                    },
+                    "focusProjectId": "proj-cc",
+                }))
+                .await;
+            }
+            "projectLinks/link" | "projectLinks/create" | "projectLinks/save" => {
+                let root = params["rootPath"].as_str().unwrap_or("/tmp").to_string();
+                let (pid, pname) = if method == "projectLinks/create" {
+                    (
+                        format!("proj-{}", params["name"].as_str().unwrap_or("x")),
+                        params["name"].as_str().unwrap_or("unnamed").to_string(),
+                    )
+                } else {
+                    (
+                        params["projectId"].as_str().unwrap_or("proj-?").to_string(),
+                        params["projectName"].as_str().unwrap_or("unnamed").to_string(),
+                    )
+                };
+                // `save` rejects when the expected remote drifted from
+                // the fixture's single repoUrl.
+                if method == "projectLinks/save" {
+                    let expected = params["expectedGithubRepoUrl"].as_str();
+                    if expected != Some("https://github.com/vehicoule/vibe-desktop") {
+                        respond_err(
+                            "invalid_params",
+                            "fixture: repository remote changed before the link could be saved",
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+                let link = json!({
+                    "projectId": pid, "projectName": pname, "directoryPath": root,
+                    "hasCommits": true,
+                });
+                // Locked read-modify-write — two fixture processes share
+                // the store, so a plain read-then-write loses bindings.
+                if update_json_map(&store, "project_links.json", |links| {
+                    links.insert(root, link.clone());
+                })
+                .await
+                .is_some()
+                {
+                    respond(json!({"link": link})).await;
+                } else {
+                    respond_err("internal_error", "fixture: link persist failed").await;
+                }
+            }
+            "projectLinks/unlink" => {
+                let root = params["rootPath"].as_str().unwrap_or("/tmp").to_string();
+                if update_json_map(&store, "project_links.json", |links| {
+                    links.remove(&root);
+                })
+                .await
+                .is_some()
+                {
+                    respond(json!({"unlinked": true})).await;
+                } else {
+                    respond_err("internal_error", "fixture: unlink persist failed").await;
+                }
+            }
             "runtime/read" => {
                 respond(json!({
                     "runtime": {
@@ -2542,6 +2774,28 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::store_safe_id;
+
+    #[test]
+    fn map_lock_is_exclusive() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!("fx-lock-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let first = super::map_lock(&dir, "m").await.unwrap();
+            // Held lock → a second acquisition can't race in: the try
+            // loop exhausts its 400 tries … too slow for a unit test —
+            // prove contention directly at the fs2 layer instead.
+            use fs2::FileExt;
+            let file = std::fs::File::open(dir.join("m.lock")).unwrap();
+            assert!(file.try_lock_exclusive().is_err());
+            drop(first);
+            assert!(file.try_lock_exclusive().is_ok());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 
     #[test]
     fn store_safe_id_rejects_traversal() {
