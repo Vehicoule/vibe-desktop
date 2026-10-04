@@ -1233,10 +1233,12 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.projects_load_more(&sid, &picker_id).await;
             let _ = this.update(cx, |view, cx| {
-                view.picker_inflight.remove("load_more");
+                // A stale reply must not release a NEWER picker's
+                // inflight key — check currency first, then remove.
                 if view.session_id() != sid || view.picker_gen != gen {
                     return;
                 }
+                view.picker_inflight.remove("load_more");
                 match resp {
                     Ok(r) => view.picker = Some(r.view),
                     Err(e) => view.error = Some(format!("projects page failed: {e}")),
@@ -1263,14 +1265,15 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.projects_select(&sid, &picker_id, &project_id).await;
             let _ = this.update(cx, |view, cx| {
-                view.picker_inflight.remove("select");
                 // The reply must land on the picker it was issued
                 // against — a reopened picker has a new id, and an
-                // old picker's reply must not overwrite it.
+                // old picker's reply must not overwrite it (or release
+                // the new picker's inflight key).
                 if view.session_id() != sid || view.picker_id.as_deref() != Some(picker_id.as_str())
                 {
                     return;
                 }
+                view.picker_inflight.remove("select");
                 match resp {
                     Ok(r) => {
                         // The applied view supersedes any in-flight
@@ -1300,11 +1303,11 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.projects_unlink(&sid, &picker_id).await;
             let _ = this.update(cx, |view, cx| {
-                view.picker_inflight.remove("unlink");
                 if view.session_id() != sid || view.picker_id.as_deref() != Some(picker_id.as_str())
                 {
                     return;
                 }
+                view.picker_inflight.remove("unlink");
                 match resp {
                     Ok(r) => {
                         view.picker_gen += 1;
@@ -1360,11 +1363,11 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.projects_create(&sid, &picker_id, &name, &branch).await;
             let _ = this.update(cx, |view, cx| {
-                view.picker_inflight.remove("create");
                 if view.session_id() != sid || view.picker_id.as_deref() != Some(picker_id.as_str())
                 {
                     return;
                 }
+                view.picker_inflight.remove("create");
                 match resp {
                     Ok(r) => {
                         view.picker_gen += 1;
