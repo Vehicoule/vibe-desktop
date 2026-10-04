@@ -404,9 +404,12 @@ impl SessionView {
                             // this toggle's fresh state.
                             view.settings_gen += 1;
                             view.mcp_state = Some(mcp);
-                        } else {
-                            view.load_settings(cx);
                         }
+                        // A discarded batch may have been carrying other
+                        // sections (e.g. a pending-skill confirmation) —
+                        // start a replacement read so nothing stays
+                        // dropped; its mcp read is post-toggle anyway.
+                        view.load_settings(cx);
                     }
                     Err(e) => view.error = Some(format!("mcp toggle failed: {e}")),
                 }
