@@ -1405,6 +1405,10 @@ async fn main() {
                     if t["status"] == "in_progress" {
                         t["status"] = json!("interrupted");
                         t["stopReason"] = json!("forked");
+                        // Terminal records always carry an end time —
+                        // same startedAt=completedAt convention as
+                        // end_turn (a real elapsed isn't recoverable).
+                        t["completedAt"] = t["startedAt"].clone();
                     }
                 }
                 // Refresh catalog fields from the parent's disk record while
