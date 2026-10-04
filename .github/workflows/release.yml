@@ -35,7 +35,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libvulkan-dev libudev-dev
+          sudo apt-get install -y libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev libvulkan-dev libudev-dev
 
       - name: rust toolchain
         run: rustup update stable && rustup default stable
