@@ -1834,6 +1834,7 @@ pub enum ReviewTarget {
     Scope {
         owner: ReviewOwner,
     },
+    #[serde(rename = "scopeFile")]
     ScopeFile {
         owner: ReviewOwner,
         path: String,
@@ -1842,9 +1843,32 @@ pub enum ReviewTarget {
         path: String,
     },
     All {},
+    #[serde(rename = "lastTurns")]
     LastTurns {
         count: u32,
     },
+}
+
+#[cfg(test)]
+mod review_target_tests {
+    use super::{ReviewOwner, ReviewTarget};
+
+    /// The protocol discriminator is camelCase — a snake_case kind
+    /// would be rejected upstream (caught by review).
+    #[test]
+    fn target_kinds_serialize_camel_case() {
+        let owner = ReviewOwner::Agent { turn_id: 1 };
+        let cases = [
+            (ReviewTarget::ScopeFile { owner: owner.clone(), path: "a.rs".into() }, "scopeFile"),
+            (ReviewTarget::File { path: "a.rs".into() }, "file"),
+            (ReviewTarget::Scope { owner }, "scope"),
+            (ReviewTarget::All {}, "all"),
+            (ReviewTarget::LastTurns { count: 2 }, "lastTurns"),
+        ];
+        for (target, kind) in cases {
+            assert_eq!(serde_json::to_value(&target).unwrap()["kind"], kind);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
