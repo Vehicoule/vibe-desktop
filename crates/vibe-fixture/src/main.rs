@@ -1884,6 +1884,9 @@ async fn main() {
                     (json!({"path": "src/lib.rs", "status": "created", "regions": [
                         {"kind": "text", "versionIndex": 0, "ordinal": 1, "owner": {"kind": "agent", "turnId": 1}, "baselineStart": 0, "baselineLineCount": 0, "currentStart": 0, "currentLineCount": 2, "decision": "pending", "dependsOn": []}
                     ]}), "src/lib.rs"),
+                    // Unscoped + regionless: exercises the whole-file
+                    // preview path (review/baseline + disk current).
+                    (json!({"path": "notes.txt", "status": "modified", "regions": []}), "notes.txt"),
                 ]
                 .into_iter()
                 .filter(|(_, p)| pending(p))
@@ -1949,7 +1952,7 @@ async fn main() {
                     Some("file") | Some("scopeFile") => {
                         target["path"].as_str().map(|p| vec![p.to_string()]).unwrap_or_default()
                     }
-                    Some("all") => vec!["src/main.rs".to_string(), "src/lib.rs".to_string()]
+                    Some("all") => vec!["src/main.rs".to_string(), "src/lib.rs".to_string(), "notes.txt".to_string()]
                         .into_iter()
                         .filter(|p| !decisions.contains_key(p))
                         .collect(),
