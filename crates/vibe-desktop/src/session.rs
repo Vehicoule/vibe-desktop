@@ -1245,6 +1245,10 @@ impl SessionView {
                     view.picker_inflight.remove("load_more");
                 }
                 if view.picker_gen != gen {
+                    // The key release must redraw even on a stale reply —
+                    // the load-more control only shows when the key is
+                    // free.
+                    cx.notify();
                     return;
                 }
                 match resp {
