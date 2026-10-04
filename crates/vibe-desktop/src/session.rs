@@ -1354,10 +1354,12 @@ impl SessionView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let resp = conn.session_relocate(&sid, &cwd).await;
             let _ = this.update(cx, |view, cx| {
-                view.relocate_inflight = false;
+                // A reply that outlived a handoff must not clear a NEW
+                // relocate's busy flag — check ownership first.
                 if view.session_id() != sid {
                     return;
                 }
+                view.relocate_inflight = false;
                 match resp {
                     Ok(r) => {
                         // adopt() refuses a stale snapshot — resync then.
@@ -1371,6 +1373,7 @@ impl SessionView {
                         let sid2 = view.session_id().to_string();
                         view.close_picker(&sid2, cx);
                         view.worktrees.clear();
+                        view.repo_branch = None;
                         view.config_fields.clear();
                         view.trust_dismissed = false;
                         view.check_trust(cx);
@@ -1623,6 +1626,11 @@ impl SessionView {
         cx.spawn(async move |this, cx| {
             let result = conn.workspace_trust_status(cwd.as_deref()).await;
             let _ = this.update(cx, |view, cx| {
+                // The read raced a relocate — it describes the OLD cwd
+                // and must not overwrite the new workspace's status.
+                if view.projection.state.session.cwd != cwd {
+                    return;
+                }
                 if let Ok(status) = result {
                     // Clear a stale banner too — after a relocate the
                     // new cwd may be trusted where the old one wasn't.
