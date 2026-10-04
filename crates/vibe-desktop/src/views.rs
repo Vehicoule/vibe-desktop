@@ -1632,6 +1632,8 @@ impl SessionView {
                         div()
                             .id(SharedString::from(format!("loop-del-{id}")))
                             .cursor_pointer()
+                            .px_2()
+                            .py_1()
                             .child(text("✕", 10.5, c(theme::INK_FAINT)))
                             .on_click(cx.listener(
                                 move |v, _e, _w, cx| v.delete_loop(id.clone(), cx),

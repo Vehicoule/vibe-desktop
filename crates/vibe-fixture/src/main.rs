@@ -579,6 +579,7 @@ async fn map_lock(store: &std::path::Path, name: &str) -> Option<MapLock> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
         else {
             return None;
