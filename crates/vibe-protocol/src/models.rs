@@ -1705,3 +1705,175 @@ pub struct AgentSwitchParams {
     pub session_id: String,
     pub agent_name: String,
 }
+
+// --- M3b: review diff ----------------------------------------------------
+
+/// Who produced a review scope (`ReviewOwner` upstream — discriminated by
+/// `kind`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ReviewOwner {
+    Agent { turn_id: i64 },
+    Manual { index: i64 },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewRegionRef {
+    #[serde(default)]
+    pub version_index: u32,
+    #[serde(default)]
+    pub ordinal: u32,
+}
+
+/// `ReviewRegion` upstream — text regions carry line ranges; `decision` is
+/// "pending" | "keep" | "revert".
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ReviewRegion {
+    Text {
+        version_index: u32,
+        ordinal: u32,
+        owner: ReviewOwner,
+        #[serde(default)]
+        baseline_start: u32,
+        #[serde(default)]
+        baseline_line_count: u32,
+        #[serde(default)]
+        current_start: u32,
+        #[serde(default)]
+        current_line_count: u32,
+        decision: String,
+        #[serde(default)]
+        depends_on: Vec<ReviewRegionRef>,
+    },
+    Opaque {
+        version_index: u32,
+        ordinal: u32,
+        owner: ReviewOwner,
+        #[serde(default)]
+        reason: Option<String>,
+        decision: String,
+        #[serde(default)]
+        depends_on: Vec<ReviewRegionRef>,
+    },
+}
+
+impl ReviewRegion {
+    /// Who authored the region — both variants carry one.
+    pub fn owner(&self) -> Option<ReviewOwner> {
+        match self {
+            ReviewRegion::Text { owner, .. } | ReviewRegion::Opaque { owner, .. } => {
+                Some(owner.clone())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewFile {
+    pub path: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub regions: Vec<ReviewRegion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewScopeFile {
+    pub path: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub region_count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewScope {
+    pub owner: ReviewOwner,
+    #[serde(default)]
+    pub files: Vec<ReviewScopeFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewStateResponse {
+    #[serde(default)]
+    pub files: Vec<ReviewFile>,
+    #[serde(default)]
+    pub scopes: Vec<ReviewScope>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewTurnDiffResponse {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub baseline: String,
+    #[serde(default)]
+    pub current: String,
+}
+
+/// `review/approve|revert` target (`ReviewTarget` upstream, `kind`-tagged).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum ReviewTarget {
+    Region {
+        path: String,
+        version_index: u32,
+        ordinal: u32,
+    },
+    Regions {
+        path: String,
+        regions: Vec<ReviewTargetRegionRef>,
+    },
+    Scope {
+        owner: ReviewOwner,
+    },
+    #[serde(rename = "scopeFile")]
+    ScopeFile {
+        owner: ReviewOwner,
+        path: String,
+    },
+    File {
+        path: String,
+    },
+    All {},
+    #[serde(rename = "lastTurns")]
+    LastTurns {
+        count: u32,
+    },
+}
+
+#[cfg(test)]
+mod review_target_tests {
+    use super::{ReviewOwner, ReviewTarget};
+
+    /// The protocol discriminator is camelCase — a snake_case kind
+    /// would be rejected upstream (caught by review).
+    #[test]
+    fn target_kinds_serialize_camel_case() {
+        let owner = ReviewOwner::Agent { turn_id: 1 };
+        let cases = [
+            (ReviewTarget::ScopeFile { owner: owner.clone(), path: "a.rs".into() }, "scopeFile"),
+            (ReviewTarget::File { path: "a.rs".into() }, "file"),
+            (ReviewTarget::Scope { owner }, "scope"),
+            (ReviewTarget::All {}, "all"),
+            (ReviewTarget::LastTurns { count: 2 }, "lastTurns"),
+        ];
+        for (target, kind) in cases {
+            assert_eq!(serde_json::to_value(&target).unwrap()["kind"], kind);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewTargetRegionRef {
+    pub version_index: u32,
+    pub ordinal: u32,
+}

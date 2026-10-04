@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use gpui::{AsyncApp, Context, FocusHandle, Task, WeakEntity};
-use vibe_protocol::client::{ClientResult, Connection};
+use vibe_protocol::client::{ClientError, ClientResult, Connection};
 use vibe_protocol::models::*;
 use vibe_protocol::projection::{Projection, Reduce};
 
@@ -18,6 +18,39 @@ use crate::voice::{self, DictationEvent, NarrationEvent};
 pub enum CallbackAnswer {
     Approval(ApprovalDecision),
     UserInput(UserQuestionResult),
+}
+
+/// Read `path` under `cwd` on the tokio runtime — gpui's executor has no
+/// reactor, so `tokio::fs` called directly inside `cx.spawn` panics.
+/// A `deleted` review status treats NotFound as empty current; other
+/// statuses preserve the error (a genuinely missing modified file must
+/// not fake an empty diff).
+async fn read_current_file(cwd: &str, path: &str, deleted: bool) -> std::io::Result<String> {
+    let full = std::path::Path::new(cwd).join(path);
+    match crate::host::runtime()
+        .spawn(tokio::fs::read_to_string(full))
+        .await
+    {
+        Ok(Err(e)) if deleted && e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Ok(r) => r,
+        Err(join) => Err(std::io::Error::new(std::io::ErrorKind::Other, join)),
+    }
+}
+
+/// Does `state` attribute `path` to any owner — a scope listing it or a
+/// region naming an owner? The negative case is what a whole-file
+/// `ReviewTarget::File` decision is allowed to cover.
+fn review_state_claims(state: &ReviewStateResponse, path: &str) -> bool {
+    state
+        .scopes
+        .iter()
+        .any(|s| s.files.iter().any(|f| f.path == path))
+        || state
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.regions.iter().any(|r| r.owner().is_some()))
+            .unwrap_or(false)
 }
 
 /// State of the rewind confirmation sheet. `has_changes == None` means the
@@ -78,6 +111,30 @@ pub struct SessionView {
     /// Config paths with an in-flight `config/write` — repeat clicks
     /// during the write would send the same value again.
     cfg_inflight: HashSet<String>,
+    /// `review/state` snapshot for the review sheet.
+    pub review: Option<ReviewStateResponse>,
+    /// Review sheet open/closed.
+    pub review_open: bool,
+    /// Open per-file diff — (path, owner, response), `None` until the
+    /// read lands. `None` owner = whole-file preview (no scope claims
+    /// the file; baseline→current rendered file-wide).
+    pub review_diff: Option<(String, Option<ReviewOwner>, ReviewTurnDiffResponse)>,
+    /// Latest diff selection the reviewer asked for — independent of what
+    /// `review_diff` currently displays. State refreshes revalidate THIS,
+    /// so a refresh can neither reopen a superseded file nor lose a click
+    /// whose response is still in flight.
+    review_diff_sel: Option<(String, Option<ReviewOwner>)>,
+    /// Generation guarding `review/state` reads — a stale response must
+    /// not overwrite a newer refresh.
+    review_state_gen: u64,
+    /// Generation guarding `review/turnDiff` reads — a state refresh must
+    /// not cancel a diff open the user just clicked, so it gets its own
+    /// counter.
+    review_diff_gen: u64,
+    /// Files with an in-flight approve/revert — both controls stay
+    /// disabled until the mutation settles so opposing decisions
+    /// can't race on one file.
+    review_inflight: HashSet<String>,
     /// Dictation run in flight while the mic toggle is down.
     pub dictation: Option<DictationRun>,
     dictation_pump: Option<Task<()>>,
@@ -149,6 +206,13 @@ impl SessionView {
             settings_open: false,
             pending_agent: None,
             cfg_inflight: HashSet::new(),
+            review: None,
+            review_open: false,
+            review_diff: None,
+            review_diff_sel: None,
+            review_state_gen: 0,
+            review_diff_gen: 0,
+            review_inflight: HashSet::new(),
             dictation: None,
             dictation_pump: None,
             dictation_meter: None,
@@ -216,6 +280,397 @@ impl SessionView {
             self.load_settings(cx);
         }
         cx.notify();
+    }
+
+    /// Fetch `review/state` for the review sheet. Refreshes every call —
+    /// the state changes as turns complete, so a cached snapshot goes
+    /// stale; `review_state_gen` drops a response that loses the race.
+    /// An open diff is revalidated against the fresh state: still-present
+    /// files are re-read, vanished files close the diff.
+    fn load_review(&mut self, cx: &mut Context<Self>) {
+        self.review_state_gen += 1;
+        let gen = self.review_state_gen;
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let state = conn.review_state(&sid).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid || view.review_state_gen != gen {
+                    return;
+                }
+                match state {
+                    Ok(s) => {
+                        let sel = view.review_diff_sel.clone();
+                        let still_present = sel.as_ref().is_some_and(|(path, _)| {
+                            s.files.iter().any(|f| f.path == *path)
+                                || s.scopes.iter().any(|sc| sc.files.iter().any(|f| f.path == *path))
+                        });
+                        view.review = Some(s);
+                        if let Some((path, owner)) = sel {
+                            // Keep the reviewer's owner while it still
+                            // applies — a scoped sel that outlived its
+                            // owner re-resolves (possibly to file-wide).
+                            let owner = match owner {
+                                Some(o) if view.review_owner_valid(&path, &o) => Some(o),
+                                _ => view.review_owner_scoped(&path),
+                            };
+                            if still_present {
+                                view.open_review_diff(path, owner, cx)
+                            } else {
+                                view.review_diff = None;
+                                view.review_diff_sel = None;
+                                view.review_diff_gen += 1;
+                            }
+                        }
+                    }
+                    Err(e) => view.error = Some(format!("review read failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Review sheet toggle — refreshes the state on every open.
+    pub fn toggle_review(&mut self, cx: &mut Context<Self>) {
+        self.review_open = !self.review_open;
+        if self.review_open {
+            self.load_review(cx);
+        } else {
+            // Pending reads must not land after the sheet closed.
+            self.review_state_gen += 1;
+            self.review_diff_gen += 1;
+        }
+        cx.notify();
+    }
+
+    /// The owner that genuinely claims `path` — a scope listing it, else
+    /// the file's own region owner. `None` when no scope or region does:
+    /// never borrow an unrelated scope's owner, its `turnDiff` would
+    /// show an empty slice (and deciding it could revert unseen edits).
+    fn review_owner_scoped(&self, path: &str) -> Option<ReviewOwner> {
+        let state = self.review.as_ref()?;
+        if let Some(scope) = state
+            .scopes
+            .iter()
+            .find(|s| s.files.iter().any(|f| f.path == path))
+        {
+            return Some(scope.owner.clone());
+        }
+        state
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .and_then(|f| f.regions.iter().find_map(|r| r.owner()))
+    }
+
+    /// Open the baseline→current diff for a file. A scoped owner reads
+    /// `review/turnDiff` (that scope's slice — two owners on one file
+    /// show their own diffs). No owner → whole-file preview:
+    /// `review/baseline` + the file as it stands on disk, so a
+    /// `ReviewTarget::File` decision later covers exactly what was shown.
+    pub fn open_review_diff(
+        &mut self,
+        path: String,
+        owner: Option<ReviewOwner>,
+        cx: &mut Context<Self>,
+    ) {
+        let owner = owner.or_else(|| self.review_owner_scoped(&path));
+        // Drop the displayed diff at once — keep/revert must not stay
+        // actionable on the previous file while this read is in flight.
+        self.review_diff = None;
+        cx.notify();
+        self.review_diff_sel = Some((path.clone(), owner.clone()));
+        self.review_diff_gen += 1;
+        let gen = self.review_diff_gen;
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        let status = self
+            .review
+            .as_ref()
+            .and_then(|s| s.files.iter().find(|f| f.path == path))
+            .map(|f| f.status.clone())
+            .unwrap_or_else(|| "modified".into());
+        let cwd = self.projection.state.session.cwd.clone();
+        cx.spawn(async move |this, cx| {
+            let resp = match &owner {
+                Some(owner) => conn.review_turn_diff(&sid, &path, owner).await,
+                None => {
+                    let local_read = |e: String| ClientError::Protocol {
+                        code: "local_read".into(),
+                        message: format!("file-wide preview needs the file on disk: {e}"),
+                        data: serde_json::Value::Null,
+                    };
+                    match (conn.review_baseline(&sid, &path).await, &cwd) {
+                        (Ok(baseline), Some(cwd)) => {
+                            match read_current_file(cwd, &path, status == "deleted").await {
+                                Ok(current) => Ok(ReviewTurnDiffResponse {
+                                    status,
+                                    baseline,
+                                    current,
+                                }),
+                                Err(e) => Err(local_read(e.to_string())),
+                            }
+                        }
+                        (Ok(_), None) => Err(local_read("session has no local cwd".into())),
+                        (Err(e), _) => Err(e),
+                    }
+                }
+            };
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid || view.review_diff_gen != gen {
+                    return;
+                }
+                match resp {
+                    Ok(d) => view.review_diff = Some((path.clone(), owner, d)),
+                    Err(e) => view.error = Some(format!("diff read failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Does `owner` still author `path` in the current state? Used when
+    /// revalidating an open selection after a refresh — a scope naming
+    /// the pair counts, and so does an unscoped file whose regions name
+    /// the owner — or a regionless file no scope claims (the
+    /// derived-owner case).
+    fn review_owner_valid(&self, path: &str, owner: &ReviewOwner) -> bool {
+        let Some(state) = self.review.as_ref() else {
+            return false;
+        };
+        if state
+            .scopes
+            .iter()
+            .any(|s| s.owner == *owner && s.files.iter().any(|f| f.path == path))
+        {
+            return true;
+        }
+        let Some(file) = state.files.iter().find(|f| f.path == path) else {
+            return false;
+        };
+        if !file.regions.is_empty() {
+            // A regioned file's owner must still come from its regions —
+            // otherwise an obsolete owner survives a region handoff.
+            return file
+                .regions
+                .iter()
+                .any(|r| r.owner().as_ref() == Some(owner));
+        }
+        // Regionless + unscoped: no owner is authoritative — the sel
+        // re-resolves to a whole-file preview instead of keeping one.
+        false
+    }
+
+    /// Every listed file is openable — ownerless rows fall back to the
+    /// whole-file preview rather than rendering inert.
+    pub fn review_file_openable(&self, _path: &str) -> bool {
+        true
+    }
+
+    pub fn close_review_diff(&mut self, cx: &mut Context<Self>) {
+        self.review_diff = None;
+        self.review_diff_sel = None;
+        self.review_diff_gen += 1;
+        cx.notify();
+    }
+
+    /// Is this selection safe to keep/revert? `None` (whole-file preview)
+    /// only while the file is STILL ownerless — a scope that claimed it
+    /// since the preview rendered means a `File` target could revert
+    /// edits the preview never showed. `Some(o)` only when `o` genuinely
+    /// claims the file: a scope naming the pair or a regioned file whose
+    /// regions name it.
+    pub fn review_decidable(&self, path: &str, owner: Option<&ReviewOwner>) -> bool {
+        let Some(owner) = owner else {
+            return self
+                .review
+                .as_ref()
+                .map(|s| !review_state_claims(s, path))
+                .unwrap_or(false);
+        };
+        let Some(state) = self.review.as_ref() else {
+            return false;
+        };
+        if state
+            .scopes
+            .iter()
+            .any(|s| s.owner == *owner && s.files.iter().any(|f| f.path == path))
+        {
+            return true;
+        }
+        state
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| {
+                !f.regions.is_empty()
+                    && f.regions.iter().any(|r| r.owner().as_ref() == Some(owner))
+            })
+            .unwrap_or(false)
+    }
+
+    /// `review/approve` (`keep`) or `review/revert`, then refresh state.
+    /// The decision target always matches the displayed diff: `ScopeFile`
+    /// on a scope-claimed file (that scope's slice was shown), `File` on
+    /// the whole-file preview (every pending change was shown). A scoped
+    /// owner that lost its claim since the diff opened is refused — its
+    /// diff no longer matches what a decision would touch. One decision
+    /// per file — a second click while in flight is ignored.
+    pub fn review_apply_file(
+        &mut self,
+        path: String,
+        owner: Option<ReviewOwner>,
+        keep: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.review_decidable(&path, owner.as_ref()) {
+            self.error = Some(format!(
+                "review: {path}'s owner changed — re-read the diff before deciding"
+            ));
+            cx.notify();
+            return;
+        }
+        // A file-wide decision needs the displayed preview's contents to
+        // re-verify — sel without a rendered diff can't decide safely.
+        let displayed = if owner.is_none() {
+            match &self.review_diff {
+                Some((p, o, d)) if *p == path && o.is_none() => Some(d.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if owner.is_none() && displayed.is_none() {
+            self.error = Some(format!(
+                "review: open {path}'s file-wide preview before deciding"
+            ));
+            cx.notify();
+            return;
+        }
+        if !self.review_inflight.insert(path.clone()) {
+            return;
+        }
+        let conn = self.conn.clone();
+        let sid = self.session_id().to_string();
+        let cwd = self.projection.state.session.cwd.clone();
+        cx.spawn(async move |this, cx| {
+            let target = match &owner {
+                Some(owner) => Ok(ReviewTarget::ScopeFile {
+                    owner: owner.clone(),
+                    path: path.clone(),
+                }),
+                None => {
+                    // `File` covers every pending change — re-verify the
+                    // preview against FRESH reads: the file may have
+                    // gained a scope or new edits since it rendered.
+                    let Some(displayed) = &displayed else {
+                        unreachable!("file-wide decision requires the displayed diff")
+                    };
+                    let verified: Result<(), String> = async {
+                        let state = conn
+                            .review_state(&sid)
+                            .await
+                            .map_err(|e| format!("review state re-read failed: {e}"))?;
+                        if review_state_claims(&state, &path) {
+                            return Err(format!(
+                                "{path} gained an owning scope — decide its slices individually"
+                            ));
+                        }
+                        let fresh_base = conn
+                            .review_baseline(&sid, &path)
+                            .await
+                            .map_err(|e| format!("baseline re-read failed: {e}"))?;
+                        // Status drift means a different operation than
+                        // was previewed — an empty file deleted after
+                        // the render still compares equal on text.
+                        let fresh_status = state
+                            .files
+                            .iter()
+                            .find(|f| f.path == path)
+                            .map(|f| f.status.as_str());
+                        if fresh_status != Some(displayed.status.as_str()) {
+                            return Err(format!(
+                                "{path}'s status changed — re-open the diff"
+                            ));
+                        }
+                        let deleted = fresh_status == Some("deleted");
+                        let Some(cwd) = &cwd else {
+                            return Err(
+                                "no local cwd — can't verify the file".to_string()
+                            );
+                        };
+                        let fresh_cur = read_current_file(cwd, &path, deleted)
+                            .await
+                            .map_err(|e| format!("file re-read failed: {e}"))?;
+                        if fresh_base != displayed.baseline
+                            || fresh_cur != displayed.current
+                        {
+                            return Err(format!(
+                                "{path} changed since the preview — re-open the diff"
+                            ));
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    verified.map(|()| ReviewTarget::File {
+                        path: path.clone(),
+                    })
+                }
+            };
+            let target = match target {
+                Ok(t) => t,
+                Err(msg) => {
+                    let _ = this.update(cx, |view, cx| {
+                        if view.session_id() != sid {
+                            return;
+                        }
+                        view.review_inflight.remove(&path);
+                        view.error = Some(msg);
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let result = if keep {
+                conn.review_approve(&sid, &target).await
+            } else {
+                conn.review_revert(&sid, &target).await
+            };
+            let _ = this.update(cx, |view, cx| {
+                if view.session_id() != sid {
+                    return;
+                }
+                view.review_inflight.remove(&path);
+                match result {
+                    Ok(()) => {
+                        // Only close the diff that the decision applied
+                        // to — the exact (path, owner) selection; another
+                        // scope's or view's diff on the file stays open.
+                        let hit = view
+                            .review_diff_sel
+                            .as_ref()
+                            .is_some_and(|(p, o)| *p == path && *o == owner);
+                        if hit {
+                            view.review_diff = None;
+                            view.review_diff_sel = None;
+                            view.review_diff_gen += 1;
+                        }
+                        view.load_review(cx);
+                    }
+                    Err(e) => view.error = Some(format!("review write failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// `path` currently has an approve/revert in flight.
+    pub fn review_busy(&self, path: &str) -> bool {
+        self.review_inflight.contains(path)
     }
 
     /// `config/model/write` — pin a model (and keep its thinking effort).
@@ -483,6 +938,12 @@ impl SessionView {
                 if session_updated && self.pending_agent.is_some() {
                     self.refresh_agents(cx);
                 }
+                // New turn output / config changes re-shape the review —
+                // re-read while the sheet is open instead of serving a
+                // stale snapshot.
+                if (session_updated || narrate_turn.is_some()) && self.review_open {
+                    self.load_review(cx);
+                }
                 if narrate_turn.is_some() && self.narrator_on {
                     self.narrate_turn(narrate_turn, cx);
                 }
@@ -512,8 +973,17 @@ impl SessionView {
             self.pending_agent = None;
             self.config_fields.clear();
             self.cfg_inflight.clear();
+            self.review = None;
+            self.review_diff = None;
+            self.review_diff_sel = None;
+            self.review_state_gen += 1;
+            self.review_diff_gen += 1;
+            self.review_inflight.clear();
             if self.settings_open {
                 self.load_settings(cx);
+            }
+            if self.review_open {
+                self.load_review(cx);
             }
         }
     }
@@ -875,9 +1345,20 @@ impl SessionView {
                     Ok(resp) => {
                         if inplace {
                             // Same-session truncation: the returned state
-                            // supersedes the projection wholesale.
+                            // supersedes the projection wholesale — and
+                            // rewound-away edits must leave the review
+                            // sheet, which a same-session replace can't
+                            // reach through the notification refresh.
                             if !view.projection.adopt(resp.state) {
                                 view.resync(cx);
+                            }
+                            view.review = None;
+                            view.review_diff = None;
+                            view.review_diff_sel = None;
+                            view.review_state_gen += 1;
+                            view.review_diff_gen += 1;
+                            if view.review_open {
+                                view.load_review(cx);
                             }
                         } else if let Some(app) = view.app.as_ref().and_then(|w| w.upgrade()) {
                             let id = resp.state.session.id.clone();
