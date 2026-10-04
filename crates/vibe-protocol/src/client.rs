@@ -1049,6 +1049,185 @@ impl Connection {
         )
         .await
     }
+
+    /// `vibeCode/projects/open` — open the project picker (`purpose`
+    /// is `"configure"` or `"teleport"`).
+    pub async fn projects_open(
+        &self,
+        session_id: &str,
+        purpose: &str,
+    ) -> ClientResult<VibeCodeProjectsOpenResponse> {
+        self.request_typed(
+            "vibeCode/projects/open",
+            VibeCodeProjectsOpenParams {
+                session_id: session_id.to_string(),
+                purpose: purpose.to_string(),
+                prompt: None,
+            },
+        )
+        .await
+    }
+
+    /// `vibeCode/projects/loadMore` — next picker page.
+    pub async fn projects_load_more(
+        &self,
+        session_id: &str,
+        picker_id: &str,
+    ) -> ClientResult<VibeCodeProjectsLoadMoreResponse> {
+        self.request_typed(
+            "vibeCode/projects/loadMore",
+            VibeCodeProjectsLoadMoreParams {
+                session_id: session_id.to_string(),
+                picker_id: picker_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `vibeCode/projects/select` — pick a project for the session.
+    pub async fn projects_select(
+        &self,
+        session_id: &str,
+        picker_id: &str,
+        project_id: &str,
+    ) -> ClientResult<VibeCodeProjectSelectResponse> {
+        self.request_typed(
+            "vibeCode/projects/select",
+            VibeCodeProjectSelectParams {
+                session_id: session_id.to_string(),
+                picker_id: picker_id.to_string(),
+                project_id: project_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `vibeCode/projects/unlink` — drop the saved project link.
+    pub async fn projects_unlink(
+        &self,
+        session_id: &str,
+        picker_id: &str,
+    ) -> ClientResult<VibeCodeProjectUnlinkResponse> {
+        self.request_typed(
+            "vibeCode/projects/unlink",
+            VibeCodeProjectUnlinkParams {
+                session_id: session_id.to_string(),
+                picker_id: picker_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `vibeCode/projects/cancel` — close the picker server-side.
+    pub async fn projects_cancel(
+        &self,
+        session_id: &str,
+        picker_id: &str,
+    ) -> ClientResult<Value> {
+        self.request(
+            "vibeCode/projects/cancel",
+            VibeCodeProjectCancelParams {
+                session_id: session_id.to_string(),
+                picker_id: picker_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `vibeCode/projects/create` — new remote project in the picker.
+    pub async fn projects_create(
+        &self,
+        session_id: &str,
+        picker_id: &str,
+        name: &str,
+        default_branch: &str,
+    ) -> ClientResult<VibeCodeProjectCreateResponse> {
+        self.request_typed(
+            "vibeCode/projects/create",
+            VibeCodeProjectCreateParams {
+                session_id: session_id.to_string(),
+                picker_id: picker_id.to_string(),
+                name: name.to_string(),
+                default_branch: default_branch.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `vibeCode/teleport/start` — begin the teleport flow after the
+    /// picker resolved a project. Progress arrives as
+    /// `vibeCode/teleport/event` notifications.
+    pub async fn teleport_start(
+        &self,
+        session_id: &str,
+        picker_id: &str,
+        operation_id: &str,
+        project_id: &str,
+    ) -> ClientResult<TeleportStartResponse> {
+        self.request_typed(
+            "vibeCode/teleport/start",
+            TeleportStartParams {
+                session_id: session_id.to_string(),
+                picker_id: picker_id.to_string(),
+                operation_id: operation_id.to_string(),
+                prompt: None,
+                project_id: project_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `vibeCode/teleport/cancel` — abort an in-flight teleport.
+    pub async fn teleport_cancel(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> ClientResult<TeleportCancelResponse> {
+        self.request_typed(
+            "vibeCode/teleport/cancel",
+            TeleportCancelParams {
+                session_id: session_id.to_string(),
+                operation_id: operation_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// `vibeCode/teleport/push/respond` — approve/deny the push when the
+    /// teleport hits `push_required`.
+    pub async fn teleport_push_respond(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        approved: bool,
+    ) -> ClientResult<Value> {
+        self.request(
+            "vibeCode/teleport/push/respond",
+            TeleportPushRespondParams {
+                session_id: session_id.to_string(),
+                operation_id: operation_id.to_string(),
+                approved,
+            },
+        )
+        .await
+    }
+
+    /// `session/relocate` — move the session to a new cwd; returns the
+    /// full relocated state.
+    pub async fn session_relocate(
+        &self,
+        session_id: &str,
+        cwd: &str,
+    ) -> ClientResult<SessionRelocateResponse> {
+        self.request_typed(
+            "session/relocate",
+            SessionRelocateParams {
+                session_id: session_id.to_string(),
+                cwd: cwd.to_string(),
+            },
+        )
+        .await
+    }
 }
 
 impl Drop for Connection {

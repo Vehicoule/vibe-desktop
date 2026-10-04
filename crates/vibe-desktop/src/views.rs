@@ -635,6 +635,7 @@ impl Render for SessionView {
             .when_some(self.render_rewind_sheet(cx), |d, s| d.child(s))
             .when_some(self.render_settings_sheet(cx), |d, s| d.child(s))
             .when_some(self.render_review_sheet(cx), |d, s| d.child(s))
+            .when_some(self.render_cloud_sheet(cx), |d, s| d.child(s))
             .child(self.render_composer(cx))
             .child(self.render_status_bar(cx))
     }
@@ -1832,10 +1833,11 @@ impl SessionView {
         Some(sheet)
     }
 
-    /// Review sheet — changed files grouped by owner scope; clicking a file
-    /// swaps the list for its baseline→current diff with keep/revert.
-    fn render_review_sheet(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        if !self.review_open {
+
+    /// Cloud sheet — the `vibeCode/projects` picker (teleport target),
+    /// the live teleport run with its push gate, and `session/relocate`.
+    fn render_cloud_sheet(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.cloud_open {
             return None;
         }
         let mut sheet = div()
@@ -1854,190 +1856,272 @@ impl SessionView {
                 div()
                     .flex()
                     .items_center()
-                    .child(text("review", 12.5, c(theme::INK)))
+                    .child(text("cloud", 12.5, c(theme::INK)))
                     .child(div().flex_1())
                     .child(
-                        ghost_button("close-review", "close")
-                            .on_click(cx.listener(|v, _e, _w, cx| v.toggle_review(cx))),
+                        ghost_button("close-cloud", "close")
+                            .on_click(cx.listener(|v, _e, _w, cx| v.toggle_cloud(cx))),
                     ),
             );
 
-        // ── open diff view ──
-        if let Some((path, owner, diff)) = &self.review_diff {
-            let keep_path = path.clone();
-            let revert_path = path.clone();
-            let keep_owner = owner.clone();
-            let revert_owner = owner.clone();
-            let busy = self.review_busy(path);
-            // Whole-file previews (owner None) always decide — the
-            // preview showed every pending change; a scoped sel only
-            // decides while its owner still claims the file.
-            let decidable = self.review_decidable(path, owner.as_ref());
-            let mut lines = div().flex().flex_col();
-            for change in
-                similar::TextDiff::from_lines(&diff.baseline, &diff.current).iter_all_changes()
-            {
-                let (mark, color) = match change.tag() {
-                    similar::ChangeTag::Delete => ("−", theme::RED),
-                    similar::ChangeTag::Insert => ("+", theme::GREEN),
-                    similar::ChangeTag::Equal => (" ", theme::INK_FAINT),
+        // ── live teleport run ──
+        if let Some(t) = &self.teleport {
+            let mut block = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(text(format!("teleport — {}", t.phase), 11.5, c(theme::INK)));
+            if let Some((count, branch_new)) = &t.push {
+                let detail = if *branch_new {
+                    "branch has never been pushed".to_string()
+                } else {
+                    format!("{count} unpushed commit{}", if *count == 1 { "" } else { "s" })
                 };
-                // Strip only the line terminator — trailing whitespace
-                // inside the line is itself diff content.
-                let line = change.value().trim_end_matches(['\n', '\r']);
-                lines = lines.child(text(format!("{mark}{line}"), 10.5, c(color)));
-            }
-            return Some(
-                sheet
+                block = block
+                    .child(text(
+                        format!("{detail} — push to the remote first?"),
+                        10.5,
+                        c(theme::AMBER),
+                    ))
                     .child(
                         div()
                             .flex()
-                            .items_center()
                             .gap_2()
-                            .child(text(
-                                match owner {
-                                    Some(o) => format!(
-                                        "{path} · {} · {}",
-                                        diff.status,
-                                        review_owner_tag(o)
-                                    ),
-                                    None => format!("{path} · {} · whole file", diff.status),
-                                },
-                                11.5,
-                                c(theme::INK_SOFT),
-                            ))
-                            .child(div().flex_1())
-                            // One decision per file at a time — keep and
-                            // revert both collapse into an inflight label
-                            // so opposing decisions can't race.
-                            .when(busy, |el| {
-                                el.child(text("applying…", 11.0, c(theme::INK_FAINT)))
-                            })
-                            .when(!busy && !decidable, |el| {
-                                el.child(text(
-                                    "owner changed — re-open the diff",
-                                    11.0,
-                                    c(theme::INK_FAINT),
-                                ))
-                            })
-                            .when(!busy && decidable, |el| {
-                                el.child(
-                                    ghost_button("review-keep", "keep").on_click(cx.listener(
-                                        move |v, _e, _w, cx| {
-                                            v.review_apply_file(
-                                                keep_path.clone(),
-                                                keep_owner.clone(),
-                                                true,
-                                                cx,
-                                            )
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    ghost_button("review-revert", "revert").on_click(
-                                        cx.listener(move |v, _e, _w, cx| {
-                                            v.review_apply_file(
-                                                revert_path.clone(),
-                                                revert_owner.clone(),
-                                                false,
-                                                cx,
-                                            )
-                                        }),
-                                    ),
-                                )
-                            })
                             .child(
-                                ghost_button("review-diff-back", "back")
-                                    .on_click(cx.listener(|v, _e, _w, cx| {
-                                        v.close_review_diff(cx)
-                                    })),
+                                ghost_button("teleport-push", "push").on_click(
+                                    cx.listener(|v, _e, _w, cx| {
+                                        v.teleport_push_answer(true, cx)
+                                    }),
+                                ),
+                            )
+                            .child(
+                                ghost_button("teleport-nopush", "decline").on_click(
+                                    cx.listener(|v, _e, _w, cx| {
+                                        v.teleport_push_answer(false, cx)
+                                    }),
+                                ),
                             ),
-                    )
-                    .child(
-                        div()
-                            .id("review-diff-lines")
-                            .max_h(px(280.0))
-                            .overflow_y_scroll()
-                            .child(lines),
-                    ),
+                    );
+            }
+            if let Some(url) = &t.url {
+                block = block.child(text(
+                    format!("moved to cloud · {url}"),
+                    10.5,
+                    c(theme::GREEN),
+                ));
+            }
+            if let Some(err) = &t.error {
+                block = block.child(text(err.clone(), 10.5, c(theme::RED)));
+            }
+            let settled = t.settled();
+            block = block.child(
+                ghost_button("teleport-dismiss", if settled { "dismiss" } else { "cancel" })
+                    .on_click(cx.listener(|v, _e, _w, cx| v.teleport_cancel(cx))),
             );
+            sheet = sheet.child(block);
         }
 
-        // ── file list, grouped by scope ──
-        let Some(state) = &self.review else {
-            return Some(sheet.child(text("no review state", 11.0, c(theme::INK_FAINT))));
-        };
-        let mut listed = Vec::new();
-        for scope in &state.scopes {
-            let scope_label = review_owner_tag(&scope.owner);
-            sheet = sheet.child(text(scope_label, 10.5, c(theme::INK_FAINT)));
-            let mut rows = div().flex().flex_col().gap_1();
-            for f in &scope.files {
-                listed.push(f.path.clone());
-                let color = match f.status.as_str() {
-                    "created" => theme::GREEN,
-                    "deleted" => theme::RED,
-                    _ => theme::AMBER,
-                };
-                let path = f.path.clone();
-                // The row's own scope owner — two scopes touching one
-                // file each get their own diff.
-                let owner = scope.owner.clone();
-                rows = rows.child(
-                    div()
-                        .id(SharedString::from(format!("review-file-{}", f.path)))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |v, _e, _w, cx| {
-                            v.open_review_diff(path.clone(), Some(owner.clone()), cx)
-                        }))
-                        .child(text(
-                            format!("{}  {} ({} region{})", f.path, f.status, f.region_count,
-                                if f.region_count == 1 { "" } else { "s" }),
-                            11.5,
-                            c(color),
-                        )),
-                );
+        // ── projects picker ──
+        match &self.picker {
+            None => {
+                sheet = sheet.child(text("loading projects…", 11.0, c(theme::INK_FAINT)));
             }
-            sheet = sheet.child(rows);
-        }
-        // Files not claimed by any scope (regions carry no scope grouping).
-        let unscoped: Vec<&ReviewFile> = state
-            .files
-            .iter()
-            .filter(|f| !listed.iter().any(|p| p == &f.path))
-            .collect();
-        if !unscoped.is_empty() {
-            sheet = sheet.child(text("all files", 10.5, c(theme::INK_FAINT)));
-            let mut rows = div().flex().flex_col().gap_1();
-            for f in unscoped {
-                let color = match f.status.as_str() {
-                    "created" => theme::GREEN,
-                    "deleted" => theme::RED,
-                    _ => theme::AMBER,
-                };
-                let path = f.path.clone();
-                // Files with no resolvable owner render inert — better a
-                // label than a click that does nothing.
-                let openable = self.review_file_openable(&f.path);
-                let mut row = div()
-                    .id(SharedString::from(format!("review-file-{}", f.path)))
-                    .child(text(
-                        format!("{}  {} ({} region{})", f.path, f.status, f.regions.len(),
-                            if f.regions.len() == 1 { "" } else { "s" }),
-                        11.5,
-                        c(if openable { color } else { theme::INK_FAINT }),
-                    ));
-                if openable {
-                    row = row.cursor_pointer().on_click(cx.listener(
-                        move |v, _e, _w, cx| v.open_review_diff(path.clone(), None, cx),
+            Some(view) => {
+                sheet = sheet.child(text(
+                    format!(
+                        "{} · {}",
+                        view.git.repo,
+                        view.git.branch.clone().unwrap_or_default()
+                    ),
+                    10.5,
+                    c(theme::INK_FAINT),
+                ));
+                if let Some(link) = &view.context.saved_link {
+                    let mut row = div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(text(
+                            format!("linked: {}", link.project_name),
+                            10.5,
+                            c(theme::AMBER),
+                        ));
+                    if !self.picker_busy("unlink") {
+                        row = row.child(
+                            ghost_button("project-unlink", "unlink").on_click(
+                                cx.listener(|v, _e, _w, cx| v.picker_unlink(cx)),
+                            ),
+                        );
+                    }
+                    sheet = sheet.child(row);
+                }
+                if view.saved_project_link_cleared {
+                    sheet = sheet.child(text(
+                        "saved project link cleared",
+                        10.0,
+                        c(theme::INK_FAINT),
                     ));
                 }
-                rows = rows.child(row);
+                let mut rows = div().flex().flex_col().gap_1();
+                for p in &view.state.projects {
+                    let selected = self
+                        .picker_selected
+                        .as_ref()
+                        .is_some_and(|s| s.project_id == p.project_id);
+                    let label = if p.is_read_only {
+                        format!("{} · read-only", p.name)
+                    } else {
+                        p.name.clone()
+                    };
+                    let mut row = div()
+                        .id(SharedString::from(format!("proj-{}", p.project_id)))
+                        .child(text(
+                            label,
+                            11.5,
+                            c(if selected { theme::AMBER } else { theme::INK }),
+                        ));
+                    if !p.is_read_only {
+                        let pid = p.project_id.clone();
+                        row = row.cursor_pointer().on_click(cx.listener(
+                            move |v, _e, _w, cx| v.picker_select(pid.clone(), cx),
+                        ));
+                    }
+                    rows = rows.child(row);
+                }
+                if view.state.next_cursor.is_some() && !self.picker_busy("load_more") {
+                    rows = rows.child(
+                        div()
+                            .id("projects-more")
+                            .cursor_pointer()
+                            .child(text("load more…", 10.5, c(theme::INK_FAINT)))
+                            .on_click(cx.listener(|v, _e, _w, cx| v.picker_load_more(cx))),
+                    );
+                }
+                sheet = sheet.child(rows);
+
+                // new-project row
+                let input_text = if self.project_input.is_empty() {
+                    "new project name…".to_string()
+                } else {
+                    format!("{}▏", self.project_input)
+                };
+                let mut create_row = div()
+                    .id("project-create")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .track_focus(&self.project_focus)
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(c(theme::IVORY))
+                            .border_1()
+                            .border_color(c(theme::EDGE))
+                            .on_key_down(cx.listener(|v, e: &gpui::KeyDownEvent, _w, cx| {
+                                match e.keystroke.key.as_str() {
+                                    "backspace" => v.edit_project_input(None, cx),
+                                    "enter" => v.picker_create(cx),
+                                    _ => {
+                                        if let Some(ch) = &e.keystroke.key_char {
+                                            v.edit_project_input(Some(ch), cx);
+                                        }
+                                    }
+                                }
+                            }))
+                            .child(text(
+                                input_text,
+                                11.0,
+                                c(if self.project_input.is_empty() {
+                                    theme::INK_FAINT
+                                } else {
+                                    theme::INK
+                                }),
+                            )),
+                    )
+                    .on_click(cx.listener(|v, _e, window, _cx| {
+                        window.focus(&v.project_focus);
+                    }));
+                if !self.picker_busy("create") {
+                    create_row = create_row.child(
+                        ghost_button("project-create-btn", "create")
+                            .on_click(cx.listener(|v, _e, _w, cx| v.picker_create(cx))),
+                    );
+                }
+                sheet = sheet.child(create_row);
+
+                // teleport CTA — needs a selected project and no live run.
+                if let Some(p) = &self.picker_selected {
+                    if self.teleport.as_ref().is_none_or(|t| t.settled()) {
+                        let pid = p.project_id.clone();
+                        sheet = sheet.child(
+                            ghost_button("teleport-go", &format!("teleport → {}", p.name))
+                                .on_click(cx.listener(move |v, _e, _w, cx| {
+                                    v.teleport_begin(pid.clone(), cx)
+                                })),
+                        );
+                    }
+                }
             }
-            sheet = sheet.child(rows);
         }
+
+        // ── relocate ──
+        let reloc_text = if self.relocate_input.is_empty() {
+            "move session to cwd…".to_string()
+        } else {
+            format!("{}▏", self.relocate_input)
+        };
+        let mut reloc_row = div()
+            .id("relocate-input")
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .track_focus(&self.relocate_focus)
+                    .flex_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(c(theme::IVORY))
+                    .border_1()
+                    .border_color(c(theme::EDGE))
+                    .on_key_down(cx.listener(|v, e: &gpui::KeyDownEvent, _w, cx| {
+                        match e.keystroke.key.as_str() {
+                            "backspace" => v.edit_relocate_input(None, cx),
+                            "enter" => v.relocate(cx),
+                            _ => {
+                                if let Some(ch) = &e.keystroke.key_char {
+                                    v.edit_relocate_input(Some(ch), cx);
+                                }
+                            }
+                        }
+                    }))
+                    .child(text(
+                        reloc_text,
+                        11.0,
+                        c(if self.relocate_input.is_empty() {
+                            theme::INK_FAINT
+                        } else {
+                            theme::INK
+                        }),
+                    )),
+            )
+            .on_click(cx.listener(|v, _e, window, _cx| {
+                window.focus(&v.relocate_focus);
+            }));
+        if !self.relocate_busy() {
+            reloc_row = reloc_row.child(
+                ghost_button("relocate-btn", "relocate")
+                    .on_click(cx.listener(|v, _e, _w, cx| v.relocate(cx))),
+            );
+        }
+        sheet = sheet.child(reloc_row);
         Some(sheet)
     }
+
 
     fn render_composer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.active_turn_id().is_some();
@@ -2251,6 +2335,24 @@ impl SessionView {
                         },
                         10.5,
                         c(if self.review_open {
+                            theme::AMBER
+                        } else {
+                            theme::INK_FAINT
+                        }),
+                    )),
+            );
+        }
+        {
+            let cloud_busy = self.teleport.as_ref().is_some_and(|t| !t.settled());
+            bar = bar.child(
+                div()
+                    .id("cloud-toggle")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _e, _w, cx| v.toggle_cloud(cx)))
+                    .child(text(
+                        if cloud_busy { "cloud ●" } else { "cloud" }.to_string(),
+                        10.5,
+                        c(if self.cloud_open {
                             theme::AMBER
                         } else {
                             theme::INK_FAINT

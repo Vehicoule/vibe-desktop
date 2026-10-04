@@ -6,12 +6,13 @@
 //! arrives — exercising the full reducer path.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::oneshot;
 use vibe_protocol::json_patch::apply_patch;
 use vibe_protocol::models::JsonPatchOperation;
 
@@ -474,6 +475,12 @@ fn turn_with_queue(id: &str, session_id: &str, status: &str, queue_item_id: Valu
 
 type Sessions = Arc<tokio::sync::Mutex<BTreeMap<String, Arc<SessionData>>>>;
 type PendingCallbacks = Arc<tokio::sync::Mutex<BTreeMap<String, (Arc<SessionData>, u64, String)>>>;
+/// Active teleports: operation id → cancel flag + optional push gate.
+/// `push_required` parks the sequence until `teleport/push/respond`
+/// delivers approved/denied through the oneshot.
+type TeleportOps = Arc<
+    tokio::sync::Mutex<BTreeMap<String, (Arc<AtomicBool>, Option<oneshot::Sender<bool>>)>>,
+>;
 type Tx = tokio::sync::mpsc::Sender<String>;
 
 /// The canned demo catalog rows: `(id, cwd, archived)`. `session/read`
@@ -484,6 +491,53 @@ const CANNED_SESSIONS: &[(&str, &str, bool)] = &[
     ("saved-aaaa1111", "/tmp/project-a", false),
     ("saved-bbbb2222", "/tmp/project-b", true),
 ];
+
+/// Cwd for params carrying `sessionId` — picker context binds its
+/// repo root to wherever the session lives.
+async fn session_cwd(sessions: &Sessions, store: &std::path::Path, params: &Value) -> String {
+    let sid = params["sessionId"].as_str().unwrap_or("saved-aaaa1111");
+    match find_session(sessions, store, sid).await {
+        Some(d) => d
+            .inner
+            .lock()
+            .await
+            .session["cwd"]
+            .as_str()
+            .unwrap_or("/tmp")
+            .to_string(),
+        None => "/tmp".to_string(),
+    }
+}
+
+/// Canned `VibeCodePickerView` — two cloud projects (+ one on loadMore),
+/// context bound to the session's cwd as the repo root.
+fn picker_view(root: &str) -> Value {
+    let repo_url = "https://github.com/vehicoule/vibe-desktop";
+    json!({
+        "context": {
+            "repoRoot": root, "repoUrl": repo_url,
+            "repoName": "vibe-desktop", "savedLink": null,
+        },
+        "state": {
+            "projects": [
+                {"projectId": "proj-aa", "name": "vibe-demo",
+                 "repositories": [{"repoUrl": repo_url, "defaultBranch": "main"}],
+                 "isReadOnly": false},
+                {"projectId": "proj-push", "name": "push-gated",
+                 "repositories": [{"repoUrl": "https://github.com/vehicoule/push-gated"}],
+                 "isReadOnly": false},
+            ],
+            "nextCursor": "c2", "repoUrl": repo_url,
+        },
+        "git": {
+            "remoteName": "origin", "remoteUrl": repo_url,
+            "repo": "vehicoule/vibe-desktop",
+            "branch": "main", "defaultBranch": "main",
+        },
+        "savedProjectLinkCleared": false,
+        "projectRepoRemoteChanged": false,
+    })
+}
 
 /// Session lookup: in-memory first, then the shared store — a session may
 /// live in a different fixture process (forks, earlier runs) — then a
@@ -1005,6 +1059,7 @@ async fn main() {
         BTreeMap::<String, Arc<SessionData>>::new(),
     ));
     let pending_callbacks: PendingCallbacks = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+    let teleport_ops: TeleportOps = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
     let store = store_dir();
     let _ = tokio::fs::create_dir_all(&store).await;
 
@@ -2278,6 +2333,177 @@ async fn main() {
                     respond(json!({"loop": entry})).await;
                 } else {
                     respond_err("internal_error", "fixture: loop persist failed").await;
+                }
+            }
+            "vibeCode/projects/open" => {
+                let view = picker_view(&session_cwd(&sessions, &store, &params).await);
+                respond(json!({"pickerId": "picker-1", "view": view,
+                               "resolvedProjectId": null}))
+                    .await;
+            }
+            "vibeCode/projects/loadMore" => {
+                // The picker keeps paging state — the loaded page stays
+                // visible in subsequent view snapshots.
+                let mut view = picker_view(&session_cwd(&sessions, &store, &params).await);
+                view["state"]["projects"].as_array_mut().unwrap().push(json!({
+                    "projectId": "proj-bb", "name": "api-worker",
+                    "repositories": [{"repoUrl": "https://github.com/vehicoule/api-worker"}],
+                    "isReadOnly": false,
+                }));
+                view["state"]["nextCursor"] = Value::Null;
+                respond(json!({"view": view, "focusOptionId": null})).await;
+            }
+            "vibeCode/projects/select" => {
+                // Selection resolves against every project the picker
+                // surfaced — including loadMore'd pages.
+                let mut view = picker_view(&session_cwd(&sessions, &store, &params).await);
+                view["state"]["projects"].as_array_mut().unwrap().push(json!({
+                    "projectId": "proj-bb", "name": "api-worker",
+                    "repositories": [{"repoUrl": "https://github.com/vehicoule/api-worker"}],
+                    "isReadOnly": false,
+                }));
+                view["state"]["nextCursor"] = Value::Null;
+                let pid = params["projectId"].as_str().unwrap_or_default();
+                let project = view["state"]["projects"].as_array().into_iter().flatten()
+                    .find(|p| p["projectId"].as_str() == Some(pid)).cloned();
+                match project {
+                    Some(p) => respond(json!({"view": view, "project": p})).await,
+                    None => respond_err("invalid_params", "fixture: unknown project").await,
+                }
+            }
+            "vibeCode/projects/create" => {
+                let mut view = picker_view(&session_cwd(&sessions, &store, &params).await);
+                let project = json!({
+                    "projectId": "proj-new", "name": params["name"],
+                    "repositories": [{"repoUrl": view["git"]["remoteUrl"].clone(),
+                                      "defaultBranch": params["defaultBranch"]}],
+                    "isReadOnly": false,
+                });
+                view["state"]["projects"].as_array_mut().unwrap().push(project.clone());
+                respond(json!({"view": view, "project": project})).await;
+            }
+            "vibeCode/projects/unlink" => {
+                let mut view = picker_view(&session_cwd(&sessions, &store, &params).await);
+                view["context"]["savedLink"] = Value::Null;
+                view["savedProjectLinkCleared"] = json!(true);
+                respond(json!({"view": view})).await;
+            }
+            "vibeCode/projects/cancel" => respond(json!({})).await,
+            "vibeCode/projects/recover" => {
+                let view = picker_view(&session_cwd(&sessions, &store, &params).await);
+                respond(json!({"recovered": false, "view": view})).await;
+            }
+            "vibeCode/teleport/start" => {
+                let op = params["operationId"].as_str().unwrap_or("op-1").to_string();
+                let needs_push = params["projectId"].as_str() == Some("proj-push");
+                let cancel = Arc::new(AtomicBool::new(false));
+                teleport_ops.lock().await.insert(op.clone(), (cancel.clone(), None));
+                let (tx2, ops2) = (tx.clone(), teleport_ops.clone());
+                respond(json!({"operationId": op.clone()})).await;
+                tokio::spawn(async move {
+                    let emit = |ev: Value| {
+                        let tx = tx2.clone();
+                        async move {
+                            let _ = tx
+                                .send(json!({"jsonrpc": "2.0",
+                                    "method": "vibeCode/teleport/event",
+                                    "params": {"event": ev}})
+                                .to_string())
+                                .await;
+                        }
+                    };
+                    emit(json!({"kind": "summarizing_context", "operationId": op})).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    if cancel.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    emit(json!({"kind": "checking_git", "operationId": op})).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    if cancel.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if needs_push {
+                        let (gate_tx, gate_rx) = oneshot::channel::<bool>();
+                        if let Some(entry) = ops2.lock().await.get_mut(&op) {
+                            entry.1 = Some(gate_tx);
+                        }
+                        emit(json!({"kind": "push_required", "operationId": op,
+                                    "unpushedCount": 2, "branchNotPushed": false})).await;
+                        let approved = gate_rx.await.unwrap_or(false);
+                        if let Some(entry) = ops2.lock().await.get_mut(&op) {
+                            entry.1 = None;
+                        }
+                        if !approved {
+                            emit(json!({"kind": "failed", "operationId": op, "error": {
+                                "code": "push_declined",
+                                "message": "fixture: push declined"}})).await;
+                            ops2.lock().await.remove(&op);
+                            return;
+                        }
+                        emit(json!({"kind": "pushing", "operationId": op})).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    }
+                    if cancel.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    emit(json!({"kind": "starting_workflow", "operationId": op})).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    if cancel.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    emit(json!({"kind": "complete", "operationId": op,
+                                "url": format!("https://vibe.mistral.ai/s/{op}")})).await;
+                    ops2.lock().await.remove(&op);
+                });
+            }
+            "vibeCode/teleport/push/respond" => {
+                let op = params["operationId"].as_str().unwrap_or_default();
+                let approved = params["approved"].as_bool().unwrap_or(false);
+                if let Some(entry) = teleport_ops.lock().await.get_mut(op) {
+                    if let Some(gate) = entry.1.take() {
+                        let _ = gate.send(approved);
+                    }
+                }
+                respond(json!({})).await;
+            }
+            "vibeCode/teleport/cancel" => {
+                let op = params["operationId"].as_str().unwrap_or_default();
+                let mut ops = teleport_ops.lock().await;
+                match ops.remove(op) {
+                    Some((cancel, gate)) => {
+                        cancel.store(true, Ordering::SeqCst);
+                        if let Some(g) = gate {
+                            let _ = g.send(false);
+                        }
+                        let _ = tx
+                            .send(json!({"jsonrpc": "2.0",
+                                "method": "vibeCode/teleport/event",
+                                "params": {"event": {"kind": "failed",
+                                    "operationId": op,
+                                    "error": {"code": "cancelled",
+                                              "message": "fixture: teleport cancelled"}}}})
+                            .to_string())
+                            .await;
+                        respond(json!({"cancelled": true})).await;
+                    }
+                    None => respond(json!({"cancelled": false})).await,
+                }
+            }
+            "session/relocate" => {
+                let sid = params["sessionId"].as_str().unwrap_or("saved-aaaa1111");
+                let cwd = params["cwd"].as_str().unwrap_or("/tmp");
+                if let Some(data) = find_session(&sessions, &store, sid).await {
+                    data.set_session_field("cwd", json!(cwd)).await;
+                    emit_updated(
+                        &tx,
+                        &data,
+                        sid,
+                        json!([{"op": "replace", "path": "/session/cwd", "value": cwd}]),
+                    )
+                    .await;
+                    respond(json!({"state": data.state_windowed(None).await})).await;
+                } else {
+                    respond_err("not_found", "session").await;
                 }
             }
             "runtime/read" => {

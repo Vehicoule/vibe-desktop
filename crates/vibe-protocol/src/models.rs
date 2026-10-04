@@ -2139,3 +2139,270 @@ pub struct LoopsDeleteResponse {
     #[serde(rename = "loop")]
     pub scheduled_loop: ScheduledLoop,
 }
+
+// ---------------------------------------------------------------------------
+// M4 — Vibe Code cloud: project picker + teleport (models.py, protocol.py)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeRepository {
+    pub repo_url: String,
+    #[serde(default)]
+    pub default_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProject {
+    pub project_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub repositories: Vec<VibeCodeRepository>,
+    #[serde(default)]
+    pub is_read_only: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProjectLink {
+    pub repo_root: String,
+    pub repo_url: String,
+    pub project_id: String,
+    pub project_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodePickerContext {
+    pub repo_root: String,
+    pub repo_url: String,
+    pub repo_name: String,
+    #[serde(default)]
+    pub saved_link: Option<RemoteProjectLink>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeGitInfo {
+    pub remote_name: String,
+    pub remote_url: String,
+    pub repo: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub default_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodePickerState {
+    #[serde(default)]
+    pub projects: Vec<VibeCodeProject>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub repo_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodePickerView {
+    pub context: VibeCodePickerContext,
+    pub state: VibeCodePickerState,
+    pub git: VibeCodeGitInfo,
+    #[serde(default)]
+    pub saved_project_link_cleared: bool,
+    #[serde(default)]
+    pub project_repo_remote_changed: bool,
+}
+
+/// `vibeCode/projects/open` — `purpose` is "configure" or "teleport".
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectsOpenParams {
+    pub session_id: String,
+    pub purpose: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectsOpenResponse {
+    pub picker_id: String,
+    pub view: VibeCodePickerView,
+    #[serde(default)]
+    pub resolved_project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectsLoadMoreParams {
+    pub session_id: String,
+    pub picker_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectsLoadMoreResponse {
+    pub view: VibeCodePickerView,
+    #[serde(default)]
+    pub focus_option_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectSelectParams {
+    pub session_id: String,
+    pub picker_id: String,
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectSelectResponse {
+    pub view: VibeCodePickerView,
+    pub project: VibeCodeProject,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectUnlinkParams {
+    pub session_id: String,
+    pub picker_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectUnlinkResponse {
+    pub view: VibeCodePickerView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectCancelParams {
+    pub session_id: String,
+    pub picker_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectCreateParams {
+    pub session_id: String,
+    pub picker_id: String,
+    pub name: String,
+    pub default_branch: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCodeProjectCreateResponse {
+    pub view: VibeCodePickerView,
+    pub project: VibeCodeProject,
+}
+
+/// `vibeCode/teleport/event` — kind-tagged lifecycle events. Variant
+/// names map to snake_case kinds; fields stay camelCase on the wire.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum TeleportEvent {
+    SummarizingContext {
+        operation_id: String,
+    },
+    CheckingGit {
+        operation_id: String,
+    },
+    PushRequired {
+        operation_id: String,
+        #[serde(default)]
+        unpushed_count: u64,
+        #[serde(default)]
+        branch_not_pushed: bool,
+    },
+    Pushing {
+        operation_id: String,
+    },
+    StartingWorkflow {
+        operation_id: String,
+    },
+    Complete {
+        operation_id: String,
+        url: String,
+    },
+    Failed {
+        operation_id: String,
+        error: PublicError,
+    },
+}
+
+impl TeleportEvent {
+    pub fn operation_id(&self) -> &str {
+        match self {
+            Self::SummarizingContext { operation_id }
+            | Self::CheckingGit { operation_id }
+            | Self::PushRequired { operation_id, .. }
+            | Self::Pushing { operation_id }
+            | Self::StartingWorkflow { operation_id }
+            | Self::Complete { operation_id, .. }
+            | Self::Failed { operation_id, .. } => operation_id,
+        }
+    }
+}
+
+/// Notification params: `{event: TeleportEvent}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TeleportEventParams {
+    pub event: TeleportEvent,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeleportStartParams {
+    pub session_id: String,
+    pub picker_id: String,
+    pub operation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeleportStartResponse {
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeleportCancelParams {
+    pub session_id: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TeleportCancelResponse {
+    #[serde(default)]
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeleportPushRespondParams {
+    pub session_id: String,
+    pub operation_id: String,
+    pub approved: bool,
+}
+
+/// `session/relocate` — move a session to a new cwd; returns full state.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRelocateParams {
+    pub session_id: String,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionRelocateResponse {
+    pub state: PublicSessionState,
+}
