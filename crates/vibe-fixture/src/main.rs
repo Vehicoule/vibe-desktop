@@ -554,13 +554,44 @@ async fn map_lock(store: &std::path::Path, name: &str) -> Option<MapLock> {
             .open(&path)
             .is_ok()
         {
+            // Stamp the owner pid — a crashed holder's lockfile is
+            // reaped instead of deadlocking every later mutation.
+            let _ = std::fs::write(&path, std::process::id().to_string());
             return Some(MapLock { path });
+        }
+        if lock_owner_dead(&path) {
+            let _ = std::fs::remove_file(&path);
+            continue;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     // 10s of contention is a deadlock or a stale lock — refuse the
     // mutation rather than run the read-modify-write unserialized.
     None
+}
+
+/// Is the process that stamped this lockfile gone? `/proc` answers on
+/// Linux; a 30s mtime is the universal backstop (no /proc, unparseable
+/// stamp, or a recycled pid) — real holds are microseconds, so a stale
+/// lock is unambiguous.
+fn lock_owner_dead(path: &std::path::Path) -> bool {
+    let pid_dead = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(|pid| {
+            std::path::Path::new("/proc").is_dir()
+                && !std::path::Path::new(&format!("/proc/{pid}")).exists()
+        })
+        .unwrap_or(false);
+    if pid_dead {
+        return true;
+    }
+    // No /proc (or unparseable stamp): age out — a lock older than 30s
+    // can't be a live hold.
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map(|e| e.as_secs() > 30).unwrap_or(false))
+        .unwrap_or(false)
 }
 
 impl Drop for MapLock {
@@ -2701,7 +2732,25 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::store_safe_id;
+    use super::{lock_owner_dead, store_safe_id};
+
+    #[test]
+    fn lock_owner_dead_reaps_stale_lock() {
+        let dir = std::env::temp_dir().join(format!("fx-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("m.lock");
+
+        // Our own pid → alive.
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+        assert!(!lock_owner_dead(&lock));
+
+        // A pid that can't be running (u32::MAX is never a real pid).
+        if std::path::Path::new("/proc").is_dir() {
+            std::fs::write(&lock, u32::MAX.to_string()).unwrap();
+            assert!(lock_owner_dead(&lock));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn store_safe_id_rejects_traversal() {
