@@ -884,6 +884,13 @@ async fn cloud_picker_teleport_and_relocate() {
     assert_eq!(more.view.state.projects.len(), 3);
     assert!(more.view.state.next_cursor.is_none());
 
+    // A loadMore'd project is selectable too.
+    let sel_paged = conn
+        .projects_select(&sid, &opened.picker_id, "proj-bb")
+        .await
+        .unwrap();
+    assert_eq!(sel_paged.project.project_id, "proj-bb");
+
     // Select binds the push-gated project.
     let sel = conn
         .projects_select(&sid, &opened.picker_id, "proj-push")
