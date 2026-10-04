@@ -46,7 +46,7 @@ Primary path:
 2. Update check: query PyPI for latest `mistral-vibe`, compare to installed, offer/perform upgrade **without an app release**. Updates are per-machine state (`~/.local/share/vibe-desktop/vibe/`).
 3. Fallback: if the user already has a working `vibe-app-server` on PATH/newer, allow "use system install" with a version check against `runtime/read`.
 
-Supply-chain (per mistral-vibe's own rules): downloads verified by hash keyed to version+arch; GitHub release assets expose `digest` in the API where used; hard-fail on unregistered versions. Never curl|sh.
+Supply-chain (per mistral-vibe's own rules): installs resolve a named release — `uv tool install mistral-vibe==<version>` where `<version>` is PyPI's current latest at install time (or the value the update flow resolved), never a floating `latest`. uv verifies every downloaded artifact's sha256 against the PyPI index metadata natively; a version the index doesn't serve fails the resolve, so unregistered pins hard-fail. GitHub release assets expose `digest` in the API where used. Never curl|sh.
 
 ## Feature parity matrix
 
