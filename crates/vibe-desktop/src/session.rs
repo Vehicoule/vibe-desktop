@@ -105,9 +105,13 @@ pub struct SessionView {
     /// Open per-file diff — (path, owner, response). `None` until
     /// `review/turnDiff` lands.
     pub review_diff: Option<(String, ReviewOwner, ReviewTurnDiffResponse)>,
-    /// Generation counter — a stale `review/state` or `review/turnDiff`
-    /// response must not overwrite a newer read or selection.
-    review_gen: u64,
+    /// Generation guarding `review/state` reads — a stale response must
+    /// not overwrite a newer refresh.
+    review_state_gen: u64,
+    /// Generation guarding `review/turnDiff` reads — a state refresh must
+    /// not cancel a diff open the user just clicked, so it gets its own
+    /// counter.
+    review_diff_gen: u64,
     /// Files with an in-flight approve/revert — both controls stay
     /// disabled until the mutation settles so opposing decisions
     /// can't race on one file.
@@ -194,7 +198,8 @@ impl SessionView {
             review: None,
             review_open: false,
             review_diff: None,
-            review_gen: 0,
+            review_state_gen: 0,
+            review_diff_gen: 0,
             review_inflight: HashSet::new(),
             dictation: None,
             dictation_pump: None,
@@ -436,20 +441,39 @@ impl SessionView {
 
     /// Fetch `review/state` for the review sheet. Refreshes every call —
     /// the state changes as turns complete, so a cached snapshot goes
-    /// stale; `review_gen` drops a response that loses the race.
+    /// stale; `review_state_gen` drops a response that loses the race.
+    /// An open diff is revalidated against the fresh state: still-present
+    /// files are re-read, vanished files close the diff.
     fn load_review(&mut self, cx: &mut Context<Self>) {
-        self.review_gen += 1;
-        let gen = self.review_gen;
+        self.review_state_gen += 1;
+        let gen = self.review_state_gen;
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let state = conn.review_state(&sid).await;
             let _ = this.update(cx, |view, cx| {
-                if view.session_id() != sid || view.review_gen != gen {
+                if view.session_id() != sid || view.review_state_gen != gen {
                     return;
                 }
                 match state {
-                    Ok(s) => view.review = Some(s),
+                    Ok(s) => {
+                        let open = view.review_diff.as_ref().map(|(p, o, _)| (p.clone(), o.clone()));
+                        let still_present = open.as_ref().is_some_and(|(path, _)| {
+                            s.files.iter().any(|f| f.path == *path)
+                                || s.scopes.iter().any(|sc| sc.files.iter().any(|f| f.path == *path))
+                        });
+                        view.review = Some(s);
+                        if let Some((path, _)) = open {
+                            if still_present && view.review_owner_for(&path).is_some() {
+                                // Re-read under a freshly resolved owner —
+                                // the file may have moved scopes.
+                                view.open_review_diff(path, None, cx);
+                            } else {
+                                view.review_diff = None;
+                                view.review_diff_gen += 1;
+                            }
+                        }
+                    }
                     Err(e) => view.error = Some(format!("review read failed: {e}")),
                 }
                 cx.notify();
@@ -465,7 +489,8 @@ impl SessionView {
             self.load_review(cx);
         } else {
             // Pending reads must not land after the sheet closed.
-            self.review_gen += 1;
+            self.review_state_gen += 1;
+            self.review_diff_gen += 1;
         }
         cx.notify();
     }
@@ -505,14 +530,14 @@ impl SessionView {
         let Some(owner) = owner.or_else(|| self.review_owner_for(&path)) else {
             return;
         };
-        self.review_gen += 1;
-        let gen = self.review_gen;
+        self.review_diff_gen += 1;
+        let gen = self.review_diff_gen;
         let conn = self.conn.clone();
         let sid = self.session_id().to_string();
         cx.spawn(async move |this, cx| {
             let resp = conn.review_turn_diff(&sid, &path, &owner).await;
             let _ = this.update(cx, |view, cx| {
-                if view.session_id() != sid || view.review_gen != gen {
+                if view.session_id() != sid || view.review_diff_gen != gen {
                     return;
                 }
                 match resp {
@@ -533,7 +558,7 @@ impl SessionView {
 
     pub fn close_review_diff(&mut self, cx: &mut Context<Self>) {
         self.review_diff = None;
-        self.review_gen += 1;
+        self.review_diff_gen += 1;
         cx.notify();
     }
 
@@ -561,7 +586,7 @@ impl SessionView {
                 match result {
                     Ok(()) => {
                         view.review_diff = None;
-                        view.review_gen += 1;
+                        view.review_diff_gen += 1;
                         view.load_review(cx);
                     }
                     Err(e) => view.error = Some(format!("review write failed: {e}")),
@@ -887,7 +912,8 @@ impl SessionView {
             self.cfg_inflight.clear();
             self.review = None;
             self.review_diff = None;
-            self.review_gen += 1;
+            self.review_state_gen += 1;
+            self.review_diff_gen += 1;
             self.review_inflight.clear();
             self.ext_skills.clear();
             self.pending_skills.clear();
