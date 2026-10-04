@@ -1226,6 +1226,7 @@ impl SessionView {
         if let Some(app) = self.app.as_ref().and_then(|w| w.upgrade()) {
             let root = root.to_string();
             app.update(cx, |app, cx| {
+                app.linked_gen += 1;
                 if linked {
                     app.linked_dirs.insert(root);
                 } else {

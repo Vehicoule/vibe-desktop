@@ -538,10 +538,14 @@ async fn write_json_map(
 /// Cross-process lock for stored-map mutation: catalog + attached
 /// session processes share the store, so a read-modify-write has to be
 /// serialized file-side, not by an in-process mutex. Uses an
-/// exclusive-create lockfile (released on drop).
-struct MapLock(std::path::PathBuf);
+/// exclusive-create lockfile; the guard only unlinks a lock it actually
+/// acquired — an acquisition failure (`None`) must never delete another
+/// process's lock.
+struct MapLock {
+    path: std::path::PathBuf,
+}
 
-async fn map_lock(store: &std::path::Path, name: &str) -> MapLock {
+async fn map_lock(store: &std::path::Path, name: &str) -> Option<MapLock> {
     let path = store.join(format!("{name}.lock"));
     for _ in 0..400 {
         if std::fs::OpenOptions::new()
@@ -550,29 +554,29 @@ async fn map_lock(store: &std::path::Path, name: &str) -> MapLock {
             .open(&path)
             .is_ok()
         {
-            return MapLock(path);
+            return Some(MapLock { path });
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    // 10s of contention is a deadlock or a stale lock — proceed rather
-    // than wedge the fixture (the unique-tmp write stays atomic).
-    MapLock(path)
+    // 10s of contention is a deadlock or a stale lock — refuse the
+    // mutation rather than run the read-modify-write unserialized.
+    None
 }
 
 impl Drop for MapLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
 /// Lock + read + mutate + atomic write of a stored map; `None` when the
-/// persist step fails.
+/// lock can't be acquired or the persist step fails.
 async fn update_json_map<R>(
     store: &std::path::Path,
     name: &str,
     f: impl FnOnce(&mut serde_json::Map<String, Value>) -> R,
 ) -> Option<R> {
-    let _guard = map_lock(store, name).await;
+    let _guard = map_lock(store, name).await?;
     let mut map = read_json_map(store, name).await;
     let out = f(&mut map);
     if write_json_map(store, name, &map).await {

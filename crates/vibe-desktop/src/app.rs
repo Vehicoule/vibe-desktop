@@ -44,6 +44,11 @@ pub struct VibeApp {
     /// Directory paths bound to remote projects (`projectLinks/list`) —
     /// rail rows inside one get a link marker.
     pub linked_dirs: std::collections::HashSet<String>,
+    /// Bumped by in-app link mutations (session sheet's `mark_linked`).
+    /// A catalog refresh only applies its fetched `linked_dirs` when the
+    /// gen it started under is still current — otherwise its older
+    /// snapshot would erase the mutation's marker.
+    pub linked_gen: u64,
 }
 
 enum AttachKind {
@@ -83,6 +88,7 @@ impl VibeApp {
             show_archived: false,
             catalog_inflight: None,
             linked_dirs: std::collections::HashSet::new(),
+            linked_gen: 0,
         };
         app.refresh_sessions(cx);
         app
@@ -121,6 +127,7 @@ impl VibeApp {
             return;
         }
         let include_archived = self.show_archived;
+        let linked_gen_at_start = self.linked_gen;
         self.catalog_inflight = Some(include_archived);
         let program = self.program();
         self.status = format!("connecting to {}…", program.display());
@@ -175,7 +182,12 @@ impl VibeApp {
                 match out {
                     Ok((items, linked)) => {
                         app.sessions = items;
-                        app.linked_dirs = linked;
+                        // The fetched links snapshot predates any mutation
+                        // made while the refresh was in flight — keep the
+                        // newer optimistic set in that case.
+                        if app.linked_gen == linked_gen_at_start {
+                            app.linked_dirs = linked;
+                        }
                         app.sort_sessions();
                         app.status = format!("{} session(s)", app.sessions.len());
                     }
