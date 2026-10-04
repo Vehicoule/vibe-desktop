@@ -492,12 +492,20 @@ impl SessionView {
     }
 
     /// Key handling on the session root — Escape closes whichever sheet
-    /// is open (at most one is ever up).
+    /// is open (at most one is ever up). Never interrupts: the composer
+    /// owns Escape-to-interrupt, and a bubbled event reaches here after
+    /// the composer already decided.
     pub fn on_session_key(&mut self, e: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
         if e.keystroke.key.as_str() == "escape" {
             self.close_sheets_except(None, cx);
             cx.notify();
         }
+    }
+
+    /// Any pinned sheet currently on screen — Escape resolves to
+    /// sheet-dismiss before it resolves to turn-interrupt.
+    pub fn any_sheet_open(&self) -> bool {
+        self.settings_open || self.review_open || self.cloud_open || self.rewind.is_some()
     }
 
     /// Settings sheet toggle — refreshes every section on every open so

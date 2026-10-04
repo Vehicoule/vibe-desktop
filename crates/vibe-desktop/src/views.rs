@@ -2418,7 +2418,16 @@ impl SessionView {
                             v.send_message(cx);
                         }
                     }
-                    "escape" => v.interrupt(cx),
+                    "escape" => {
+                        // Sheet dismiss beats interrupt — one key press,
+                        // one effect. Only when nothing is open does
+                        // Escape mean "stop the turn".
+                        if v.any_sheet_open() {
+                            v.on_session_key(e, cx);
+                        } else {
+                            v.interrupt(cx);
+                        }
+                    }
                     _ => {
                         if let Some(ch) = &e.keystroke.key_char {
                             v.composer.push_str(ch);
