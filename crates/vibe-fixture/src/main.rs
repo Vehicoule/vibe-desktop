@@ -2472,6 +2472,8 @@ async fn main() {
                     .await;
             }
             "vibeCode/projects/loadMore" => {
+                // The picker keeps paging state — the loaded page stays
+                // visible in subsequent view snapshots.
                 let mut view = picker_view(&session_cwd(&sessions, &store, &params).await);
                 view["state"]["projects"].as_array_mut().unwrap().push(json!({
                     "projectId": "proj-bb", "name": "api-worker",
@@ -2482,7 +2484,15 @@ async fn main() {
                 respond(json!({"view": view, "focusOptionId": null})).await;
             }
             "vibeCode/projects/select" => {
-                let view = picker_view(&session_cwd(&sessions, &store, &params).await);
+                // Selection resolves against every project the picker
+                // surfaced — including loadMore'd pages.
+                let mut view = picker_view(&session_cwd(&sessions, &store, &params).await);
+                view["state"]["projects"].as_array_mut().unwrap().push(json!({
+                    "projectId": "proj-bb", "name": "api-worker",
+                    "repositories": [{"repoUrl": "https://github.com/vehicoule/api-worker"}],
+                    "isReadOnly": false,
+                }));
+                view["state"]["nextCursor"] = Value::Null;
                 let pid = params["projectId"].as_str().unwrap_or_default();
                 let project = view["state"]["projects"].as_array().into_iter().flatten()
                     .find(|p| p["projectId"].as_str() == Some(pid)).cloned();
