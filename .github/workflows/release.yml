@@ -80,7 +80,22 @@ jobs:
           merge-multiple: true
           path: dist
 
+      # GHA expressions have no split(), so parse the tag in shell —
+      # ref name arrives via env, never ${{ }}-interpolated into run text.
+      # Semver prerelease suffix (v0.1.0-alpha) → prerelease; only the
+      # part before '+' counts since build metadata may hold hyphens.
+      - id: pre
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          core="${REF_NAME%%+*}"
+          case "$core" in
+            *-*) echo "flag=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "flag=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
           generate_release_notes: true
+          prerelease: ${{ steps.pre.outputs.flag }}
