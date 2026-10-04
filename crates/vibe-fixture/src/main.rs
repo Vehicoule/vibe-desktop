@@ -1990,29 +1990,34 @@ async fn main() {
                 .await;
             }
             "review/state" => {
-                // Materialize the ownerless file under the session cwd —
-                // the app's whole-file preview reads its current side
-                // from disk, so a listed file must actually exist.
-                if let Some(sid) = params["sessionId"].as_str() {
-                    if let Some(d) = find_session(&sessions, &store, sid).await {
-                        let inner = d.inner.lock().await;
-                        if let Some(cwd) = inner.session["cwd"].as_str() {
-                            let p = std::path::Path::new(cwd).join("notes.txt");
-                            if !p.exists() {
-                                let _ = std::fs::write(
-                                    &p,
-                                    "notes [file-wide] current\nedge cases tracked\n",
-                                );
-                            }
-                        }
-                    }
-                }
                 // Decisions persist to review_decisions.json — an
                 // approve/revert on a file target resolves it off the
                 // pending list (all regions decided ⇒ nothing left to
                 // review), so the round-trip is observable.
                 let decisions = read_overlay(&store, "review_decisions.json");
                 let pending = |path: &str| !decisions.contains_key(path);
+                // Materialize the ownerless file under the session cwd —
+                // the app's whole-file preview reads its current side
+                // from disk, so a listed file must actually exist. Only
+                // while pending: a decided file must not be resurrected
+                // by a refresh.
+                if pending("notes.txt") {
+                    if let Some(sid) = params["sessionId"].as_str() {
+                        if let Some(d) = find_session(&sessions, &store, sid).await {
+                            let inner = d.inner.lock().await;
+                            if let Some(cwd) = inner.session["cwd"].as_str() {
+                                let p = std::path::Path::new(cwd).join("notes.txt");
+                                if !p.exists() {
+                                    let _ = std::fs::create_dir_all(cwd);
+                                    let _ = std::fs::write(
+                                        &p,
+                                        "notes [file-wide] current\nedge cases tracked\n",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 let files: Vec<Value> = [
                     (json!({"path": "src/main.rs", "status": "modified", "regions": [
                         {"kind": "text", "versionIndex": 0, "ordinal": 0, "owner": {"kind": "agent", "turnId": 1}, "baselineStart": 1, "baselineLineCount": 2, "currentStart": 1, "currentLineCount": 3, "decision": "pending", "dependsOn": []}
