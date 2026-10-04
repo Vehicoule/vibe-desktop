@@ -1917,6 +1917,27 @@ impl SessionView {
                         view.check_trust(cx);
                         view.load_worktrees(cx);
                         view.clear_link();
+                        // The rail row's cwd is stale now — update it so
+                        // the linked-dir marker recomputes against the new
+                        // checkout without waiting for a catalog refresh.
+                        if let Some(app) = view.app.as_ref().and_then(|w| w.upgrade()) {
+                            let new_cwd = view
+                                .projection
+                                .state
+                                .session
+                                .cwd
+                                .clone()
+                                .unwrap_or_else(|| cwd.clone());
+                            let sid3 = sid.clone();
+                            app.update(cx, |app, cx| {
+                                if let Some(row) =
+                                    app.sessions.iter_mut().find(|s| s.id == sid3)
+                                {
+                                    row.cwd = Some(new_cwd);
+                                }
+                                cx.notify();
+                            });
+                        }
                         if view.cloud_open {
                             view.load_picker(cx);
                             view.load_link(cx);
