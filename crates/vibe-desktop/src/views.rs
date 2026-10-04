@@ -598,6 +598,7 @@ impl Render for SessionView {
         };
         let mut entries = div()
             .id("entries")
+            .track_scroll(&self.entries_scroll)
             .flex()
             .flex_col()
             .flex_1()
@@ -661,10 +662,23 @@ impl Render for SessionView {
             Some(col)
         };
 
+        // Follow the stream only while the user is parked within ~80px
+        // of the bottom — a scrolled-up reader is never dragged back
+        // down (their click targets stay put), and a fresh view (zero
+        // scroll state → 0 >= -80) opens at the newest entries.
+        let at_bottom =
+            self.entries_scroll.offset().y + self.entries_scroll.max_offset().height <= px(80.0);
+        if at_bottom {
+            self.entries_scroll.scroll_to_bottom();
+        }
+
         div()
             .size_full()
             .flex()
             .flex_col()
+            .on_key_down(cx.listener(|v, e: &gpui::KeyDownEvent, _w, cx| {
+                v.on_session_key(e, cx);
+            }))
             .child(
                 // header
                 div()
