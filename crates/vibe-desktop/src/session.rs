@@ -352,6 +352,7 @@ impl SessionView {
         // Drop the displayed diff at once — keep/revert must not stay
         // actionable on the previous file while this read is in flight.
         self.review_diff = None;
+        cx.notify();
         self.review_diff_sel = Some((path.clone(), owner.clone()));
         self.review_diff_gen += 1;
         let gen = self.review_diff_gen;
