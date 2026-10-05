@@ -30,5 +30,5 @@ The app manages its own `vibe-app-server`: with `uv` on PATH it installs `mistra
 ## Notes
 
 - `Cargo.lock` pins `libc = 0.2.189`: `xattr 0.2.3` (via `gpui_http_client`) still uses `libc::ENOATTR`, removed from libc on Linux in 0.2.190. Revisit when `xattr` releases a fix.
-- Releasing: tag `v*` pushes build per-OS artifacts — Linux `.tar.gz` (FHS layout: `bin/` + `.desktop` + icon), macOS `.zip` (`.app` bundle), Windows `.zip` — and publishes a GitHub Release. `workflow_dispatch` builds artifacts without releasing. Signing/notarization steps are stubbed in `release.yml` pending Apple cert + Windows cert secrets.
+- Releasing: tag `v*` pushes build per-OS bundles — Linux `.AppImage`, macOS `.zip` (`Vibe Desktop.app` bundle), Windows NSIS `*-setup.exe` (per-user install under `%LOCALAPPDATA%`, Start Menu shortcut, Add/Remove Programs entry) — and publishes a GitHub Release. `workflow_dispatch` builds artifacts without releasing. Signing/notarization steps are stubbed in `release.yml` pending Apple cert + Windows cert secrets.
 - Status: M5 in progress — see DESIGN.md milestones.

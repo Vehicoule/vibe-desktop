@@ -45,9 +45,24 @@ jobs:
 
       # VERSION is passed through the environment, never ${{ }}-interpolated
       # into shell text — a tag name can't inject commands.
+      # appimagetool is an AppImage itself — the wrapper adds
+      # --appimage-extract-and-run, sidestepping the missing FUSE driver
+      # on hosted runners (no fuse → plain AppImage exec fails).
+      # Digest-pinned like the actions above; bump when upstream republishes
+      # the rolling 'continuous' asset and the check starts failing.
+      - name: appimagetool
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          curl -fsSL -o appimagetool.bin https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          echo "95cbe7cce9717fce90c484e34052ee7c7f1d7635b33c12525b4776826a7d29b6  appimagetool.bin" | sha256sum -c -
+          chmod +x appimagetool.bin
+          printf '#!/bin/sh\nexec "%s/appimagetool.bin" --appimage-extract-and-run "$@"\n' "$PWD" > appimagetool
+          chmod +x appimagetool
+          echo "APPIMAGETOOL=$PWD/appimagetool" >> "$GITHUB_ENV"
+
       - name: package (linux)
         if: matrix.os == 'ubuntu-latest'
-        run: ./scripts/package-unix.sh target/release/vibe-desktop linux "$VERSION" "vibe-desktop-${VERSION}-${{ matrix.artifact }}.tar.gz"
+        run: ./scripts/package-unix.sh target/release/vibe-desktop linux "$VERSION" "vibe-desktop-${VERSION}-${{ matrix.artifact }}.AppImage"
 
       - name: package (macos)
         if: matrix.os == 'macos-latest'
@@ -59,14 +74,17 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          Compress-Archive -Path target/release/vibe-desktop.exe, packaging/icon.png -DestinationPath "vibe-desktop-$env:VERSION-${{ matrix.artifact }}.zip"
+          choco install nsis --no-progress -y
+          # choco's PATH update does not reach this session; call makensis by full path
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION="$env:VERSION" packaging\vibe-desktop.nsi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vibe-desktop-${{ matrix.artifact }}
           path: |
-            *.tar.gz
+            *.AppImage
             *.zip
+            *.exe
           if-no-files-found: error
 
   publish:

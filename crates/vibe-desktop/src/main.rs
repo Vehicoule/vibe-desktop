@@ -3,6 +3,11 @@
 //! Usage: `vibe-desktop` (real server) or `vibe-desktop --fixture` (scripted
 //! fake server for development without credentials).
 
+// Release builds are a GUI-subsystem exe on Windows — without this, every
+// launch from Explorer/shortcuts also pops a stray console window. Debug
+// builds stay console-subsystem so `--fixture` output remains visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod host;
 mod session;
