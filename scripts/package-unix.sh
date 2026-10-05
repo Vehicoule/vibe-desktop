@@ -12,12 +12,18 @@ PACKAGING="$(cd "$(dirname "$0")/../packaging" && pwd)"
 
 case "$OS" in
   linux)
-    STAGE="$(mktemp -d)/vibe-desktop-${VERSION}-linux-x86_64"
-    mkdir -p "$STAGE/bin" "$STAGE/share/applications" "$STAGE/share/icons/hicolor/512x512/apps"
-    cp "$BIN" "$STAGE/bin/vibe-desktop"
-    cp "$PACKAGING/vibe-desktop.desktop" "$STAGE/share/applications/"
-    cp "$PACKAGING/icon.png" "$STAGE/share/icons/hicolor/512x512/apps/vibe-desktop.png"
-    tar -C "$(dirname "$STAGE")" -czf "$OUT" "$(basename "$STAGE")"
+    # AppImage: FHS AppDir (usr/bin + usr/share) with a root AppRun,
+    # .desktop and icon. APPIMAGETOOL must point at an appimagetool
+    # binary — release.yml downloads appimagetool-x86_64.AppImage.
+    APPDIR="$(mktemp -d)/AppDir"
+    mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/512x512/apps"
+    cp "$BIN" "$APPDIR/usr/bin/vibe-desktop"
+    cp "$PACKAGING/vibe-desktop.desktop" "$APPDIR/vibe-desktop.desktop"
+    cp "$PACKAGING/vibe-desktop.desktop" "$APPDIR/usr/share/applications/"
+    cp "$PACKAGING/icon.png" "$APPDIR/vibe-desktop.png"
+    cp "$PACKAGING/icon.png" "$APPDIR/usr/share/icons/hicolor/512x512/apps/vibe-desktop.png"
+    ln -s usr/bin/vibe-desktop "$APPDIR/AppRun"
+    "${APPIMAGETOOL:?set APPIMAGETOOL to an appimagetool binary}" "$APPDIR" "$OUT"
     ;;
   macos)
     STAGE="$(mktemp -d)/Vibe Desktop.app/Contents"
