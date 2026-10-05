@@ -75,7 +75,8 @@ jobs:
         shell: pwsh
         run: |
           choco install nsis --no-progress -y
-          makensis /DVERSION="$env:VERSION" packaging\vibe-desktop.nsi
+          # choco's PATH update does not reach this session; call makensis by full path
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION="$env:VERSION" packaging\vibe-desktop.nsi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
