@@ -38,7 +38,9 @@ case "$OS" in
       sips -z "$dbl" "$dbl" "$PACKAGING/icon.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
     done
     iconutil -c icns "$ICONSET" -o "$STAGE/Resources/icon.icns"
-    ditto -c -k --sequesterRsrc "$(dirname "$STAGE")" "$OUT"
+    # --keepParent keeps "Vibe Desktop.app" at the zip root — without it
+    # ditto flattens the bundle and users get a bare Contents/ folder.
+    ditto -c -k --sequesterRsrc --keepParent "$(dirname "$STAGE")" "$OUT"
     ;;
   *)
     echo "unknown os: $OS" >&2
