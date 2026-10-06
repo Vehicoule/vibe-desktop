@@ -44,6 +44,14 @@ case "$OS" in
       sips -z "$dbl" "$dbl" "$PACKAGING/icon.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
     done
     iconutil -c icns "$ICONSET" -o "$STAGE/Resources/icon.icns"
+    # The linker-adhoc signature on the raw binary does not cover the
+    # bundle's resources — codesign --verify fails with "code has no
+    # resources but signature indicates they must be present" and macOS
+    # reports the app as damaged. Re-sign the whole bundle adhoc so the
+    # signature is coherent (still bypassable via Settings → Open Anyway;
+    # real Developer ID + notarization pending certs — see release.yml).
+    codesign --force --deep --sign - "$(dirname "$STAGE")"
+    codesign --verify --deep --strict "$(dirname "$STAGE")"
     # --keepParent keeps "Vibe Desktop.app" at the zip root — without it
     # ditto flattens the bundle and users get a bare Contents/ folder.
     ditto -c -k --sequesterRsrc --keepParent "$(dirname "$STAGE")" "$OUT"
