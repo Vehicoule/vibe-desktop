@@ -38,7 +38,10 @@ pub fn server_binary() -> PathBuf {
             return local;
         }
     }
-    PathBuf::from("vibe-app-server")
+    // PATH fallback MUST go through `which`: it returns the full path
+    // with its extension — an extensionless "vibe-app-server" can't spawn
+    // a .cmd/.bat shim on Windows (CreateProcess only tries .exe).
+    crate::vibe_dist::which("vibe-app-server").unwrap_or_else(|| PathBuf::from("vibe-app-server"))
 }
 
 /// Resolve the dev fixture binary: `VIBE_FIXTURE` env → sibling cargo target.

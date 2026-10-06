@@ -70,7 +70,11 @@ pub fn dist_root() -> Option<PathBuf> {
 /// uv lays tools out as `<UV_TOOL_DIR>/<name>/bin/<exe>` on Unix and
 /// `<UV_TOOL_DIR>/<name>/Scripts/<exe>.exe` on Windows (venv layout).
 pub fn managed_binary(root: &Path) -> PathBuf {
-    if cfg!(windows) {
+    managed_binary_on(root, cfg!(windows))
+}
+
+fn managed_binary_on(root: &Path, windows: bool) -> PathBuf {
+    if windows {
         root.join("tool/mistral-vibe/Scripts/vibe-app-server.exe")
     } else {
         root.join("tool/mistral-vibe/bin/vibe-app-server")
@@ -85,11 +89,27 @@ pub fn uv_binary() -> Option<PathBuf> {
     which("uv")
 }
 
-fn which(name: &str) -> Option<PathBuf> {
+/// PATH search. Anything `server_binary` may spawn must come through
+/// this resolver — the returned path carries its extension (CreateProcess
+/// only auto-appends .exe, and .cmd/.bat need it for std's cmd /c
+/// wrapping).
+pub(crate) fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    // Windows executables carry an extension; try the common script/exe
-    // forms instead of PATHEXT parsing (covers .cmd shims too).
-    let names: Vec<String> = if cfg!(windows) {
+    for dir in std::env::split_paths(&path) {
+        for n in exe_candidates(name, cfg!(windows)) {
+            let p = dir.join(n);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Windows executables carry an extension; try the common script/exe
+/// forms instead of PATHEXT parsing (covers .cmd shims too).
+fn exe_candidates(name: &str, windows: bool) -> Vec<String> {
+    if windows {
         vec![
             format!("{name}.exe"),
             format!("{name}.cmd"),
@@ -98,16 +118,7 @@ fn which(name: &str) -> Option<PathBuf> {
         ]
     } else {
         vec![name.to_string()]
-    };
-    for dir in std::env::split_paths(&path) {
-        for n in &names {
-            let p = dir.join(n);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
     }
-    None
 }
 
 /// `~/.local/bin/<name>` — uv's tool-bin dir is home-relative on every
@@ -317,6 +328,37 @@ mod tests {
             Some("0.4.2".to_string())
         );
         assert_eq!(parse_tool_version("ruff 0.6.1\n"), None);
+    }
+
+    /// Windows takes the Scripts/*.exe venv layout; Unix bin/ — both
+    /// branches testable without a Windows box.
+    #[test]
+    fn managed_binary_layout_per_os() {
+        let root = Path::new("/root");
+        assert_eq!(
+            managed_binary_on(root, true),
+            root.join("tool/mistral-vibe/Scripts/vibe-app-server.exe")
+        );
+        assert_eq!(
+            managed_binary_on(root, false),
+            root.join("tool/mistral-vibe/bin/vibe-app-server")
+        );
+    }
+
+    /// Windows PATH resolution must cover real exe + script shims —
+    /// anything probe accepts has to be spawnable via the same resolver.
+    #[test]
+    fn exe_candidates_cover_windows_forms() {
+        assert_eq!(
+            exe_candidates("vibe-app-server", true),
+            vec![
+                "vibe-app-server.exe",
+                "vibe-app-server.cmd",
+                "vibe-app-server.bat",
+                "vibe-app-server"
+            ]
+        );
+        assert_eq!(exe_candidates("uv", false), vec!["uv"]);
     }
 
     #[test]
