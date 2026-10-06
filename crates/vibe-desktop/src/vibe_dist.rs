@@ -95,15 +95,40 @@ pub fn uv_binary() -> Option<PathBuf> {
 /// wrapping).
 pub(crate) fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    which_in(name, std::env::split_paths(&path))
+}
+
+/// Split out from `which` so tests inject PATH entries without mutating
+/// env (parallel tests share it).
+fn which_in(name: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    for dir in dirs {
         for n in exe_candidates(name, cfg!(windows)) {
             let p = dir.join(n);
-            if p.is_file() {
+            if runnable(&p) {
                 return Some(p);
             }
         }
     }
     None
+}
+
+/// Spawnability gate for `which` candidates. Unix requires an execute
+/// bit: a resolved path bypasses PATH search at spawn time, so letting
+/// a non-executable file through would hard-fail where a bare name
+/// would have execvp-skipped to a working later entry.
+#[cfg(unix)]
+fn runnable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    p.is_file()
+        && p.metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+/// No execute bit on Windows — the extension is the contract.
+#[cfg(not(unix))]
+fn runnable(p: &Path) -> bool {
+    p.is_file()
 }
 
 /// Windows executables carry an extension; try the common script/exe
@@ -343,6 +368,29 @@ mod tests {
             managed_binary_on(root, false),
             root.join("tool/mistral-vibe/bin/vibe-app-server")
         );
+    }
+
+    /// A non-executable PATH entry must not shadow a runnable one
+    /// later in PATH (the resolved path bypasses PATH search, so
+    /// `which` itself has to skip it — execvp semantics).
+    #[cfg(unix)]
+    #[test]
+    fn which_skips_non_executable_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vibe-which-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dead = dir.join("old");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let bad = dead.join("vibe-app-server");
+        let good = bin.join("vibe-app-server");
+        // Default create mode has no exec bit (0644 under a sane umask).
+        std::fs::write(&bad, b"").unwrap();
+        std::fs::write(&good, b"").unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(which_in("vibe-app-server", vec![dead, bin]), Some(good));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Windows PATH resolution must cover real exe + script shims —
