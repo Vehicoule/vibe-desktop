@@ -93,7 +93,10 @@ impl VibeApp {
             open_ids: Vec::new(),
             selected: 0,
             new_session_open: false,
-            new_cwd: std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+            new_cwd: dirs::home_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .display()
+                .to_string(),
             new_focus,
             rail_menu: None,
             renaming: None,
@@ -202,7 +205,7 @@ impl VibeApp {
                         return Err("uv not found — install it from astral.sh/uv".to_string());
                     };
                     let Some(root) = crate::vibe_dist::dist_root() else {
-                        return Err("no data directory (HOME/XDG_DATA_HOME unset)".to_string());
+                        return Err("no per-user data directory resolved".to_string());
                     };
                     std::fs::create_dir_all(&root).map_err(|e| format!("{e}"))?;
                     if upgrade {

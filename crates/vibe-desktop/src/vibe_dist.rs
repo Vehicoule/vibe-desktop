@@ -46,11 +46,13 @@ impl VibeDist {
     }
 }
 
-/// Root of the managed distribution: `$XDG_DATA_HOME/vibe-desktop/vibe`
-/// or `~/.local/share/vibe-desktop/vibe`; `VIBE_DESKTOP_DIST` overrides
-/// (tests point it at a tempdir). `None` when no per-user data dir
-/// resolves — deliberately never a shared `/tmp` path, where another
-/// local user could plant a server binary we'd then execute.
+/// Root of the managed distribution: `$XDG_DATA_HOME/vibe-desktop/vibe`,
+/// `~/.local/share/vibe-desktop/vibe`, or the platform data dir
+/// (`%LOCALAPPDATA%` on Windows, where HOME/XDG are unset);
+/// `VIBE_DESKTOP_DIST` overrides (tests point it at a tempdir). `None`
+/// when no per-user data dir resolves — deliberately never a shared
+/// `/tmp` path, where another local user could plant a server binary
+/// we'd then execute.
 pub fn dist_root() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("VIBE_DESKTOP_DIST") {
         return Some(PathBuf::from(p));
@@ -58,14 +60,21 @@ pub fn dist_root() -> Option<PathBuf> {
     if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
         return Some(Path::new(&x).join("vibe-desktop/vibe"));
     }
-    std::env::var_os("HOME")
-        .map(|h| Path::new(&h).join(".local/share/vibe-desktop/vibe"))
+    if let Some(h) = std::env::var_os("HOME") {
+        return Some(Path::new(&h).join(".local/share/vibe-desktop/vibe"));
+    }
+    dirs::data_local_dir().map(|d| d.join("vibe-desktop").join("vibe"))
 }
 
 /// `vibe-app-server` inside the managed tool env.
-/// uv lays tools out as `<UV_TOOL_DIR>/<name>/bin/<exe>`.
+/// uv lays tools out as `<UV_TOOL_DIR>/<name>/bin/<exe>` on Unix and
+/// `<UV_TOOL_DIR>/<name>/Scripts/<exe>.exe` on Windows (venv layout).
 pub fn managed_binary(root: &Path) -> PathBuf {
-    root.join("tool/mistral-vibe/bin/vibe-app-server")
+    if cfg!(windows) {
+        root.join("tool/mistral-vibe/Scripts/vibe-app-server.exe")
+    } else {
+        root.join("tool/mistral-vibe/bin/vibe-app-server")
+    }
 }
 
 /// uv binary: `VIBE_DESKTOP_UV` env → PATH. `None` when uv is absent.
@@ -78,13 +87,38 @@ pub fn uv_binary() -> Option<PathBuf> {
 
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    // Windows executables carry an extension; try the common script/exe
+    // forms instead of PATHEXT parsing (covers .cmd shims too).
+    let names: Vec<String> = if cfg!(windows) {
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            format!("{name}.bat"),
+            name.to_string(),
+        ]
+    } else {
+        vec![name.to_string()]
+    };
     for dir in std::env::split_paths(&path) {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Some(p);
+        for n in &names {
+            let p = dir.join(n);
+            if p.is_file() {
+                return Some(p);
+            }
         }
     }
     None
+}
+
+/// `~/.local/bin/<name>` — uv's tool-bin dir is home-relative on every
+/// OS (`%USERPROFILE%\.local\bin` on Windows). Exe suffix on Windows.
+pub fn local_tool_binary(name: &str) -> Option<PathBuf> {
+    let exe = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    Some(dirs::home_dir()?.join(".local/bin").join(exe))
 }
 
 /// Parse `mistral-vibe 1.2.3` (uv tool list output line) → `1.2.3`.
@@ -250,8 +284,8 @@ pub async fn probe(check_latest: bool) -> VibeDist {
     }
     // A system/PATH server needs no per-user data dir — check it before
     // the managed-root failure so the row describes a runnable server.
-    let system_present = std::env::var_os("HOME")
-        .map(|h| Path::new(&h).join(".local/bin/vibe-app-server").exists())
+    let system_present = local_tool_binary("vibe-app-server")
+        .map(|p| p.exists())
         .unwrap_or(false)
         || which("vibe-app-server").is_some();
     if system_present {
@@ -263,7 +297,7 @@ pub async fn probe(check_latest: bool) -> VibeDist {
     if root.is_none() {
         return VibeDist::Failed {
             upgrade: false,
-            error: "no data directory (HOME/XDG_DATA_HOME unset)".into(),
+            error: "no per-user data directory resolved".into(),
         };
     }
     if uv.is_none() {
