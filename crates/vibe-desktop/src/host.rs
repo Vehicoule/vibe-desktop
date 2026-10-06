@@ -22,6 +22,7 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
 
 /// Resolve the `vibe-app-server` binary:
 /// `VIBE_APP_SERVER` env → managed install → `~/.local/bin` → PATH.
+/// (`.local/bin` is uv's home-relative tool-bin dir on every OS.)
 pub fn server_binary() -> PathBuf {
     if let Ok(p) = std::env::var("VIBE_APP_SERVER") {
         return PathBuf::from(p);
@@ -32,13 +33,15 @@ pub fn server_binary() -> PathBuf {
             return managed;
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = Path::new(&home).join(".local/bin/vibe-app-server");
-        if p.exists() {
-            return p;
+    if let Some(local) = crate::vibe_dist::local_tool_binary("vibe-app-server") {
+        if local.exists() {
+            return local;
         }
     }
-    PathBuf::from("vibe-app-server")
+    // PATH fallback MUST go through `which`: it returns the full path
+    // with its extension — an extensionless "vibe-app-server" can't spawn
+    // a .cmd/.bat shim on Windows (CreateProcess only tries .exe).
+    crate::vibe_dist::which("vibe-app-server").unwrap_or_else(|| PathBuf::from("vibe-app-server"))
 }
 
 /// Resolve the dev fixture binary: `VIBE_FIXTURE` env → sibling cargo target.

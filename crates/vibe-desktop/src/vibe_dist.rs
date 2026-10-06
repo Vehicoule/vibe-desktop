@@ -46,11 +46,13 @@ impl VibeDist {
     }
 }
 
-/// Root of the managed distribution: `$XDG_DATA_HOME/vibe-desktop/vibe`
-/// or `~/.local/share/vibe-desktop/vibe`; `VIBE_DESKTOP_DIST` overrides
-/// (tests point it at a tempdir). `None` when no per-user data dir
-/// resolves — deliberately never a shared `/tmp` path, where another
-/// local user could plant a server binary we'd then execute.
+/// Root of the managed distribution: `$XDG_DATA_HOME/vibe-desktop/vibe`,
+/// `~/.local/share/vibe-desktop/vibe`, or the platform data dir
+/// (`%LOCALAPPDATA%` on Windows, where HOME/XDG are unset);
+/// `VIBE_DESKTOP_DIST` overrides (tests point it at a tempdir). `None`
+/// when no per-user data dir resolves — deliberately never a shared
+/// `/tmp` path, where another local user could plant a server binary
+/// we'd then execute.
 pub fn dist_root() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("VIBE_DESKTOP_DIST") {
         return Some(PathBuf::from(p));
@@ -58,14 +60,25 @@ pub fn dist_root() -> Option<PathBuf> {
     if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
         return Some(Path::new(&x).join("vibe-desktop/vibe"));
     }
-    std::env::var_os("HOME")
-        .map(|h| Path::new(&h).join(".local/share/vibe-desktop/vibe"))
+    if let Some(h) = std::env::var_os("HOME") {
+        return Some(Path::new(&h).join(".local/share/vibe-desktop/vibe"));
+    }
+    dirs::data_local_dir().map(|d| d.join("vibe-desktop").join("vibe"))
 }
 
 /// `vibe-app-server` inside the managed tool env.
-/// uv lays tools out as `<UV_TOOL_DIR>/<name>/bin/<exe>`.
+/// uv lays tools out as `<UV_TOOL_DIR>/<name>/bin/<exe>` on Unix and
+/// `<UV_TOOL_DIR>/<name>/Scripts/<exe>.exe` on Windows (venv layout).
 pub fn managed_binary(root: &Path) -> PathBuf {
-    root.join("tool/mistral-vibe/bin/vibe-app-server")
+    managed_binary_on(root, cfg!(windows))
+}
+
+fn managed_binary_on(root: &Path, windows: bool) -> PathBuf {
+    if windows {
+        root.join("tool/mistral-vibe/Scripts/vibe-app-server.exe")
+    } else {
+        root.join("tool/mistral-vibe/bin/vibe-app-server")
+    }
 }
 
 /// uv binary: `VIBE_DESKTOP_UV` env → PATH. `None` when uv is absent.
@@ -76,15 +89,72 @@ pub fn uv_binary() -> Option<PathBuf> {
     which("uv")
 }
 
-fn which(name: &str) -> Option<PathBuf> {
+/// PATH search. Anything `server_binary` may spawn must come through
+/// this resolver — the returned path carries its extension (CreateProcess
+/// only auto-appends .exe, and .cmd/.bat need it for std's cmd /c
+/// wrapping).
+pub(crate) fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Some(p);
+    which_in(name, std::env::split_paths(&path))
+}
+
+/// Split out from `which` so tests inject PATH entries without mutating
+/// env (parallel tests share it).
+fn which_in(name: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    for dir in dirs {
+        for n in exe_candidates(name, cfg!(windows)) {
+            let p = dir.join(n);
+            if runnable(&p) {
+                return Some(p);
+            }
         }
     }
     None
+}
+
+/// Spawnability gate for `which` candidates. Unix requires an execute
+/// bit: a resolved path bypasses PATH search at spawn time, so letting
+/// a non-executable file through would hard-fail where a bare name
+/// would have execvp-skipped to a working later entry.
+#[cfg(unix)]
+fn runnable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    p.is_file()
+        && p.metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+/// No execute bit on Windows — the extension is the contract.
+#[cfg(not(unix))]
+fn runnable(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// Windows executables carry an extension; try the common script/exe
+/// forms instead of PATHEXT parsing (covers .cmd shims too).
+fn exe_candidates(name: &str, windows: bool) -> Vec<String> {
+    if windows {
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            format!("{name}.bat"),
+            name.to_string(),
+        ]
+    } else {
+        vec![name.to_string()]
+    }
+}
+
+/// `~/.local/bin/<name>` — uv's tool-bin dir is home-relative on every
+/// OS (`%USERPROFILE%\.local\bin` on Windows). Exe suffix on Windows.
+pub fn local_tool_binary(name: &str) -> Option<PathBuf> {
+    let exe = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    Some(dirs::home_dir()?.join(".local/bin").join(exe))
 }
 
 /// Parse `mistral-vibe 1.2.3` (uv tool list output line) → `1.2.3`.
@@ -250,8 +320,8 @@ pub async fn probe(check_latest: bool) -> VibeDist {
     }
     // A system/PATH server needs no per-user data dir — check it before
     // the managed-root failure so the row describes a runnable server.
-    let system_present = std::env::var_os("HOME")
-        .map(|h| Path::new(&h).join(".local/bin/vibe-app-server").exists())
+    let system_present = local_tool_binary("vibe-app-server")
+        .map(|p| p.exists())
         .unwrap_or(false)
         || which("vibe-app-server").is_some();
     if system_present {
@@ -263,7 +333,7 @@ pub async fn probe(check_latest: bool) -> VibeDist {
     if root.is_none() {
         return VibeDist::Failed {
             upgrade: false,
-            error: "no data directory (HOME/XDG_DATA_HOME unset)".into(),
+            error: "no per-user data directory resolved".into(),
         };
     }
     if uv.is_none() {
@@ -283,6 +353,60 @@ mod tests {
             Some("0.4.2".to_string())
         );
         assert_eq!(parse_tool_version("ruff 0.6.1\n"), None);
+    }
+
+    /// Windows takes the Scripts/*.exe venv layout; Unix bin/ — both
+    /// branches testable without a Windows box.
+    #[test]
+    fn managed_binary_layout_per_os() {
+        let root = Path::new("/root");
+        assert_eq!(
+            managed_binary_on(root, true),
+            root.join("tool/mistral-vibe/Scripts/vibe-app-server.exe")
+        );
+        assert_eq!(
+            managed_binary_on(root, false),
+            root.join("tool/mistral-vibe/bin/vibe-app-server")
+        );
+    }
+
+    /// A non-executable PATH entry must not shadow a runnable one
+    /// later in PATH (the resolved path bypasses PATH search, so
+    /// `which` itself has to skip it — execvp semantics).
+    #[cfg(unix)]
+    #[test]
+    fn which_skips_non_executable_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vibe-which-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dead = dir.join("old");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let bad = dead.join("vibe-app-server");
+        let good = bin.join("vibe-app-server");
+        // Default create mode has no exec bit (0644 under a sane umask).
+        std::fs::write(&bad, b"").unwrap();
+        std::fs::write(&good, b"").unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(which_in("vibe-app-server", vec![dead, bin]), Some(good));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows PATH resolution must cover real exe + script shims —
+    /// anything probe accepts has to be spawnable via the same resolver.
+    #[test]
+    fn exe_candidates_cover_windows_forms() {
+        assert_eq!(
+            exe_candidates("vibe-app-server", true),
+            vec![
+                "vibe-app-server.exe",
+                "vibe-app-server.cmd",
+                "vibe-app-server.bat",
+                "vibe-app-server"
+            ]
+        );
+        assert_eq!(exe_candidates("uv", false), vec!["uv"]);
     }
 
     #[test]
